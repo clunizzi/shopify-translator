@@ -41,14 +41,21 @@ class Settings:
     sim_t_html: float = _get_float("SIM_T_HTML", 0.98)
     sim_t_meta: float = _get_float("SIM_T_META", 0.985)
     sim_t_product_type: float = _get_float("SIM_T_PRODUCT_TYPE", 0.985)
-    sim_t_handle: float = _get_float("SIM_T_HANDLE", 0.985)  # solo con --preserve-handle
+    sim_t_handle: float = _get_float("SIM_T_HANDLE", 0.985)
+    # Nuovi
+    sim_t_option: float = _get_float("SIM_T_OPTION", 0.99)
+    sim_t_value: float = _get_float("SIM_T_VALUE", 0.99)
 
     retry_max: int = _get_int("RETRY_MAX", 2)
+    # Nuovi
+    retry_max_option: int = _get_int("RETRY_MAX_OPTION", 1)
+    retry_max_value: int = _get_int("RETRY_MAX_VALUE", 1)
+
     rules_version: int = _get_int("RULES_VERSION", 1)
 
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
-    log_file: str = os.getenv("LOG_FILE", "")  # es. logs/translator.jsonl
+    log_file: str = os.getenv("LOG_FILE", "")
     log_retention_days: int = _get_int("LOG_RETENTION_DAYS", 14)
     log_payloads: bool = bool(int(os.getenv("LOG_PAYLOADS", "0")))
     log_payload_max: int = _get_int("LOG_PAYLOAD_MAX", 500)

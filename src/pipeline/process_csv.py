@@ -6,16 +6,26 @@ import logging
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
 import structlog
 
 from src.config.settings import SETTINGS
-from src.io.csv_reader import identification_order, iter_groups_in_input_order, read_csv
+from src.io.csv_reader import iter_groups_in_input_order, read_csv
 from src.io.csv_writer import append_rows, init_output
+from src.rules.option_value import (
+    normalize_option_label,
+    should_skip_option_name,
+    should_skip_option_value_name,
+)
 from src.shopify.product_status import get_active_products_map
 from src.translate.cache import TranslationCache
-from src.translate.translator import DoNotTranslateConfig, Translator
+from src.translate.translator import Translator
+
+if TYPE_CHECKING:
+    # Solo per gli editor / mypy; nessun costo runtime
+    from src.translate.translator import DoNotTranslateConfig
 
 logger = structlog.get_logger()
 
@@ -39,17 +49,17 @@ SCHEMA = {
     "Translated content": pl.Utf8,
 }
 
+ALLOWED_TYPES = {"PRODUCT", "PRODUCT_OPTION", "PRODUCT_OPTION_VALUE"}
+
 
 def _configure_logging(log_file: Path | None, no_stdout: bool) -> None:
     handlers: list[logging.Handler] = []
     level = getattr(logging, SETTINGS.log_level.upper(), logging.INFO)
-
     if not no_stdout:
         sh = logging.StreamHandler(sys.stdout)
         sh.setLevel(level)
         sh.setFormatter(logging.Formatter("%(message)s"))
         handlers.append(sh)
-
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         fh = TimedRotatingFileHandler(
@@ -62,19 +72,15 @@ def _configure_logging(log_file: Path | None, no_stdout: bool) -> None:
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter("%(message)s"))
         handlers.append(fh)
-
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(level)
     for h in handlers:
         root.addHandler(h)
-
-    # SOLO i nostri logger devono arrivare qui; silenzia librerie rumorose
     for name in ("httpx", "httpcore", "urllib3", "hpack", "h11"):
         lg = logging.getLogger(name)
         lg.setLevel(logging.WARNING)
-        lg.propagate = False  # evita che finiscano nei nostri handler
-
+        lg.propagate = False
     structlog.configure(
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.make_filtering_bound_logger(level),
@@ -88,122 +94,12 @@ def _configure_logging(log_file: Path | None, no_stdout: bool) -> None:
     )
 
 
-def load_do_not_translate(config_path: str | Path | None) -> DoNotTranslateConfig:
-    brands: list[str] = []
-    units: list[str] = []
-    tokens: list[str] = []
-    if config_path and Path(config_path).exists():
-        import yaml  # lazy import
-
-        data = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-        brands = list(map(str, data.get("brands", []) or []))
-        units = list(map(str, data.get("units", []) or []))
-        tokens = list(map(str, data.get("tokens", []) or []))
-    return DoNotTranslateConfig(brands=brands, units=units, tokens=tokens)
-
-
-def _load_checkpoint(cp_path: Path) -> dict:
-    if cp_path.exists():
-        try:
-            return json.loads(cp_path.read_text())
-        except Exception:
-            return {}
-    return {}
-
-
-def _save_checkpoint(cp_path: Path, content: dict) -> None:
-    cp_path.parent.mkdir(parents=True, exist_ok=True)
-    cp_path.write_text(json.dumps(content, ensure_ascii=False, indent=2))
-
-
-def _hash_file(path: Path, chunk: int = 1024 * 1024) -> str:
+def _hash_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.update(b)
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
     return h.hexdigest()
-
-
-def _parse_ids(ids: str | None) -> set[int]:
-    out: set[int] = set()
-    if not ids:
-        return out
-    for part in ids.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            out.add(int(part))
-        except ValueError:
-            continue
-    return out
-
-
-def _parse_ids_file(path: str | Path | None) -> set[int]:
-    out: set[int] = set()
-    if not path:
-        return out
-    p = Path(path)
-    if not p.exists():
-        return out
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.add(int(line))
-        except ValueError:
-            continue
-    return out
-
-
-def _parse_id_range(rng: str | None) -> set[int]:
-    out: set[int] = set()
-    if not rng:
-        return out
-    try:
-        start_s, end_s = rng.split(":", 1)
-        start_i = int(start_s.strip())
-        end_i = int(end_s.strip())
-        if start_i <= end_i:
-            out.update(range(start_i, end_i + 1))
-    except Exception:
-        pass
-    return out
-
-
-def _compute_allowed_ids(
-    df: pl.DataFrame,
-    first_n: int | None,
-    ids: str | None,
-    ids_file: str | Path | None,
-    id_range: str | None,
-) -> set[int] | None:
-    order = identification_order(df)
-    allowed_seq: list[int] | None = None
-
-    base_union: set[int] = set()
-    base_union |= _parse_ids(ids)
-    base_union |= _parse_ids_file(ids_file)
-    base_union |= _parse_id_range(id_range)
-
-    if base_union:
-        allowed_seq = [i for i in order if i in base_union]
-
-    if first_n is not None:
-        if first_n <= 0:
-            return set()
-        if allowed_seq is None:
-            allowed_seq = order[:first_n]
-        else:
-            allowed_seq = allowed_seq[:first_n]
-
-    if allowed_seq is None:
-        return None
-    return set(allowed_seq)
 
 
 def _checkpoint_path_for(input_hash: str, locale: str) -> Path:
@@ -214,26 +110,76 @@ def _checkpoint_path_for(input_hash: str, locale: str) -> Path:
 def _load_checkpoint_any(
     new_path: Path, fallback_old: Path, expect_hash: str, expect_locale: str
 ) -> dict:
-    """
-    Carica prima dal path per-file/locale; se assente prova il vecchio 'state/checkpoint.json'
-    e migra se combacia.
-    """
     if new_path.exists():
         try:
             return json.loads(new_path.read_text())
         except Exception:
             return {}
-
     if fallback_old.exists():
         try:
             data = json.loads(fallback_old.read_text())
         except Exception:
             return {}
         if data.get("input_hash") == expect_hash and data.get("locale") == expect_locale:
-            # migra scrivendo sul nuovo path
             new_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
             return data
     return {}
+
+
+def _parse_types_arg(types: str, df_types: set[str]) -> set[str]:
+    if not types or types.strip().lower() == "auto":
+        return set(t for t in df_types if t in ALLOWED_TYPES) or {"PRODUCT"}
+    parts = [t.strip().upper() for t in types.split(",") if t.strip()]
+    sel = set(p for p in parts if p in ALLOWED_TYPES)
+    return sel or {"PRODUCT"}
+
+
+def _compute_allowed_ids(
+    df: pl.DataFrame,
+    first_n: int | None,
+    ids: str | None,
+    ids_file: str | Path | None,
+    id_range: str | None,
+) -> set[int] | None:
+    if ids:
+        return set(int(x) for x in ids.split(",") if x.strip())
+    if ids_file:
+        p = Path(ids_file)
+        return set(int(x.strip()) for x in p.read_text().splitlines() if x.strip().isdigit())
+    if id_range and ":" in id_range:
+        a, b = id_range.split(":", 1)
+        try:
+            return set(range(int(a), int(b) + 1))
+        except Exception:
+            return set()
+    if first_n:
+        seen: set[int] = set()
+        out: list[int] = []
+        for pid in df["Identification"].to_list():
+            pid = int(pid)
+            if pid not in seen:
+                seen.add(pid)
+                out.append(pid)
+                if len(out) >= first_n:
+                    break
+        return set(out)
+    return None
+
+
+def load_do_not_translate(dnt_config_path: str | Path | None) -> DoNotTranslateConfig:
+    import yaml
+
+    from src.translate.translator import DoNotTranslateConfig  # lazy import per evitare cicli
+
+    if not dnt_config_path:
+        return DoNotTranslateConfig(brands=[], units=[], tokens=[])
+    with Path(dnt_config_path).open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return DoNotTranslateConfig(
+        brands=list(data.get("brands", []) or []),
+        units=list(data.get("units", []) or []),
+        tokens=list(data.get("tokens", []) or []),
+    )
 
 
 def process_file(
@@ -247,6 +193,7 @@ def process_file(
     dry_run: bool,
     stats: bool,
     *,
+    types: str = "auto",
     first_n: int | None = None,
     ids: str | None = None,
     ids_file: str | Path | None = None,
@@ -263,7 +210,28 @@ def process_file(
     in_path = Path(input_csv)
     input_hash = _hash_file(in_path)
 
-    df = read_csv(in_path).filter(pl.col("Type") == "PRODUCT")
+    df_all = read_csv(in_path)
+    present_types = set(df_all["Type"].unique().to_list())
+    wanted_types = _parse_types_arg(types, present_types)
+    df = df_all.filter(pl.col("Type").is_in(list(wanted_types)))
+
+    # Calcola gli ID da interrogare su Shopify **solo** per i gruppi PRODUCT
+    product_ids_for_status = []
+    if "PRODUCT" in wanted_types:
+        try:
+            product_ids_for_status = [
+                int(x) for x in df.filter(pl.col("Type") == "PRODUCT")["Identification"].to_list()
+            ]
+            product_ids_for_status = sorted(set(product_ids_for_status))
+        except Exception:
+            product_ids_for_status = []
+
+    if product_ids_for_status:
+        active_map = get_active_products_map(product_ids_for_status, dry_run=dry_run)
+    else:
+        active_map = {}
+        # log esplicito: nessuna chiamata a Shopify per questo run
+        logger.info("shopify_status_skip", reason="no_PRODUCT_in_types")
 
     allowed_ids = _compute_allowed_ids(df, first_n, ids, ids_file, id_range)
     if allowed_ids is not None:
@@ -272,7 +240,6 @@ def process_file(
     out_path = Path(output_csv)
     init_output(out_path, truncate=truncate_output)
 
-    # checkpoint per file+locale
     cp_new = _checkpoint_path_for(input_hash, target_locale)
     cp_old = Path("state/checkpoint.json")
     cp = _load_checkpoint_any(cp_new, cp_old, input_hash, target_locale)
@@ -290,8 +257,13 @@ def process_file(
     active_map = get_active_products_map(unique_ids, dry_run=dry_run)
 
     summary = {
-        "translated_rows": 0,  # inteso come "righe scritte"
+        "translated_rows": 0,
         "skipped_inactive": 0,
+        "skipped_by_rule_option": 0,
+        "skipped_by_rule_option_value": 0,
+        "translated_option_rows": 0,
+        "translated_option_value_rows": 0,
+        "unchanged_by_rule_value": 0,  # <--- aggiunto
         "cache_hit": 0,
         "processed_products": 0,
     }
@@ -301,56 +273,122 @@ def process_file(
             logger.info("skip_completed", product_id=pid)
             continue
 
-        if not active_map.get(pid, False):
-            summary["skipped_inactive"] += len(sub)
-            logger.info("skip_inactive", product_id=pid)
-            continue
+        # Tipo del gruppo (per sicurezza, consideriamo il set; i gruppi dovrebbero essere omogenei)
+        sub_types = set(sub["Type"].unique().to_list())
+        is_product_group = "PRODUCT" in sub_types
+
+        # SOLO per PRODUCT consultiamo active_map; OPTION/OPTION_VALUE passano diretti
+        if is_product_group:
+            if not active_map.get(pid, False):
+                summary["skipped_inactive"] += len(sub)
+                logger.info("skip_inactive", product_id=pid)
+                continue
 
         title_translated: str | None = None
         rows_out: list[pl.DataFrame] = []
 
         for row in sub.iter_rows(named=True):
-            # normalizza None -> "" prima di lavorare
             for c in TEXT_COLS:
                 if row.get(c) is None:
                     row[c] = ""
 
-            field = row["Field"].strip()
+            type_name = row["Type"].strip().upper()
+            field_csv = (row["Field"] or "").strip()  # per OPTION/OPTION_VALUE sarà "name"
             default = row["Default content"] or ""
             translated_existing = row["Translated content"] or ""
 
             if translated_existing and not force:
                 rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-                summary["translated_rows"] += 1  # conta anche righe già compilate
+                summary["translated_rows"] += 1
                 continue
 
-            if field == "title":
-                title_translated = translator.translate_field(
-                    "PRODUCT",
-                    field,
-                    default,
-                    target_locale,
-                    dnt=dnt,
-                    exclude_similarity_tokens=exclude_tokens,
-                )
-                translated = title_translated
-            else:
-                translated = translator.translate_field(
-                    "PRODUCT",
-                    field,
-                    default,
-                    target_locale,
-                    dnt=dnt,
-                    exclude_similarity_tokens=exclude_tokens,
-                    title_translated=title_translated,
-                    preserve_handle=preserve_handle,
-                )
+            translated = ""
 
-            if translated == "":
+            if type_name == "PRODUCT":
+                if field_csv == "title":
+                    title_translated = translator.translate_field(
+                        "PRODUCT",
+                        "title",
+                        default,
+                        target_locale,
+                        dnt=dnt,
+                        exclude_similarity_tokens=exclude_tokens,
+                    )
+                    translated = title_translated
+                else:
+                    translated = translator.translate_field(
+                        "PRODUCT",
+                        field_csv,
+                        default,
+                        target_locale,
+                        dnt=dnt,
+                        exclude_similarity_tokens=exclude_tokens,
+                        title_translated=title_translated,
+                        preserve_handle=preserve_handle,
+                    )
+
+            elif type_name == "PRODUCT_OPTION":
+                skip, reason = should_skip_option_name(default)
+                if skip:
+                    summary["skipped_by_rule_option"] += 1
+                    logger.info(
+                        "skip_option_rule", reason=reason, product_id=pid, value=default[:120]
+                    )
+                    continue
+                label_norm, had_colon = normalize_option_label(default)
+                translated = translator.translate_plain(
+                    "PRODUCT_OPTION",
+                    "option_name",  # <-- field interno per soglie/cache
+                    label_norm,
+                    target_locale,
+                    dnt=dnt,
+                    exclude_similarity_tokens=exclude_tokens,
+                )
+                if translated == "":
+                    row["Status"] = "ERROR_SIMILARITY_OPTION"
+                if had_colon and translated:
+                    translated = translated + ":"
+                summary["translated_option_rows"] += 1
+
+            elif type_name == "PRODUCT_OPTION_VALUE":
+                skip, reason = should_skip_option_value_name(default, dnt.units)
+                if skip:
+                    if reason == "value_default_title":
+                        # continua a skippare "Default Title"
+                        summary["skipped_by_rule_option_value"] += 1
+                        logger.info(
+                            "skip_value_rule", reason=reason, product_id=pid, value=default[:120]
+                        )
+                        continue
+                    # scrivi riga invariata con status dedicato
+                    row["Translated content"] = default
+                    row["Status"] = f"UNCHANGED_BY_RULE_VALUE:{reason}"
+                    rows_out.append(pl.DataFrame([row], schema=SCHEMA))
+                    summary["translated_rows"] += 1
+                    summary["unchanged_by_rule_value"] += 1
+                    logger.info(
+                        "value_rule_unchanged", reason=reason, product_id=pid, value=default[:120]
+                    )
+                    continue
+
+                translated = translator.translate_plain(
+                    "PRODUCT_OPTION_VALUE",
+                    "option_value_name",
+                    default,
+                    target_locale,
+                    dnt=dnt,
+                    exclude_similarity_tokens=exclude_tokens,
+                )
+                if translated == "":
+                    row["Status"] = "ERROR_SIMILARITY_VALUE"
+                summary["translated_option_value_rows"] += 1
+
+            # error code per PRODUCT se reject
+            if type_name == "PRODUCT" and translated == "":
                 err_code = (
                     "ERROR_SIMILARITY_HTML"
-                    if field == "body_html"
-                    else f"ERROR_SIMILARITY_{field.upper()}"
+                    if field_csv == "body_html"
+                    else f"ERROR_SIMILARITY_{field_csv.upper()}"
                 )
                 row["Status"] = err_code
 
@@ -374,6 +412,8 @@ def process_file(
         }
         cp_new.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
         summary["processed_products"] += 1
+
+    summary["cache_hit"] = getattr(translator, "cache_hits", 0)
 
     if stats:
         logger.info("summary", **summary)

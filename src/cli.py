@@ -7,7 +7,7 @@ import typer
 from src.config.settings import SETTINGS
 from src.pipeline.process_csv import process_file
 
-app = typer.Typer(help="Traduttore CSV Shopify (PRODUCT)")
+app = typer.Typer(help="Traduttore CSV Shopify (PRODUCT / PRODUCT_OPTION / PRODUCT_VALUE)")
 
 # Opzioni principali
 OPT_INPUT = typer.Option(..., "--input", "-i", help="Path CSV input")
@@ -16,6 +16,13 @@ OPT_TARGET = typer.Option(
     SETTINGS.target_locale, "--target-locale", help="Locale destinazione es. fr-FR"
 )
 OPT_DNT = typer.Option(None, "--dnt", help="Path YAML do_not_translate")
+
+# Filtri Type
+OPT_TYPES = typer.Option(
+    "auto",
+    "--types",
+    help="Tipi da processare (comma-separated). Default: auto (rilevati nel CSV). Esempio: PRODUCT,PRODUCT_OPTION",
+)
 
 # Subsetting
 OPT_FIRSTN = typer.Option(None, "--first-n", help="Primi N Identification unici")
@@ -48,6 +55,7 @@ def process(
     output: Path = OPT_OUTPUT,
     target_locale: str = OPT_TARGET,
     dnt: Path | None = OPT_DNT,
+    types: str = OPT_TYPES,
     first_n: int | None = OPT_FIRSTN,
     ids: str | None = OPT_IDS,
     ids_file: Path | None = OPT_IDS_FILE,
@@ -66,6 +74,8 @@ def process(
         output_csv=output,
         target_locale=target_locale,
         dnt_config_path=dnt,
+        # types
+        types=types,
         # subset
         first_n=first_n,
         ids=ids,
@@ -83,5 +93,4 @@ def process(
         # output
         truncate_output=truncate_output,
     )
-    # manda il “Done …” su stderr per non sporcare JSON su stdout
     typer.echo(f"Done. {summary}", err=True)
