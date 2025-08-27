@@ -1,0 +1,67 @@
+.F.F                                                                     [100%]
+=================================== FAILURES ===================================
+____________________________ test_pipeline_dry_run _____________________________
+
+sample_csv = PosixPath('/tmp/pytest-of-clunizzi/pytest-5/test_pipeline_dry_run0/in.csv')
+tmp_path = PosixPath('/tmp/pytest-of-clunizzi/pytest-5/test_pipeline_dry_run0')
+
+    def test_pipeline_dry_run(sample_csv, tmp_path):
+        out = tmp_path / "out.csv"
+>       summary = process_file(
+            input_csv=sample_csv,
+            output_csv=out,
+            target_locale="fr-FR",
+            dnt_config_path=None,
+            preserve_handle=False,
+            resume=False,
+            force=True,
+            dry_run=True,
+            stats=False,
+        )
+
+/home/clunizzi/shopify_translator/tests/test_pipeline_smoke.py:6: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/home/clunizzi/shopify_translator/src/pipeline/process_csv.py:143: in process_file
+    append_rows(out_path, pl.concat(rows_out))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+path = PosixPath('/tmp/pytest-of-clunizzi/pytest-5/test_pipeline_dry_run0/out.csv')
+df = shape: (6, 8)
+┌─────────┬───────────────┬───────────────┬────────┬────────┬────────┬──────────────┬──────────────┐
+│ T...  ┆ legger…      │
+└─────────┴───────────────┴───────────────┴────────┴────────┴────────┴──────────────┴──────────────┘
+
+    def append_rows(path: str | Path, df: pl.DataFrame) -> None:
+        # Assicura stesso ordine colonne
+        ordered = df.select(
+            [
+                "Type",
+                "Identification",
+                "Field",
+                "Locale",
+                "Market",
+                "Status",
+                "Default content",
+                "Translated content",
+            ]
+        )
+        # Append CSV senza header
+>       ordered.write_csv(path, include_header=False, append=True)
+E       TypeError: DataFrame.write_csv() got an unexpected keyword argument 'append'
+
+/home/clunizzi/shopify_translator/src/io/csv_writer.py:36: TypeError
+______________________________ test_meta_helpers _______________________________
+
+    def test_meta_helpers():
+        s = enforce_meta_title_format("Prodotto X", "Brand", "Benefit")
+        assert " | " in s
+        ok, cut = validate_meta_length("x" * 200, 60)
+        assert not ok
+>       assert len(cut) <= 60
+E       AssertionError: assert 61 <= 60
+E        +  where 61 = len('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+
+/home/clunizzi/shopify_translator/tests/test_validators.py:12: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_pipeline_smoke.py::test_pipeline_dry_run - TypeError: DataF...
+FAILED tests/test_validators.py::test_meta_helpers - AssertionError: assert 6...

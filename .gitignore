@@ -1,0 +1,57 @@
+# --- Secret & local env files ---
+.env
+.env.*
+.env.local
+
+# --- Project data & outputs ---
+data/
+logs/
+state/
+out/
+
+# --- SQLite / local DB / logs ---
+*.sqlite
+*.db
+*.log
+*.tmp
+
+# --- Python bytecode & caches ---
+__pycache__/
+*.py[cod]
+*.pyo
+
+# --- Virtual environments ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Build / packaging artifacts ---
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# --- Test & coverage ---
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Linters / type checkers ---
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.dmypy.json
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- Notebooks / misc ---
+.ipynb_checkpoints/
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db

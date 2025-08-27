@@ -1,0 +1,57 @@
+[project]
+name = "shopify-translator"
+version = "0.1.1"
+description = "Pipeline modulare per tradurre contenuti Shopify da CSV con OpenAI"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Your Org" }]
+dependencies = [
+  "typer>=0.12.3",
+  "httpx>=0.27.0",
+  "tenacity>=8.2.3",
+  "python-dotenv>=1.0.1",
+  "rapidfuzz>=3.9.6",
+  "python-slugify>=8.0.4",
+  "beautifulsoup4>=4.12.3",
+  "html5lib>=1.1",
+  "langid>=1.1.6",
+  "polars>=1.6.0",
+  "pandas>=2.2.2",
+  "structlog>=24.1.0",
+  "openai>=1.40.0",
+  "PyYAML>=6.0.2"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "pytest-cov>=5.0.0",
+  "ruff>=0.6.2",
+  "black>=24.8.0",
+]
+
+[project.scripts]
+shopify-translator = "src.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.black]
+target-version = ["py311"]
+line-length = 100
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
