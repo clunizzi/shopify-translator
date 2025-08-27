@@ -24,7 +24,6 @@ from src.translate.cache import TranslationCache
 from src.translate.translator import Translator
 
 if TYPE_CHECKING:
-    # Solo per gli editor / mypy; nessun costo runtime
     from src.translate.translator import DoNotTranslateConfig
 
 logger = structlog.get_logger()
@@ -49,7 +48,7 @@ SCHEMA = {
     "Translated content": pl.Utf8,
 }
 
-ALLOWED_TYPES = {"PRODUCT", "PRODUCT_OPTION", "PRODUCT_OPTION_VALUE"}
+ALLOWED_TYPES = {"PRODUCT", "PRODUCT_OPTION", "PRODUCT_OPTION_VALUE", "COLLECTION"}
 
 
 def _configure_logging(log_file: Path | None, no_stdout: bool) -> None:
@@ -169,7 +168,7 @@ def _compute_allowed_ids(
 def load_do_not_translate(dnt_config_path: str | Path | None) -> DoNotTranslateConfig:
     import yaml
 
-    from src.translate.translator import DoNotTranslateConfig  # lazy import per evitare cicli
+    from src.translate.translator import DoNotTranslateConfig  # lazy to avoid cycle
 
     if not dnt_config_path:
         return DoNotTranslateConfig(brands=[], units=[], tokens=[])
@@ -215,24 +214,6 @@ def process_file(
     wanted_types = _parse_types_arg(types, present_types)
     df = df_all.filter(pl.col("Type").is_in(list(wanted_types)))
 
-    # Calcola gli ID da interrogare su Shopify **solo** per i gruppi PRODUCT
-    product_ids_for_status = []
-    if "PRODUCT" in wanted_types:
-        try:
-            product_ids_for_status = [
-                int(x) for x in df.filter(pl.col("Type") == "PRODUCT")["Identification"].to_list()
-            ]
-            product_ids_for_status = sorted(set(product_ids_for_status))
-        except Exception:
-            product_ids_for_status = []
-
-    if product_ids_for_status:
-        active_map = get_active_products_map(product_ids_for_status, dry_run=dry_run)
-    else:
-        active_map = {}
-        # log esplicito: nessuna chiamata a Shopify per questo run
-        logger.info("shopify_status_skip", reason="no_PRODUCT_in_types")
-
     allowed_ids = _compute_allowed_ids(df, first_n, ids, ids_file, id_range)
     if allowed_ids is not None:
         df = df.filter(pl.col("Identification").cast(pl.Int64).is_in(list(allowed_ids)))
@@ -252,9 +233,21 @@ def process_file(
     dnt = load_do_not_translate(dnt_config_path)
     exclude_tokens = [*dnt.brands, *dnt.units, *dnt.tokens]
 
-    all_ids = [int(x) for x in df["Identification"].to_list()]
-    unique_ids = sorted(set(all_ids))
-    active_map = get_active_products_map(unique_ids, dry_run=dry_run)
+    # Shopify status SOLO per PRODUCT
+    product_ids_for_status: list[int] = []
+    if "PRODUCT" in wanted_types:
+        try:
+            product_ids_for_status = [
+                int(x) for x in df.filter(pl.col("Type") == "PRODUCT")["Identification"].to_list()
+            ]
+            product_ids_for_status = sorted(set(product_ids_for_status))
+        except Exception:
+            product_ids_for_status = []
+    if product_ids_for_status:
+        active_map = get_active_products_map(product_ids_for_status, dry_run=dry_run)
+    else:
+        active_map = {}
+        logger.info("shopify_status_skip", reason="no_PRODUCT_in_types")
 
     summary = {
         "translated_rows": 0,
@@ -263,7 +256,8 @@ def process_file(
         "skipped_by_rule_option_value": 0,
         "translated_option_rows": 0,
         "translated_option_value_rows": 0,
-        "unchanged_by_rule_value": 0,  # <--- aggiunto
+        "unchanged_by_rule_value": 0,
+        "skipped_empty_body_html": 0,
         "cache_hit": 0,
         "processed_products": 0,
     }
@@ -273,16 +267,12 @@ def process_file(
             logger.info("skip_completed", product_id=pid)
             continue
 
-        # Tipo del gruppo (per sicurezza, consideriamo il set; i gruppi dovrebbero essere omogenei)
         sub_types = set(sub["Type"].unique().to_list())
         is_product_group = "PRODUCT" in sub_types
-
-        # SOLO per PRODUCT consultiamo active_map; OPTION/OPTION_VALUE passano diretti
-        if is_product_group:
-            if not active_map.get(pid, False):
-                summary["skipped_inactive"] += len(sub)
-                logger.info("skip_inactive", product_id=pid)
-                continue
+        if is_product_group and not active_map.get(pid, False):
+            summary["skipped_inactive"] += len(sub)
+            logger.info("skip_inactive", product_id=pid)
+            continue
 
         title_translated: str | None = None
         rows_out: list[pl.DataFrame] = []
@@ -293,9 +283,14 @@ def process_file(
                     row[c] = ""
 
             type_name = row["Type"].strip().upper()
-            field_csv = (row["Field"] or "").strip()  # per OPTION/OPTION_VALUE sarà "name"
+            field_csv = (row["Field"] or "").strip()
             default = row["Default content"] or ""
             translated_existing = row["Translated content"] or ""
+
+            if field_csv == "body_html" and not default.strip():
+                summary["skipped_empty_body_html"] += 1
+                logger.info("skip_empty_body_html", product_id=pid, type_name=type_name)
+                continue
 
             if translated_existing and not force:
                 rows_out.append(pl.DataFrame([row], schema=SCHEMA))
@@ -338,7 +333,7 @@ def process_file(
                 label_norm, had_colon = normalize_option_label(default)
                 translated = translator.translate_plain(
                     "PRODUCT_OPTION",
-                    "option_name",  # <-- field interno per soglie/cache
+                    "option_name",
                     label_norm,
                     target_locale,
                     dnt=dnt,
@@ -354,13 +349,11 @@ def process_file(
                 skip, reason = should_skip_option_value_name(default, dnt.units)
                 if skip:
                     if reason == "value_default_title":
-                        # continua a skippare "Default Title"
                         summary["skipped_by_rule_option_value"] += 1
                         logger.info(
                             "skip_value_rule", reason=reason, product_id=pid, value=default[:120]
                         )
                         continue
-                    # scrivi riga invariata con status dedicato
                     row["Translated content"] = default
                     row["Status"] = f"UNCHANGED_BY_RULE_VALUE:{reason}"
                     rows_out.append(pl.DataFrame([row], schema=SCHEMA))
@@ -383,8 +376,31 @@ def process_file(
                     row["Status"] = "ERROR_SIMILARITY_VALUE"
                 summary["translated_option_value_rows"] += 1
 
-            # error code per PRODUCT se reject
-            if type_name == "PRODUCT" and translated == "":
+            elif type_name == "COLLECTION":
+                if field_csv == "title":
+                    title_translated = translator.translate_field(
+                        "COLLECTION",
+                        "title",
+                        default,
+                        target_locale,
+                        dnt=dnt,
+                        exclude_similarity_tokens=exclude_tokens,
+                    )
+                    translated = title_translated
+                else:
+                    translated = translator.translate_field(
+                        "COLLECTION",
+                        field_csv,
+                        default,
+                        target_locale,
+                        dnt=dnt,
+                        exclude_similarity_tokens=exclude_tokens,
+                        title_translated=title_translated,
+                        preserve_handle=preserve_handle,
+                    )
+
+            # error code per reject
+            if type_name in {"PRODUCT", "COLLECTION"} and translated == "":
                 err_code = (
                     "ERROR_SIMILARITY_HTML"
                     if field_csv == "body_html"
@@ -413,6 +429,7 @@ def process_file(
         cp_new.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
         summary["processed_products"] += 1
 
+    # aggiorna contatore cache_hit se disponibile
     summary["cache_hit"] = getattr(translator, "cache_hits", 0)
 
     if stats:

@@ -420,7 +420,7 @@ class Translator:
         field: str,
         html: str,
         target_locale: str,
-        dnt: DoNotTranslateConfig,
+        dnt: "DoNotTranslateConfig",
         exclude_similarity_tokens: Sequence[str],
         *,
         strict: bool = False,
@@ -430,9 +430,9 @@ class Translator:
         - Estrae segmenti testuali -> [[T0]], [[T1]]... (ordine stabile)
         - Usa cache per segmento (hit/miss loggati)
         - Chiama OpenAI una sola volta per i miss, chiedendo JSON {"translations":[...]}
-        - Parsing JSON tollerante (no crash): padding/troncamento se lunghezze mismatch
-        - Re-inietta le traduzioni nelle posizioni originali
-        - Similarità/language check: log warning, non solleva
+        - Gestisce risposta come str o tuple (text, meta)
+        - Parsing JSON tollerante (no crash) + fallback per segmenti vuoti
+        - Guard finale: se output “solo tag”, restituisce l’HTML originale
         """
         # 1) Estrazione segmenti
         html_map, segments = extract_text_segments(html or "")
@@ -474,19 +474,21 @@ class Translator:
             system = (
                 _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
                 + " Restituisci SOLO un oggetto JSON con chiave 'translations': una lista di stringhe, "
-                "una per ciascun segmento in 'segments', nello stesso ordine."
+                  "una per ciascun segmento in 'segments', nello stesso ordine."
             )
 
             if not self.dry_run:
                 logger.info("openai_call_html", type_name=type_name, field=field, segments=misses)
 
-            s = json.dumps(payload, ensure_ascii=False)
-            # NB: _call_openai ritorna una stringa; in dry_run usi la simulazione che già hai
-            resp_text = (
-                self._call_openai(system, s)
-                if not self.dry_run
-                else json.dumps({"translations": todo}, ensure_ascii=False)
-            )
+            req_text = json.dumps(payload, ensure_ascii=False)
+            if self.dry_run:
+                resp_text, meta = json.dumps({"translations": todo}, ensure_ascii=False), {}
+            else:
+                resp = self._call_openai(system, req_text)
+                if isinstance(resp, tuple):
+                    resp_text, meta = resp
+                else:
+                    resp_text, meta = resp, {}
 
             # 4) Parsing tollerante
             translated_list: list[str] = []
@@ -512,11 +514,14 @@ class Translator:
                 else:
                     translated_list.extend([""] * (len(todo) - len(translated_list)))
 
+            # Fallback per-segmento: se vuoto, usa il sorgente
+            translated_list = [dst if (dst or "").strip() else src for src, dst in zip(todo, translated_list)]
+
             # Mappa {idx -> traduzione} per i miss
             fresh_map = {i: translated_list[k] for k, i in enumerate(idxs)}
 
             # Aggiorna cache solo per i segmenti appena tradotti
-            for i, seg in zip(idxs, todo, strict=False):
+            for i, seg in zip(idxs, todo):
                 text_norm = normalize_text(seg)
                 key = self._cache_key(type_name, field, target_locale, text_norm)
                 self.cache.set(key, {"translated": fresh_map.get(i, "")}, self.model)
@@ -538,22 +543,17 @@ class Translator:
             lang, conf = ("unknown", 0.0)
 
         sim = similarity(plain_src, plain_dst, exclude_tokens=exclude_similarity_tokens)
-        logger.info(
-            "html_similarity",
-            field=field,
-            lang=lang,
-            conf=conf,
-            sim=sim,
-            threshold=SETTINGS.sim_t_html,
-        )
+        logger.info("html_similarity", field=field, lang=lang, conf=conf, sim=sim, threshold=SETTINGS.sim_t_html)
 
-        # (Policy tollerante: non alziamo. Il chiamante può impostare Status se vuole segnalare.)
-        if not self.dry_run and sim >= SETTINGS.sim_t_html and lang != (target_locale[:2]):
-            logger.warning("html_similarity_suspicious", field=field, lang=lang, sim=sim)
+        # Guard finale: se output “solo tag” (no testo) ma input aveva testo, restituisci originale
+        if plain_src and not plain_dst:
+            logger.warning("html_translation_empty_fallback", field=field)
+            return html or ""
 
         # 7) Re-iniezione nelle strutture HTML e ritorno
         out_html = reinject_text(html_map, translated_segments)
         return out_html
+
 
     def translate_field(
         self,
