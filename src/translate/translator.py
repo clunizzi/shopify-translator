@@ -6,6 +6,7 @@ import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -25,6 +26,122 @@ from src.translate.validators import (
 )
 
 logger = structlog.get_logger("translate")
+
+TECH_VALUE_RE = re.compile(
+    r"""^
+    \s*
+    (?:
+        (?:https?://\S+)                              # URL
+        |
+        (?:
+            [\d\s.,/×x*+-]+                           # numeri + separatori
+            (?:                                       # unità opzionali
+                (?:mm|cm|m|km|mm²|cm²|m²|mm3|cm3|m3|mm³|cm³|m³|
+                 ml|mL|l|L|kg|g|mg|
+                 kW|W|V|A|Ah|Hz|
+                 HP|hp|CV|cv|
+                 dB(?:\(A\))?|m/s(?:²)?|m³/h|cf/min|min|sec|s|°C|°F|bar|Pa|N·m
+                )
+            )?
+            (?:\s*[\"'″″′’”]|)                        # pollici/apici opzionali
+            [\s\d¹²³⁴⁵⁶⁷⁸⁹⁰\.\-\/\(\)\[\]]*          # apici/simboli vari
+        )
+        |
+        (?:[XS]L|S|M|L|XL|XXL|XXXL)                   # taglie comuni
+    )
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+PREFIX_TECH_SPLIT_RE = re.compile(
+    r"^\s*([0-9\s.,/×x*+-]+(?:mm|cm|m|mm³|cm³|m³|kW|W|V|A|Ah|Hz|dB\(A\)|dB|m/s(?:²)?|m³/h|cf/min|min|%|°C|°F)?\s*(?:-|–|—|:)\s*)(.+)$",
+    re.IGNORECASE,
+)
+
+
+def is_technical_value(s: str) -> bool:
+    """True se stringa è solo numeri/unità/simboli (o URL/size)."""
+    return bool(TECH_VALUE_RE.match((s or "").strip()))
+
+
+def split_prefix_tech_text(s: str) -> tuple[str, str] | None:
+    """
+    Se stringa ha prefisso tecnico ('20m - test'), separa (prefisso, testo).
+    """
+    m = PREFIX_TECH_SPLIT_RE.match(s or "")
+    if m:
+        return m.group(1), m.group(2).strip()
+    return None
+
+
+def try_extract_json(s: str) -> Any | None:
+    """Prova a fare json.loads con fallback: estrai da prima { o [ } fino a ultima } o ]."""
+    if not s or not s.strip():
+        return None
+    txt = s.strip()
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+    # fallback: ritaglia
+    start_brace = txt.find("{")
+    start_bracket = txt.find("[")
+    start = min([i for i in [start_brace, start_bracket] if i >= 0], default=-1)
+    if start < 0:
+        return None
+    cut = txt[start:]
+    # taglia alla chiusura compatibile più a destra
+    end_brace = cut.rfind("}")
+    end_bracket = cut.rfind("]")
+    end = max(end_brace, end_bracket)
+    if end >= 0:
+        cut = cut[: end + 1]
+    try:
+        return json.loads(cut)
+    except Exception:
+        return None
+
+
+def safe_parse_openai_list(output: str) -> list[str]:
+    """
+    Accetta sia:
+      - oggetto {"translations":[...]}
+      - lista nuda [...]
+      - output con fence ```json
+    Ritorna lista di stringhe o lista vuota.
+    """
+    s = (output or "").strip()
+    if s.lower().startswith("output:"):
+        s = s[len("output:") :].strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        if s.startswith("json"):
+            s = s[4:].strip()
+    # prova oggetto
+    try:
+        obj = json.loads(s)
+        if (
+            isinstance(obj, dict)
+            and "translations" in obj
+            and isinstance(obj["translations"], list)
+        ):
+            return [str(x) if x is not None else "" for x in obj["translations"]]
+        if isinstance(obj, list):
+            return [str(x) if x is not None else "" for x in obj]
+    except Exception:
+        pass
+    # estrai prima lista plausibile
+    lb = s.find("[")
+    rb = s.rfind("]")
+    if lb >= 0 and rb > lb:
+        try:
+            arr = json.loads(s[lb : rb + 1])
+            if isinstance(arr, list):
+                return [str(x) if x is not None else "" for x in arr]
+        except Exception:
+            return []
+    return []
 
 
 def detect_lang_fast(text: str) -> tuple[str, float]:
@@ -420,7 +537,7 @@ class Translator:
         field: str,
         html: str,
         target_locale: str,
-        dnt: "DoNotTranslateConfig",
+        dnt: DoNotTranslateConfig,
         exclude_similarity_tokens: Sequence[str],
         *,
         strict: bool = False,
@@ -474,7 +591,7 @@ class Translator:
             system = (
                 _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
                 + " Restituisci SOLO un oggetto JSON con chiave 'translations': una lista di stringhe, "
-                  "una per ciascun segmento in 'segments', nello stesso ordine."
+                "una per ciascun segmento in 'segments', nello stesso ordine."
             )
 
             if not self.dry_run:
@@ -482,13 +599,10 @@ class Translator:
 
             req_text = json.dumps(payload, ensure_ascii=False)
             if self.dry_run:
-                resp_text, meta = json.dumps({"translations": todo}, ensure_ascii=False), {}
+                resp_text = json.dumps({"translations": todo}, ensure_ascii=False)
             else:
                 resp = self._call_openai(system, req_text)
-                if isinstance(resp, tuple):
-                    resp_text, meta = resp
-                else:
-                    resp_text, meta = resp, {}
+                resp_text = resp[0] if isinstance(resp, tuple) else resp
 
             # 4) Parsing tollerante
             translated_list: list[str] = []
@@ -515,13 +629,16 @@ class Translator:
                     translated_list.extend([""] * (len(todo) - len(translated_list)))
 
             # Fallback per-segmento: se vuoto, usa il sorgente
-            translated_list = [dst if (dst or "").strip() else src for src, dst in zip(todo, translated_list)]
+            translated_list = [
+                dst if (dst or "").strip() else src
+                for src, dst in zip(todo, translated_list, strict=False)
+            ]
 
             # Mappa {idx -> traduzione} per i miss
             fresh_map = {i: translated_list[k] for k, i in enumerate(idxs)}
 
             # Aggiorna cache solo per i segmenti appena tradotti
-            for i, seg in zip(idxs, todo):
+            for i, seg in zip(idxs, todo, strict=False):
                 text_norm = normalize_text(seg)
                 key = self._cache_key(type_name, field, target_locale, text_norm)
                 self.cache.set(key, {"translated": fresh_map.get(i, "")}, self.model)
@@ -543,7 +660,14 @@ class Translator:
             lang, conf = ("unknown", 0.0)
 
         sim = similarity(plain_src, plain_dst, exclude_tokens=exclude_similarity_tokens)
-        logger.info("html_similarity", field=field, lang=lang, conf=conf, sim=sim, threshold=SETTINGS.sim_t_html)
+        logger.info(
+            "html_similarity",
+            field=field,
+            lang=lang,
+            conf=conf,
+            sim=sim,
+            threshold=SETTINGS.sim_t_html,
+        )
 
         # Guard finale: se output “solo tag” (no testo) ma input aveva testo, restituisci originale
         if plain_src and not plain_dst:
@@ -553,7 +677,6 @@ class Translator:
         # 7) Re-iniezione nelle strutture HTML e ritorno
         out_html = reinject_text(html_map, translated_segments)
         return out_html
-
 
     def translate_field(
         self,
@@ -614,3 +737,223 @@ class Translator:
         return self.translate_plain(
             type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens
         )
+
+    # -------------------------------
+    # JSON translation for METAFIELD
+    # -------------------------------
+    def translate_json_value(
+        self,
+        type_name: str,
+        field_logical: str,  # "value" | "meta_title" | "meta_description"
+        default_content: str,
+        target_locale: str,
+        dnt: DoNotTranslateConfig,
+        exclude_similarity_tokens: Sequence[str],
+        *,
+        batch_size: int = 8,
+    ) -> str:
+        """
+        Traduce solo i VALORI (leaf string) del JSON, saltando numeri/unità/URL.
+        Tollerante: non solleva, in errore ritorna "" per permettere al chiamante di impostare Status.
+        """
+        logger.info("json_detect", type_name=type_name, field=field_logical)
+
+        # 0) Parse JSON; se fallisce → tratta come plain
+        obj = try_extract_json(default_content)
+        if obj is None:
+            # Plain string: applica stesse regole di skip tecnico/prefisso e traduci come testo
+            s = (default_content or "").strip()
+            if not s:
+                return ""
+            if is_technical_value(s):
+                logger.info("json_skip_tech", reason="technical_plain")
+                return s
+            pref = split_prefix_tech_text(s)
+            if pref:
+                prefix, text = pref
+            else:
+                prefix, text = ("", s)
+
+            translated = self.translate_plain(
+                type_name,
+                field_logical if field_logical in {"meta_title", "meta_description"} else "value",
+                text,
+                target_locale,
+                dnt=dnt,
+                exclude_similarity_tokens=exclude_similarity_tokens,
+            )
+            return (prefix + translated) if translated else ""
+
+        # 1) Flatten: raccogli tutte le leaf string
+        paths: list[tuple] = []
+        leaves: list[str] = []
+
+        def _walk(x: Any, path: tuple):
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    _walk(v, path + (k,))
+            elif isinstance(x, list):
+                for i, v in enumerate(x):
+                    _walk(v, path + (i,))
+            elif isinstance(x, str):
+                leaves.append(x)
+                paths.append(path)
+            else:
+                # tipi non string non si traducono
+                return
+
+        _walk(obj, ())
+
+        if not leaves:
+            # niente da tradurre
+            return json.dumps(obj, ensure_ascii=False)
+
+        # 2) Cache & skip tecnico per leaf
+        cached_out: dict[int, str] = {}
+        todo_texts: list[str] = []
+        todo_idxs: list[int] = []
+        skip_count = 0
+
+        dont = list(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
+
+        for i, seg in enumerate(leaves):
+            s = (seg or "").strip()
+            if (
+                not s
+                or is_technical_value(s)
+                or s.lower().startswith("http://")
+                or s.lower().startswith("https://")
+            ):
+                cached_out[i] = s
+                skip_count += 1
+                logger.info("json_segment_skipped", reason="tech_or_url")
+                continue
+
+            # gestisci prefisso tecnico (es. "20m - ")
+            prefix = ""
+            sp = split_prefix_tech_text(s)
+            if sp:
+                prefix, s = sp
+
+            text_norm = normalize_text(s)
+            key = self._cache_key(type_name, field_logical, target_locale, text_norm)
+            entry = self.cache.get(key)
+            translated = (entry.get("translated") or "").strip() if entry else ""
+            if translated:
+                cached_out[i] = prefix + translated
+                self.cache_hits += 1
+                logger.info("cache_hit_json", field=field_logical)
+            else:
+                todo_texts.append(s)
+                todo_idxs.append(i)
+                # memorizza prefix per reiniezione post-traduzione
+                cached_out[i] = prefix  # temporaneamente solo prefisso
+
+        if todo_texts:
+            self.cache_misses += len(todo_texts)
+            logger.info("cache_miss_json", field=field_logical, segments=len(todo_texts))
+
+        # 3) Batch OpenAI sui miss
+        fresh_map: dict[int, str] = {}
+        try:
+            if todo_texts and not self.dry_run:
+                system = (
+                    _build_system_prompt(type_name, field_logical, target_locale, dnt, strict=True)
+                    + " Traduci SOLO i valori testuali (non le chiavi). "
+                    'Rispondi con un JSON valido: o un oggetto {"translations":[...]} '
+                    "oppure direttamente una lista [...]. Ordine invariato."
+                )
+                for b in range(0, len(todo_texts), batch_size):
+                    batch = todo_texts[b : b + batch_size]
+                    user_payload = json.dumps(
+                        {"values": batch, "do_not_translate": dont},
+                        ensure_ascii=False,
+                    )
+                    resp = self._call_openai(system, user_payload)
+                    resp_text = resp[0] if isinstance(resp, tuple) else resp
+                    arr = safe_parse_openai_list(resp_text)
+                    if not arr:
+                        logger.error(
+                            "openai_json_error",
+                            error="empty_or_parse_fail",
+                            field=field_logical,
+                            sample=resp_text[:300],
+                        )
+                        # lasciamo vuoto: caller imposterà Status
+                        return ""
+                    # riallinea lunghezze
+                    if len(arr) < len(batch):
+                        arr += [""] * (len(batch) - len(arr))
+                    elif len(arr) > len(batch):
+                        arr = arr[: len(batch)]
+
+                    # copia nelle posizioni originali
+                    for j, t in enumerate(arr):
+                        idx = todo_idxs[b + j]
+                        full = (cached_out[idx] or "") + (t or "")
+                        fresh_map[idx] = full
+                        # aggiorna cache singolo leaf (senza prefisso tecnico)
+                        text_norm = normalize_text(batch[j])
+                        key = self._cache_key(type_name, field_logical, target_locale, text_norm)
+                        self.cache.set(key, {"translated": t or ""}, model=self.model)
+                logger.info("openai_call_json", field=field_logical, segments=len(todo_texts))
+            elif todo_texts and self.dry_run:
+                # DRY-RUN: eco con marker
+                for j, s in enumerate(todo_texts):
+                    idx = todo_idxs[j]
+                    fresh_map[idx] = (cached_out[idx] or "") + f"[{target_locale}] {s}"
+        except Exception as e:
+            logger.error("openai_json_error", error=str(e), field=field_logical)
+            return ""
+
+        # 4) Ricostruzione oggetto
+        def _set_in(obj_ref: Any, path: tuple, value: Any):
+            cur = obj_ref
+            for k in path[:-1]:
+                cur = cur[k]
+            cur[path[-1]] = value
+
+        out_obj = json.loads(json.dumps(obj))  # shallow copy via json
+        for i, path in enumerate(paths):
+            if i in fresh_map:
+                _set_in(out_obj, path, fresh_map[i])
+            elif i in cached_out:
+                _set_in(out_obj, path, cached_out[i])
+            else:
+                _set_in(out_obj, path, leaves[i])
+
+        # 5) Similarità / lingua: solo logging, mai bloccare
+        plain_src = " ".join(x.strip() for x in leaves if x and isinstance(x, str))
+        # dst flatten
+        # prendi valori string dall'oggetto finale
+        flat_dst: list[str] = []
+
+        def _walk2(x: Any):
+            if isinstance(x, dict):
+                for v in x.values():
+                    _walk2(v)
+            elif isinstance(x, list):
+                for v in x:
+                    _walk2(v)
+            elif isinstance(x, str):
+                flat_dst.append(x)
+
+        _walk2(out_obj)
+        plain_dst = " ".join(x.strip() for x in flat_dst if x)
+        try:
+            lang, conf = detect_lang_fast(plain_dst)  # già importato altrove nel file
+        except Exception:
+            lang, conf = ("unknown", 0.0)
+        sim = similarity(plain_src, plain_dst, exclude_tokens=exclude_similarity_tokens)
+        logger.info(
+            "json_similarity",
+            extra={
+                "field": field_logical,
+                "lang": lang,
+                "conf": conf,
+                "sim": sim,
+                "threshold": self._threshold_for_field(field_logical),
+            },
+        )
+
+        return json.dumps(out_obj, ensure_ascii=False)

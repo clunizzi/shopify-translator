@@ -19,6 +19,7 @@ from src.rules.option_value import (
     should_skip_option_name,
     should_skip_option_value_name,
 )
+from src.shopify.metafield_owner import get_metafields_owner_map
 from src.shopify.product_status import get_active_products_map
 from src.translate.cache import TranslationCache
 from src.translate.translator import Translator
@@ -48,17 +49,19 @@ SCHEMA = {
     "Translated content": pl.Utf8,
 }
 
-ALLOWED_TYPES = {"PRODUCT", "PRODUCT_OPTION", "PRODUCT_OPTION_VALUE", "COLLECTION"}
+ALLOWED_TYPES = {"PRODUCT", "PRODUCT_OPTION", "PRODUCT_OPTION_VALUE", "COLLECTION", "METAFIELD"}
 
 
 def _configure_logging(log_file: Path | None, no_stdout: bool) -> None:
     handlers: list[logging.Handler] = []
     level = getattr(logging, SETTINGS.log_level.upper(), logging.INFO)
+
     if not no_stdout:
         sh = logging.StreamHandler(sys.stdout)
         sh.setLevel(level)
         sh.setFormatter(logging.Formatter("%(message)s"))
         handlers.append(sh)
+
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         fh = TimedRotatingFileHandler(
@@ -71,15 +74,18 @@ def _configure_logging(log_file: Path | None, no_stdout: bool) -> None:
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter("%(message)s"))
         handlers.append(fh)
+
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(level)
     for h in handlers:
         root.addHandler(h)
+
     for name in ("httpx", "httpcore", "urllib3", "hpack", "h11"):
         lg = logging.getLogger(name)
         lg.setLevel(logging.WARNING)
         lg.propagate = False
+
     structlog.configure(
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.make_filtering_bound_logger(level),
@@ -209,29 +215,51 @@ def process_file(
     in_path = Path(input_csv)
     input_hash = _hash_file(in_path)
 
+    # Lettura + filtro tipi
     df_all = read_csv(in_path)
     present_types = set(df_all["Type"].unique().to_list())
     wanted_types = _parse_types_arg(types, present_types)
     df = df_all.filter(pl.col("Type").is_in(list(wanted_types)))
 
+    # FILTRI ID prima delle query (riduce chiamate)
     allowed_ids = _compute_allowed_ids(df, first_n, ids, ids_file, id_range)
     if allowed_ids is not None:
         df = df.filter(pl.col("Identification").cast(pl.Int64).is_in(list(allowed_ids)))
 
-    out_path = Path(output_csv)
-    init_output(out_path, truncate=truncate_output)
+    # --- Metafield owner/key map + active (solo se richiesto) ---
+    metafield_owner_map: dict[int, dict] = {}
+    metafield_active_map: dict[int, bool] = {}
+    if "METAFIELD" in wanted_types:
+        try:
+            mf_ids = [
+                int(x) for x in df.filter(pl.col("Type") == "METAFIELD")["Identification"].to_list()
+            ]
+            mf_ids = sorted(set(mf_ids))
+        except Exception:
+            mf_ids = []
 
-    cp_new = _checkpoint_path_for(input_hash, target_locale)
-    cp_old = Path("state/checkpoint.json")
-    cp = _load_checkpoint_any(cp_new, cp_old, input_hash, target_locale)
-    completed: set[int] = set()
-    if resume and cp and cp.get("input_hash") == input_hash and cp.get("locale") == target_locale:
-        completed = set(cp.get("completed_identifications", []))
-
-    cache = TranslationCache()
-    translator = Translator(cache=cache, model=SETTINGS.openai_model, dry_run=dry_run)
-    dnt = load_do_not_translate(dnt_config_path)
-    exclude_tokens = [*dnt.brands, *dnt.units, *dnt.tokens]
+        if mf_ids:
+            metafield_owner_map = get_metafields_owner_map(mf_ids)
+            # Attivi solo per owner PRODUCT
+            owner_product_ids = sorted(
+                set(
+                    d["owner_numeric"]
+                    for d in metafield_owner_map.values()
+                    if d.get("owner_type") == "PRODUCT" and d.get("owner_numeric") is not None
+                )
+            )
+            product_active = (
+                get_active_products_map(owner_product_ids, dry_run=dry_run)
+                if owner_product_ids
+                else {}
+            )
+            for mf_id, info in metafield_owner_map.items():
+                if info.get("owner_type") == "PRODUCT":
+                    onum = info.get("owner_numeric")
+                    metafield_active_map[mf_id] = bool(product_active.get(int(onum or 0), False))
+                else:
+                    # non-PRODUCT: procedo senza filtro
+                    metafield_active_map[mf_id] = True
 
     # Shopify status SOLO per PRODUCT
     product_ids_for_status: list[int] = []
@@ -249,8 +277,25 @@ def process_file(
         active_map = {}
         logger.info("shopify_status_skip", reason="no_PRODUCT_in_types")
 
+    # Output + checkpoint
+    out_path = Path(output_csv)
+    init_output(out_path, truncate=truncate_output)
+
+    cp_new = _checkpoint_path_for(input_hash, target_locale)
+    cp_old = Path("state/checkpoint.json")
+    cp = _load_checkpoint_any(cp_new, cp_old, input_hash, target_locale)
+    completed: set[int] = set()
+    if resume and cp and cp.get("input_hash") == input_hash and cp.get("locale") == target_locale:
+        completed = set(cp.get("completed_identifications", []))
+
+    cache = TranslationCache()
+    translator = Translator(cache=cache, model=SETTINGS.openai_model, dry_run=dry_run)
+    dnt = load_do_not_translate(dnt_config_path)
+    exclude_tokens = [*dnt.brands, *dnt.units, *dnt.tokens]
+
     summary = {
         "translated_rows": 0,
+        "copied_rows_existing": 0,
         "skipped_inactive": 0,
         "skipped_by_rule_option": 0,
         "skipped_by_rule_option_value": 0,
@@ -258,6 +303,7 @@ def process_file(
         "translated_option_value_rows": 0,
         "unchanged_by_rule_value": 0,
         "skipped_empty_body_html": 0,
+        "translated_metafield_rows": 0,
         "cache_hit": 0,
         "processed_products": 0,
     }
@@ -268,8 +314,17 @@ def process_file(
             continue
 
         sub_types = set(sub["Type"].unique().to_list())
-        is_product_group = "PRODUCT" in sub_types
-        if is_product_group and not active_map.get(pid, False):
+
+        # METAFIELD: skip se owner=PRODUCT inattivo
+        if "METAFIELD" in sub_types:
+            active_ok = metafield_active_map.get(int(pid), True)
+            if not active_ok:
+                summary["skipped_inactive"] += len(sub)
+                logger.info("skip_metafield_inactive_owner", metafield_id=int(pid))
+                continue
+
+        # PRODUCT: skip se inattivo
+        if "PRODUCT" in sub_types and not active_map.get(pid, False):
             summary["skipped_inactive"] += len(sub)
             logger.info("skip_inactive", product_id=pid)
             continue
@@ -278,6 +333,7 @@ def process_file(
         rows_out: list[pl.DataFrame] = []
 
         for row in sub.iter_rows(named=True):
+            # normalizzazione null -> ""
             for c in TEXT_COLS:
                 if row.get(c) is None:
                     row[c] = ""
@@ -287,17 +343,20 @@ def process_file(
             default = row["Default content"] or ""
             translated_existing = row["Translated content"] or ""
 
+            # Skip silenzioso: body_html senza contenuto (stringa vuota)
             if field_csv == "body_html" and not default.strip():
                 summary["skipped_empty_body_html"] += 1
                 logger.info("skip_empty_body_html", product_id=pid, type_name=type_name)
                 continue
 
+            # Se già presente e non forzi, copia la riga esistente
             if translated_existing and not force:
                 rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-                summary["translated_rows"] += 1
+                summary["copied_rows_existing"] += 1
                 continue
 
             translated = ""
+            did_translate = False
 
             if type_name == "PRODUCT":
                 if field_csv == "title":
@@ -310,6 +369,7 @@ def process_file(
                         exclude_similarity_tokens=exclude_tokens,
                     )
                     translated = title_translated
+                    did_translate = True
                 else:
                     translated = translator.translate_field(
                         "PRODUCT",
@@ -321,6 +381,7 @@ def process_file(
                         title_translated=title_translated,
                         preserve_handle=preserve_handle,
                     )
+                    did_translate = True
 
             elif type_name == "PRODUCT_OPTION":
                 skip, reason = should_skip_option_name(default)
@@ -344,6 +405,7 @@ def process_file(
                 if had_colon and translated:
                     translated = translated + ":"
                 summary["translated_option_rows"] += 1
+                did_translate = True
 
             elif type_name == "PRODUCT_OPTION_VALUE":
                 skip, reason = should_skip_option_value_name(default, dnt.units)
@@ -357,7 +419,7 @@ def process_file(
                     row["Translated content"] = default
                     row["Status"] = f"UNCHANGED_BY_RULE_VALUE:{reason}"
                     rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-                    summary["translated_rows"] += 1
+                    summary["translated_rows"] += 1  # viene considerata "output scritto"
                     summary["unchanged_by_rule_value"] += 1
                     logger.info(
                         "value_rule_unchanged", reason=reason, product_id=pid, value=default[:120]
@@ -375,6 +437,7 @@ def process_file(
                 if translated == "":
                     row["Status"] = "ERROR_SIMILARITY_VALUE"
                 summary["translated_option_value_rows"] += 1
+                did_translate = True
 
             elif type_name == "COLLECTION":
                 if field_csv == "title":
@@ -387,6 +450,7 @@ def process_file(
                         exclude_similarity_tokens=exclude_tokens,
                     )
                     translated = title_translated
+                    did_translate = True
                 else:
                     translated = translator.translate_field(
                         "COLLECTION",
@@ -398,8 +462,42 @@ def process_file(
                         title_translated=title_translated,
                         preserve_handle=preserve_handle,
                     )
+                    did_translate = True
 
-            # error code per reject
+            elif type_name == "METAFIELD":
+                info = metafield_owner_map.get(int(pid), {}) if metafield_owner_map else {}
+                key = (info.get("key") or "").strip()
+                # mappa campo logico per policy/prompt
+                if key == "title_tag":
+                    field_logical = "meta_title"
+                elif key == "description_tag":
+                    field_logical = "meta_description"
+                else:
+                    field_logical = "value"
+
+                translated = translator.translate_json_value(
+                    "METAFIELD",
+                    field_logical,
+                    default,
+                    target_locale,
+                    dnt=dnt,
+                    exclude_similarity_tokens=exclude_tokens,
+                )
+
+                src_strip = default.strip()
+                if translated == "":
+                    if src_strip in ("{}", "[]"):
+                        translated = src_strip  # JSON vuoto: preserva, no errore
+                    else:
+                        row["Status"] = (
+                            "ERROR_SIMILARITY_JSON"
+                            if src_strip.startswith("{") or src_strip.startswith("[")
+                            else "ERROR_SIMILARITY_VALUE"
+                        )
+                summary["translated_metafield_rows"] += 1
+                did_translate = True
+
+            # error code per reject su PRODUCT/COLLECTION (plain/html)
             if type_name in {"PRODUCT", "COLLECTION"} and translated == "":
                 err_code = (
                     "ERROR_SIMILARITY_HTML"
@@ -410,7 +508,8 @@ def process_file(
 
             row["Translated content"] = translated
             rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-            summary["translated_rows"] += 1
+            if did_translate:
+                summary["translated_rows"] += 1
 
         if rows_out:
             batch = pl.concat(rows_out, rechunk=True).with_columns(
@@ -429,7 +528,7 @@ def process_file(
         cp_new.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
         summary["processed_products"] += 1
 
-    # aggiorna contatore cache_hit se disponibile
+    # aggiorna contatore cache_hit (se esposto dal Translator)
     summary["cache_hit"] = getattr(translator, "cache_hits", 0)
 
     if stats:

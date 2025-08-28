@@ -1,141 +1,149 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import time
+import re
 from collections.abc import Iterable
+from typing import Any
 
 import httpx
 import structlog
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from src.config.settings import SETTINGS
+logger = structlog.get_logger()
 
-logger = structlog.get_logger("shopify")
+# Estrattore id numerico da GID Shopify
+_GID_NUM_RE = re.compile(r"/(\d+)$")
 
 
-def _hash_text(s: str) -> str:
+def extract_numeric_id(gid: str | None) -> int | None:
+    """'gid://shopify/Product/12345' -> 12345."""
+    if not gid or not isinstance(gid, str):
+        return None
+    m = _GID_NUM_RE.search(gid)
+    return int(m.group(1)) if m else None
+
+
+def _snippet(obj: Any, limit: int = 400) -> str:
+    """Stringa compatta per log; tollerante."""
     try:
-        data = s.encode("utf-8", errors="ignore")
+        s = json.dumps(obj, ensure_ascii=False) if isinstance(obj, (dict, list)) else str(obj)
+        return (s[:limit] + "…") if len(s) > limit else s
     except Exception:
-        data = str(s).encode("utf-8", errors="ignore")
-    return "sha256:" + hashlib.sha256(data).hexdigest()
-
-
-def _snippet(obj: object, limit: int) -> str:
-    try:
-        if isinstance(obj, dict | list):  # UP038
-            s = json.dumps(obj, ensure_ascii=False)
-        else:
-            s = str(obj)
-    except Exception:
-        s = "<unserializable>"
-    return s[: max(0, limit)]
+        return "<unserializable>"
 
 
 class ShopifyGraphQLClient:
-    def __init__(self, store_domain: str, token: str, timeout: float = 20.0) -> None:
-        self.endpoint = f"https://{store_domain}/admin/api/2024-07/graphql.json"
-        # NON loggare né esporre mai questo header nei log
-        self.headers = {
-            "X-Shopify-Access-Token": token,
-            "Content-Type": "application/json",
-        }
+    """
+    Client GraphQL minimale per Shopify Admin.
+    - Costruisce endpoint
+    - Gestisce auth header
+    - POST con timeout e log sintetici
+    """
+
+    def __init__(
+        self,
+        store_domain: str | None = None,
+        token: str | None = None,
+        api_version: str = "2024-07",
+        *,
+        endpoint: str | None = None,
+        timeout: float = 30.0,
+    ):
+        if endpoint:
+            self.endpoint = endpoint
+        else:
+            if not store_domain:
+                raise RuntimeError("store_domain mancante per costruire l'endpoint.")
+            self.endpoint = f"https://{store_domain}/admin/api/{api_version}/graphql.json"
+        if not token:
+            raise RuntimeError("token Shopify mancante.")
+        self.token = token
+        self.api_version = api_version
         self.timeout = timeout
+        self.headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": self.token,
+        }
 
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=1, max=20),
-        retry=retry_if_exception_type(httpx.HTTPError),
-    )
-    def _post(self, query: str, variables: dict | None = None) -> dict:
-        """Esegue una richiesta GraphQL con retry e logging opzionale (sanificato)."""
-        payload = {"query": query, "variables": variables or {}}
-
-        if SETTINGS.log_payloads:
-            logger.info(
-                "api_request",
-                api="shopify",
-                op="graphql",
-                endpoint=self.endpoint,
-                query_hash=_hash_text(query),
-                variables_hash=_hash_text(json.dumps(payload["variables"], ensure_ascii=False)),
-                snippet_query=_snippet(query, SETTINGS.log_payload_max),
-                snippet_variables=_snippet(payload["variables"], SETTINGS.log_payload_max),
+    @classmethod
+    def from_settings(cls, settings: Any) -> ShopifyGraphQLClient:
+        """Factory standardizzata dal blocco SETTINGS."""
+        store = (
+            getattr(settings, "shopify_domain", None)
+            or getattr(settings, "shopify_store", None)
+            or getattr(settings, "shopify_store_domain", None)
+        )
+        if not store:
+            raise RuntimeError(
+                "Config mancante: SETTINGS.shopify_domain (es. 'myshop.myshopify.com')."
             )
+        api_version = getattr(settings, "shopify_api_version", "2024-07")
+        token = getattr(settings, "shopify_token", None) or getattr(
+            settings, "shopify_access_token", None
+        )
+        if not token:
+            raise RuntimeError("Config mancante: SETTINGS.shopify_token.")
+        timeout = getattr(settings, "http_timeout", 30.0)
+        return cls(store_domain=store, token=token, api_version=api_version, timeout=timeout)
 
-        t0 = time.perf_counter()
+    def _post(self, query: str, variables: dict | None = None) -> dict:
+        payload = {"query": query, "variables": variables or {}}
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(self.endpoint, headers=self.headers, json=payload)
-        dt_ms = int((time.perf_counter() - t0) * 1000)
-
-        # Alza per 4xx/5xx
-        resp.raise_for_status()
-        data = resp.json()
-
-        has_errors = bool(data.get("errors"))
-        if SETTINGS.log_payloads:
-            # Non logghiamo l'intero 'data'; solo flag errori e snippet errors
-            logger.info(
-                "api_response",
-                api="shopify",
-                op="graphql",
-                status=resp.status_code,
-                duration_ms=dt_ms,
-                has_errors=has_errors,
-                snippet_errors=_snippet(data.get("errors", ""), SETTINGS.log_payload_max),
+            logger.debug(
+                "shopify_graphql_post",
+                status_code=resp.status_code,
+                endpoint=self.endpoint,
+                payload_snippet=_snippet(payload, 300),
             )
+            resp.raise_for_status()
+            data = resp.json()
+            if "errors" in data:
+                logger.warning("shopify_graphql_errors", errors=_snippet(data["errors"], 300))
+            return data
 
-        if has_errors:
-            # Rendi il messaggio conciso ma informativo
-            raise httpx.HTTPError(f"Shopify GraphQL errors: {data['errors']}")
-        return data
+    # ---------------------------
+    # Query helper ad-hoc usate
+    # ---------------------------
 
     @staticmethod
-    def to_gid(product_id: int) -> str:
-        return f"gid://shopify/Product/{int(product_id)}"
+    def _make_product_gid(numeric_id: int | str) -> str:
+        return f"gid://shopify/Product/{int(numeric_id)}"
 
     def get_product_status_map(
         self, numeric_ids: Iterable[int], batch_size: int | None = None
     ) -> dict[int, str]:
-        """Restituisce {id_numerico: status} in batch usando nodes()."""
+        """
+        Ritorna {id_numerico: 'ACTIVE'|'DRAFT'|'ARCHIVED'} usando nodes().
+        """
         ids = [int(i) for i in numeric_ids]
         if not ids:
             return {}
-        size = batch_size or SETTINGS.batch_size
-        out: dict[int, str] = {}
-        query = """
-        query Nodes($ids: [ID!]!) {
-          nodes(ids: $ids) {
-            ... on Product {
-              id
-              status
-            }
-          }
-        }
-        """.strip()
-        for i in range(0, len(ids), size):
-            chunk = ids[i : i + size]
-            gids = [self.to_gid(x) for x in chunk]
-            data = self._post(query, {"ids": gids})
-            nodes = data.get("data", {}).get("nodes", [])
-            for node in nodes:
-                if not node:
-                    continue
-                gid = node.get("id")
-                status = node.get("status")
-                if gid and status:
-                    try:
-                        num = int(gid.rsplit("/", 1)[-1])
-                        out[num] = status
-                    except Exception:
-                        continue
-        # Log di riepilogo (senza payload)
-        logger.info(
-            "shopify_status_summary",
-            total=len(ids),
-            active=sum(1 for v in out.values() if v == "ACTIVE"),
-            returned=len(out),
+        q = (
+            "query ProductStatus($ids:[ID!]!) {"
+            "  nodes(ids: $ids) {"
+            "    __typename"
+            "    ... on Product { id status }"
+            "  }"
+            "}"
         )
+        out: dict[int, str] = {}
+        bs = int(batch_size or 50)
+        for i in range(0, len(ids), bs):
+            chunk = ids[i : i + bs]
+            gids = [self._make_product_gid(x) for x in chunk]
+            data = self._post(q, {"ids": gids})
+            nodes = (data.get("data") or {}).get("nodes") or []
+            for node in nodes:
+                if not node or node.get("__typename") != "Product":
+                    continue
+                gid = node.get("id") or ""
+                num = extract_numeric_id(gid)
+                status = (node.get("status") or "").upper()
+                if num is not None and status:
+                    out[num] = status
+            logger.info(
+                "shopify_product_status_batch",
+                count=len(chunk),
+                mapped=len(out),
+            )
         return out
