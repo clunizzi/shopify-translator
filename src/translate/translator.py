@@ -61,6 +61,22 @@ PREFIX_TECH_SPLIT_RE = re.compile(
 
 OPENAI_JSON_ERROR_SENTINEL = "\u241BOPENAI_JSON_ERROR\u241B"
 
+# Handle preservation -NN
+
+HANDLE_SUFFIX_RE = re.compile(r"^(?P<stem>.+?)(?P<suffix>-\d{1,5})$")
+
+def _split_numeric_suffix(handle: str) -> tuple[str, str]:
+    """
+    Se l'handle termina con '-<numero>' (1..5 cifre), ritorna (stem, suffix), altrimenti (handle, "").
+    Esempi: 'molla-14' -> ('molla', '-14'); 'bg-66-ced' -> ('bg-66-ced', '')
+    """
+    s = (handle or "").strip()
+    m = HANDLE_SUFFIX_RE.match(s)
+    if m:
+        return m.group("stem"), m.group("suffix")
+    return s, ""
+
+
 # --- Helpers logging/snippets -------------------------------------------------
 
 def _snippet_ell(s: object, limit: int = 500) -> str:
@@ -899,7 +915,11 @@ class Translator:
         )
 
         if field == "handle":
+            # recupera suffisso numerico dall'handle originale (Default content)
+            _, orig_suffix = _split_numeric_suffix(default_content)
+
             if preserve_handle:
+                # tenta traduzione del handle così com’è
                 result = self.translate_plain(
                     type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens
                 )
@@ -907,17 +927,24 @@ class Translator:
                 if not ok:
                     base = title_translated or default_content
                     result = make_handle_from_title(base)
+                # se c'è un suffisso numerico originale e non è già presente, ri-applicalo
+                if orig_suffix and not (result or "").endswith(orig_suffix):
+                    result = f"{result}{orig_suffix}"
                 return result
-            # Non preserviamo: generiamo dallo slug del TITLE tradotto.
-            # Se il TITLE è stato rifiutato (""), blocchiamo anche l'handle.
+
+            # Non preserviamo: generiamo dallo slug del TITLE tradotto (o default come fallback)
             if title_translated is not None:
                 if title_translated == "":
                     return ""  # reject: niente handle senza titolo valido
                 base = title_translated
             else:
-                # fallback raro: se il titolo non è ancora stato visto, usa il default
                 base = default_content
-            return make_handle_from_title(base)
+
+            result = make_handle_from_title(base)
+            if orig_suffix:
+                result = f"{result}{orig_suffix}"
+            return result
+
 
         if field in {"meta_title", "meta_description", "title", "product_type"}:
             result = self.translate_plain(
