@@ -7,90 +7,96 @@ import typer
 from src.config.settings import SETTINGS
 from src.pipeline.process_csv import process_file
 
-app = typer.Typer(help="Traduttore CSV Shopify (PRODUCT / PRODUCT_OPTION / PRODUCT_VALUE)")
+app = typer.Typer(add_completion=False, help="Shopify CSV translator")
 
-# Opzioni principali
-OPT_INPUT = typer.Option(..., "--input", "-i", help="Path CSV input")
-OPT_OUTPUT = typer.Option(..., "--output", "-o", help="Path CSV output")
-OPT_TARGET = typer.Option(
-    SETTINGS.target_locale, "--target-locale", help="Locale destinazione es. fr-FR"
-)
-OPT_DNT = typer.Option(None, "--dnt", help="Path YAML do_not_translate")
 
-# Filtri Type
-OPT_TYPES = typer.Option(
-    "auto",
-    "--types",
-    help="Tipi da processare (comma-separated). Default: auto (rilevati nel CSV). Esempio: PRODUCT,PRODUCT_OPTION",
-)
-
-# Subsetting
-OPT_FIRSTN = typer.Option(None, "--first-n", help="Primi N Identification unici")
-OPT_IDS = typer.Option(None, "--ids", help="Lista ID separati da virgola")
-OPT_IDS_FILE = typer.Option(None, "--ids-file", help="File con ID (uno per riga)")
-OPT_ID_RANGE = typer.Option(None, "--id-range", help="Range numerico inclusivo START:END")
-
-# Logging
-OPT_LOG_FILE = typer.Option(
-    SETTINGS.log_file or None, "--log-file", help="Scrivi log JSONL su file"
-)
-OPT_NO_STDOUT = typer.Option(False, "--no-stdout", help="Solo file (niente stdout)")
-
-# Altri flag
-OPT_PRESERVE = typer.Option(
-    False, "--preserve-handle", help="Tenta trad. handle invece di generarlo"
-)
-OPT_RESUME = typer.Option(True, "--resume/--no-resume", help="Resume con checkpoint")
-OPT_FORCE = typer.Option(False, "--force", help="Ignora cache/checkpoint e ritraduce")
-OPT_DRY = typer.Option(False, "--dry-run", help="Nessuna chiamata a Shopify/OpenAI")
-OPT_STATS = typer.Option(True, "--stats/--no-stats", help="Logga statistiche finali")
-OPT_TRUNCATE = typer.Option(
-    False, "--truncate-output", help="Sovrascrive l'output (riscrive header)"
-)
+# Opzioni predefinite centralizzate (evita B008 nelle signature)
+OPT_STATS: bool = True
+OPT_TRUNCATE: bool = False
+OPT_NO_STDOUT: bool = False
+OPT_AUTO_CLASSIFY: bool = True
 
 
 @app.command("process")
 def process(
-    input: Path = OPT_INPUT,
-    output: Path = OPT_OUTPUT,
-    target_locale: str = OPT_TARGET,
-    dnt: Path | None = OPT_DNT,
-    types: str = OPT_TYPES,
-    first_n: int | None = OPT_FIRSTN,
-    ids: str | None = OPT_IDS,
-    ids_file: Path | None = OPT_IDS_FILE,
-    id_range: str | None = OPT_ID_RANGE,
-    log_file: Path | None = OPT_LOG_FILE,
-    no_stdout: bool = OPT_NO_STDOUT,
-    preserve_handle: bool = OPT_PRESERVE,
-    resume: bool = OPT_RESUME,
-    force: bool = OPT_FORCE,
-    dry_run: bool = OPT_DRY,
-    stats: bool = OPT_STATS,
-    truncate_output: bool = OPT_TRUNCATE,
+    input: Path = typer.Option(..., "--input", "-i", help="Path CSV input"),  # noqa: B008
+    output: Path = typer.Option(..., "--output", "-o", help="Path CSV output"),  # noqa: B008
+    target_locale: str = typer.Option(
+        SETTINGS.target_locale, "--target-locale", help="Locale target es. fr-FR"
+    ),  # noqa: B008
+    dnt: Path | None = typer.Option(None, "--dnt", help="Path YAML do_not_translate"),  # noqa: B008
+    preserve_handle: bool = typer.Option(
+        False, "--preserve-handle", help="Tenta trad. handle invece di generarlo"
+    ),  # noqa: B008
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Resume con checkpoint"
+    ),  # noqa: B008
+    force: bool = typer.Option(
+        False, "--force", help="Ignora cache/checkpoint e ritraduce"
+    ),  # noqa: B008
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Nessuna chiamata a Shopify/OpenAI"
+    ),  # noqa: B008
+    stats: bool = typer.Option(
+        OPT_STATS, "--stats/--no-stats", help="Logga summary finale"
+    ),  # noqa: B008
+    types: str = typer.Option(
+        "auto",
+        "--types",
+        help="Filtra Type (es. PRODUCT,COLLECTION). 'auto' elabora tutti i Type presenti",
+    ),  # noqa: B008
+    first_n: int | None = typer.Option(
+        None, "--first-n", help="Primi N Identification unici"
+    ),  # noqa: B008
+    ids: str | None = typer.Option(
+        None, "--ids", help="Lista ID numerici separati da virgola"
+    ),  # noqa: B008
+    ids_file: Path | None = typer.Option(
+        None, "--ids-file", help="File con un ID per riga"
+    ),  # noqa: B008
+    id_range: str | None = typer.Option(
+        None, "--id-range", help="Intervallo 'start:end'"
+    ),  # noqa: B008
+    log_file: Path | None = typer.Option(
+        None, "--log-file", help="Log JSONL su file"
+    ),  # noqa: B008
+    no_stdout: bool = typer.Option(
+        OPT_NO_STDOUT, "--no-stdout", help="Silenzia stdout (solo file)"
+    ),  # noqa: B008
+    truncate_output: bool = typer.Option(
+        OPT_TRUNCATE, "--truncate-output", help="Tronca l'output invece che appenderlo"
+    ),  # noqa: B008
+    auto_classify: bool = typer.Option(
+        OPT_AUTO_CLASSIFY,
+        "--auto-classify/--no-auto-classify",
+        help="Riconosce automaticamente JSON/HTML/URL/valori tecnici/plain se Field non è informativo",
+    ),  # noqa: B008
 ):
+    """
+    Esegue la pipeline di traduzione.
+    """
     summary = process_file(
         input_csv=input,
         output_csv=output,
         target_locale=target_locale,
         dnt_config_path=dnt,
-        # types
-        types=types,
-        # subset
-        first_n=first_n,
-        ids=ids,
-        ids_file=ids_file,
-        id_range=id_range,
-        # logging
-        log_file=log_file,
-        no_stdout=no_stdout,
-        # altri
         preserve_handle=preserve_handle,
         resume=resume,
         force=force,
         dry_run=dry_run,
         stats=stats,
-        # output
+        types=types,
+        first_n=first_n,
+        ids=ids,
+        ids_file=ids_file,
+        id_range=id_range,
+        log_file=log_file,
+        no_stdout=no_stdout,
         truncate_output=truncate_output,
+        auto_classify=auto_classify,
     )
-    typer.echo(f"Done. {summary}", err=True)
+    # Non stampo "Done ..." per non rompere piping | jq
+    if stats:
+        import json
+
+        print(json.dumps(summary, ensure_ascii=False))

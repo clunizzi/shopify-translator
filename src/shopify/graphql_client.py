@@ -22,10 +22,10 @@ def extract_numeric_id(gid: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _snippet(obj: Any, limit: int = 400) -> str:
+def _snippet(obj: object, limit: int) -> str:
     """Stringa compatta per log; tollerante."""
     try:
-        s = json.dumps(obj, ensure_ascii=False) if isinstance(obj, (dict, list)) else str(obj)
+        s = json.dumps(obj, ensure_ascii=False) if isinstance(obj, dict | list) else str(obj)
         return (s[:limit] + "…") if len(s) > limit else s
     except Exception:
         return "<unserializable>"

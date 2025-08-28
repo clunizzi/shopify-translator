@@ -13,9 +13,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config.settings import SETTINGS
 from src.htmlmap.extract import extract_text_segments
+from src.htmlmap.liquid import detect_has_liquid, protect_liquid, unprotect_liquid
 from src.htmlmap.reinject import reinject_text
 from src.translate.cache import TranslationCache
-from src.translate.langdetect import detect_language
 from src.translate.similarity import normalize_text, similarity
 from src.translate.validators import (
     MetaRules,
@@ -59,6 +59,105 @@ PREFIX_TECH_SPLIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+OPENAI_JSON_ERROR_SENTINEL = "\u241BOPENAI_JSON_ERROR\u241B"
+
+# --- Helpers logging/snippets -------------------------------------------------
+
+def _snippet_ell(s: object, limit: int = 500) -> str:
+    """
+    Ritorna una versione stringa di `s` tagliata a `limit` caratteri,
+    con ellissi finale se troncata. Tollerante a tipi non stringa.
+    """
+    try:
+        text = str(s or "")
+    except Exception:
+        text = ""
+    return text if len(text) <= limit else (text[:limit] + "…")
+
+
+# --- JSON parsing helpers -----------------------------------------------------
+
+def _safe_json_loads(text: str) -> dict:
+    """
+    Tenta di parse-are la risposta OpenAI in un dict con chiave 'translations'.
+    Accetta:
+      - oggetto {"translations":[...]}
+      - lista nuda [...]
+      - output con ```json ... ``` o testo extra
+    Ritorna sempre un dict {"translations": list[str]} anche se vuota.
+    """
+    s = (text or "").strip()
+
+    # 1) Prova parse diretto
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict) and isinstance(obj.get("translations"), list):
+            return {"translations": [str(x or "") for x in obj["translations"]]}
+        if isinstance(obj, list):
+            return {"translations": [str(x or "") for x in obj]}
+    except Exception:
+        pass
+
+    # 2) Prova a ripulire code fences / estrarre il core JSON
+    candidate = _strip_code_fences_and_extract_json(s)
+    if candidate:
+        try:
+            obj2 = json.loads(candidate)
+            if isinstance(obj2, dict) and isinstance(obj2.get("translations"), list):
+                return {"translations": [str(x or "") for x in obj2["translations"]]}
+            if isinstance(obj2, list):
+                return {"translations": [str(x or "") for x in obj2]}
+        except Exception:
+            pass
+
+    # 3) Fallback: usa il parser permissivo a lista
+    arr = safe_parse_openai_list(s)
+    if arr:
+        return {"translations": [str(x or "") for x in arr]}
+
+    # 4) Estremo fallback: nessuna traduzione estratta
+    return {"translations": []}
+
+
+def _strip_code_fences_and_extract_json(text: str) -> str | None:
+    """
+    Pulisce blocchi ```json ...``` e prova a estrarre il JSON principale.
+
+    Ritorna una stringa JSON (obj o array) pronta per json.loads, oppure None.
+    """
+    if not text:
+        return None
+    s = text.strip()
+
+    # Rimuovi triple backticks (con o senza 'json')
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+
+    # Se la risposta ha prefissi tipo 'Output:' o testo extra, prova a prendere
+    # dal primo '{' all'ultima '}', altrimenti dal primo '[' all'ultima ']'.
+    # 1) prova oggetto
+    l = s.find("{")
+    r = s.rfind("}")
+    if 0 <= l < r:
+        candidate = s[l : r + 1].strip()
+        # sanity check veloce
+        if candidate.count("{") >= 1 and candidate.count("}") >= 1:
+            return candidate
+
+    # 2) prova array
+    l = s.find("[")
+    r = s.rfind("]")
+    if 0 <= l < r:
+        candidate = s[l : r + 1].strip()
+        if candidate.startswith("[") and candidate.endswith("]"):
+            return candidate
+
+    # 3) fallback: se sembra già JSON minimale
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+        return s
+
+    return None
 
 def is_technical_value(s: str) -> bool:
     """True se stringa è solo numeri/unità/simboli (o URL/size)."""
@@ -450,63 +549,121 @@ class Translator:
         if field == "option_value_name":
             return max(1, SETTINGS.retry_max_value)
         return max(1, SETTINGS.retry_max)
+    
+    # --- dentro class Translator ---
 
-    def _should_skip_similarity(
-        self, default_text: str, exclude_similarity_tokens: Sequence[str]
-    ) -> bool:
-        return normalize_text(default_text, exclude_tokens=exclude_similarity_tokens) == ""
+    def _unpack_openai_resp(self, resp: object) -> tuple[str, dict]:
+        """
+        Ritorna (text, meta) da una risposta OpenAI che può essere:
+        - stringa semplice
+        - (stringa, meta_dict)
+        Qualsiasi altra forma viene ridotta a (str(resp), {}).
+        """
+        try:
+            if isinstance(resp, tuple) and len(resp) == 2:
+                text = (resp[0] or "")
+                meta = resp[1] or {}
+                return str(text), (meta if isinstance(meta, dict) else {})
+            return (str(resp or ""), {})
+        except Exception:
+            return (str(resp), {})
 
-    def translate_plain(
+    def _translate_and_validate(
         self,
-        type_name: str,
         field: str,
-        default_text: str,
+        text: str,
         target_locale: str,
-        dnt: DoNotTranslateConfig,
         exclude_similarity_tokens: Sequence[str],
+        system: str,
+        *,
+        strict: bool = False,
     ) -> str:
-        text_norm = normalize_text(default_text)
-        key = self._cache_key(type_name, field, target_locale, text_norm)
-
-        cached = self.cache.get(key)
-        if cached:
-            translated = (cached.get("translated") or "").strip()
-            self.cache_hits += 1
+        # dry-run fast path
+        if self.dry_run:
+            out = f"[{target_locale}] {text}"
+            try:
+                lang, _ = detect_lang_fast(out)  # best effort
+            except Exception:
+                lang = "unknown"
             logger.info(
-                "cache_hit_plain", type_name=type_name, field=field, chars=len(default_text)
+                "translate",
+                field=field,
+                attempt=1,
+                sim=0.0,
+                threshold=self._threshold_for_field(field),
+                lang_out=lang,
+                decision="accept_dry_run",
+                reason="",
+                model=self.model,
+                duration_ms=0,
+                usage={},
             )
-            return translated
-
-        self.cache_misses += 1
-        logger.info("cache_miss_plain", type_name=type_name, field=field, chars=len(default_text))
+            return out
 
         threshold = self._threshold_for_field(field)
-        max_local_retries = max(1, SETTINGS.retry_max)
-        translated = default_text
-        start = time.perf_counter()
-        for attempt in range(1, max_local_retries + 1):
-            if self.dry_run:
-                translated = f"[{target_locale}] {default_text}".strip()
-                meta = {"usage": {}, "duration_ms": 0}
-            else:
-                strict = attempt > 1
-                system = _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
-                translated, meta = self._call_openai(system, default_text)
+        max_attempts = max(1, self._retry_max_for_field(field))
 
-            lang, _ = detect_language(translated)
-            sim_ok = not self._should_skip_similarity(default_text, exclude_similarity_tokens)
-            sim = (
-                similarity(default_text, translated, exclude_tokens=exclude_similarity_tokens)
-                if sim_ok
-                else 0.0
-            )
+        last_out: str = text
+        for attempt in range(1, max_attempts + 1):
+            t0 = time.monotonic()
+            try:
+                resp = self._call_openai(system, text)
+                out_text, meta = self._unpack_openai_resp(resp)
+            except Exception as e:
+                decision = "retry_error" if attempt < max_attempts else ("reject_error" if strict else "accept_error")
+                logger.warning(
+                    "translate",
+                    field=field,
+                    attempt=attempt,
+                    sim=None,
+                    threshold=threshold,
+                    lang_out="unknown",
+                    decision=decision,
+                    reason=str(e),
+                    model=self.model,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    usage={},
+                )
+                if attempt < max_attempts:
+                    continue
+                return "" if strict else last_out
 
-            decision = "accept"
-            reason = ""
-            if not self.dry_run and sim_ok and sim >= threshold and lang != target_locale[:2]:
-                decision = "retry" if attempt < max_local_retries else "reject"
-                reason = "similarity_high"
+            last_out = (out_text or "").strip()
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            usage = meta.get("usage", {}) if isinstance(meta, dict) else {}
 
+            # lingua + similarità
+            try:
+                lang, conf = detect_lang_fast(last_out)
+            except Exception:
+                lang, conf = ("unknown", 0.0)
+
+            try:
+                sim = similarity(text, last_out, exclude_tokens=exclude_similarity_tokens)
+            except TypeError:
+                from difflib import SequenceMatcher
+                sim = SequenceMatcher(None, (text or "").lower(), (last_out or "").lower()).ratio()
+
+            suspicious = (lang.split("-")[0] == "it") or (sim >= threshold and (target_locale[:2] != lang[:2]))
+
+            if suspicious and attempt < max_attempts:
+                logger.info(
+                    "translate",
+                    field=field,
+                    attempt=attempt,
+                    sim=sim,
+                    threshold=threshold,
+                    lang_out=lang,
+                    decision="retry",
+                    reason="lang_it_or_high_similarity",
+                    model=self.model,
+                    duration_ms=duration_ms,
+                    usage=usage,
+                )
+                continue
+
+            decision = "accept_suspect" if suspicious else "accept"
+            reason = "lang_it_or_high_similarity" if suspicious else ""
             logger.info(
                 "translate",
                 field=field,
@@ -514,21 +671,83 @@ class Translator:
                 sim=sim,
                 threshold=threshold,
                 lang_out=lang,
-                decision=decision,
+                decision=("reject" if (suspicious and strict) else decision),
                 reason=reason,
                 model=self.model,
-                duration_ms=int((time.perf_counter() - start) * 1000),
-                usage=meta.get("usage", {}),
+                duration_ms=duration_ms,
+                usage=usage,
             )
+            if suspicious and strict:
+                return ""
+            return last_out
 
-            if decision == "accept":
-                break
-            if decision == "reject":
-                translated = ""
-                break
+        return "" if strict else last_out
 
-        if not self.dry_run:
-            self.cache.set(key, {"translated": translated}, self.model)
+
+    def _should_skip_similarity(
+        self, default_text: str, exclude_similarity_tokens: Sequence[str]
+    ) -> bool:
+        return normalize_text(default_text, exclude_tokens=exclude_similarity_tokens) == ""
+
+    # -------------------------------
+    # Cache alias per campi equivalenti (lookup) + translate_plain unico
+    # -------------------------------
+    def _alias_fields_for_lookup(self, field: str) -> list[str]:
+        f = field.strip()
+        if f == "value":
+            return ["value", "option_name", "title"]
+        if f == "option_value_name":
+            return ["option_value_name", "value"]
+        if f == "option_name":
+            return ["option_name", "title", "value"]
+        if f == "title":
+            return ["title", "option_name", "value"]
+        return [f]  # niente alias per body_html/meta/handle/product_type
+
+    def _cache_get_with_alias(self, type_name: str, field: str, locale: str, text_norm: str) -> str:
+        for f in self._alias_fields_for_lookup(field):
+            key = self.cache.make_key(
+                type_name, f, locale, text_norm, SETTINGS.rules_version, self.model
+            )
+            entry = self.cache.get(key)
+            translated = (entry.get("translated") or "").strip() if entry else ""
+            if translated:
+                if f != field:
+                    logger.info("cache_hit_alias", from_field=f, to_field=field)
+                self.cache_hits += 1
+                return translated
+        return ""
+
+    def translate_plain(
+        self,
+        type_name: str,
+        field: str,
+        default_content: str,
+        target_locale: str,
+        dnt: DoNotTranslateConfig,
+        exclude_similarity_tokens: Sequence[str],
+    ) -> str:
+        """Traduzione testo plain con lookup cache alias; scrive solo sulla chiave primaria."""
+        text = (default_content or "").strip()
+        if not text:
+            return ""
+
+        text_norm = normalize_text(text)
+
+        # 1) cache read-through con alias
+        cached = self._cache_get_with_alias(type_name, field, target_locale, text_norm)
+        if cached:
+            return cached
+
+        # 2) OpenAI
+        system = _build_system_prompt(type_name, field, target_locale, dnt, strict=False)
+        translated = self._translate_and_validate(
+            field, text, target_locale, exclude_similarity_tokens, system
+        )
+
+        # 3) scrittura cache solo su chiave primaria
+        key = self._cache_key(type_name, field, target_locale, text_norm)
+        self.cache.set(key, {"translated": translated or ""}, model=self.model)
         return translated
 
     def translate_html(
@@ -543,22 +762,33 @@ class Translator:
         strict: bool = False,
     ) -> str:
         """
-        Traduce HTML in batch:
-        - Estrae segmenti testuali -> [[T0]], [[T1]]... (ordine stabile)
-        - Usa cache per segmento (hit/miss loggati)
-        - Chiama OpenAI una sola volta per i miss, chiedendo JSON {"translations":[...]}
-        - Gestisce risposta come str o tuple (text, meta)
-        - Parsing JSON tollerante (no crash) + fallback per segmenti vuoti
-        - Guard finale: se output “solo tag”, restituisce l’HTML originale
+        Traduce HTML:
+        - Protegge Liquid ({{ }}, {% %}, {% raw %}...{% endraw %})
+        - Estrae segmenti testuali -> [[T#]]
+        - Cache per segmento
+        - Una call OpenAI per i miss (JSON {"translations":[...]})
+        - Parsing JSON tollerante; non ferma la pipeline
+        - Re-inietta testi e poi Liquid
+        - Similarità/lang: solo log
         """
-        # 1) Estrazione segmenti
-        html_map, segments = extract_text_segments(html or "")
+
+        html_in = html or ""
+
+        # 0) Protezione Liquid
+        liquid_map: dict[int, str] = {}
+        if detect_has_liquid(html_in):
+            html_prot, liquid_map = protect_liquid(html_in)
+            logger.info("liquid_protected", count=len(liquid_map))
+        else:
+            html_prot = html_in
+
+        # 1) Estrazione segmenti testuali
+        html_map, segments = extract_text_segments(html_prot)
 
         # 2) Cache per segmenti
         cached_out: dict[int, str] = {}
         todo: list[str] = []
-        idxs: list[int] = []  # indici dei segmenti mancanti
-
+        idxs: list[int] = []
         for i, seg in enumerate(segments):
             text_norm = normalize_text(seg)
             key = self._cache_key(type_name, field, target_locale, text_norm)
@@ -579,9 +809,9 @@ class Translator:
             self.cache_misses += misses
             logger.info("cache_miss_html", type_name=type_name, field=field, segments=misses)
 
-        # 3) Call OpenAI una sola volta per i miss (se non dry_run e ci sono miss)
+        # 3) Call OpenAI unica per i miss
         fresh_map: dict[int, str] = {}
-        if misses > 0:
+        if misses > 0 and not self.dry_run:
             payload = {
                 "target_locale": target_locale,
                 "field": field,
@@ -590,93 +820,58 @@ class Translator:
             }
             system = (
                 _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
-                + " Restituisci SOLO un oggetto JSON con chiave 'translations': una lista di stringhe, "
-                "una per ciascun segmento in 'segments', nello stesso ordine."
+                + " Restituisci SOLO un oggetto JSON con chiave 'translations' (lista di stringhe) nello stesso ordine di 'segments'."
             )
-
-            if not self.dry_run:
-                logger.info("openai_call_html", type_name=type_name, field=field, segments=misses)
-
-            req_text = json.dumps(payload, ensure_ascii=False)
-            if self.dry_run:
-                resp_text = json.dumps({"translations": todo}, ensure_ascii=False)
-            else:
-                resp = self._call_openai(system, req_text)
-                resp_text = resp[0] if isinstance(resp, tuple) else resp
-
-            # 4) Parsing tollerante
-            translated_list: list[str] = []
+            logger.info("openai_call_html", type_name=type_name, field=field, segments=len(todo))
             try:
-                obj = json.loads(resp_text)
+                resp = self._call_openai(system=system, text=json.dumps(payload, ensure_ascii=False))
+                resp_text = resp[0] if isinstance(resp, tuple) else resp  # compat log meta
+                obj = _safe_json_loads(resp_text)
                 translations = obj.get("translations")
                 if not isinstance(translations, list):
-                    raise ValueError("missing translations list")
+                    raise ValueError("missing 'translations' list")
                 translated_list = [str(x or "").strip() for x in translations]
             except Exception as e:
                 logger.error(
                     "openai_json_error",
-                    error=str(e)[:200],
-                    sample=(resp_text or "")[:200],
+                    error=str(e),
+                    sample=_snippet_ell(resp_text if 'resp_text' in locals() else "", 500),
                     field=field,
                 )
-                translated_list = []
+                translated_list = list(todo)  # fallback no-op
+            # ricostruisci posizioni e aggiorna cache
+            for pos, txt in zip(idxs, translated_list, strict=False):
+                fresh_map[pos] = txt
+                key = self._cache_key(
+                    type_name,
+                    field,
+                    target_locale,
+                    normalize_text(todo[idxs.index(pos)])
+                )
+                self.cache.set(key, {"translated": txt}, model=self.model)
 
-            # Pad o tronca per allineare alle aspettative
-            if len(translated_list) != len(todo):
-                if len(translated_list) > len(todo):
-                    translated_list = translated_list[: len(todo)]
-                else:
-                    translated_list.extend([""] * (len(todo) - len(translated_list)))
 
-            # Fallback per-segmento: se vuoto, usa il sorgente
-            translated_list = [
-                dst if (dst or "").strip() else src
-                for src, dst in zip(todo, translated_list, strict=False)
-            ]
-
-            # Mappa {idx -> traduzione} per i miss
-            fresh_map = {i: translated_list[k] for k, i in enumerate(idxs)}
-
-            # Aggiorna cache solo per i segmenti appena tradotti
-            for i, seg in zip(idxs, todo, strict=False):
-                text_norm = normalize_text(seg)
-                key = self._cache_key(type_name, field, target_locale, text_norm)
-                self.cache.set(key, {"translated": fresh_map.get(i, "")}, self.model)
-
-        # 5) Ricostruzione lista finale nell'ordine originale
+        # 4) Ricostruzione segmenti completi
         translated_segments: list[str] = []
         for i in range(len(segments)):
-            if i in cached_out:
-                translated_segments.append(cached_out[i])
-            else:
-                translated_segments.append(fresh_map.get(i, ""))
+            translated_segments.append(cached_out.get(i, fresh_map.get(i, segments[i])))
 
-        # 6) Similarità/lingua (tollerante, solo log)
-        plain_src = " ".join(seg.strip() for seg in segments if seg and seg.strip())
-        plain_dst = " ".join(seg.strip() for seg in translated_segments if seg and seg.strip())
+        # 5) Re-iniezione testi e Liquid
+        out_html = reinject_text(html_map, translated_segments)
+        if liquid_map:
+            out_html = unprotect_liquid(out_html, liquid_map)
+
+        # 6) Similarità/Lang: log informativi
+        plain_src = " ".join(s.strip() for s in segments if s and s.strip())
+        plain_dst = " ".join(s.strip() for s in translated_segments if s and s.strip())
         try:
-            lang, conf = detect_lang_fast(plain_dst)
+            lang, conf = detect_lang_fast(plain_dst)  # già definito nel modulo
         except Exception:
             lang, conf = ("unknown", 0.0)
-
         sim = similarity(plain_src, plain_dst, exclude_tokens=exclude_similarity_tokens)
-        logger.info(
-            "html_similarity",
-            field=field,
-            lang=lang,
-            conf=conf,
-            sim=sim,
-            threshold=SETTINGS.sim_t_html,
-        )
-
-        # Guard finale: se output “solo tag” (no testo) ma input aveva testo, restituisci originale
-        if plain_src and not plain_dst:
-            logger.warning("html_translation_empty_fallback", field=field)
-            return html or ""
-
-        # 7) Re-iniezione nelle strutture HTML e ritorno
-        out_html = reinject_text(html_map, translated_segments)
+        logger.info("html_similarity", extra={"sim": sim, "lang": lang, "conf": conf})
         return out_html
+
 
     def translate_field(
         self,
@@ -689,11 +884,19 @@ class Translator:
         title_translated: str | None = None,
         preserve_handle: bool = False,
     ) -> str:
+        
         field = field.strip()
+        text  = default_content or ""
+
         if field == "body_html":
             return self.translate_html(
                 type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens
             )
+        
+        if detect_has_liquid(text):
+            return self.translate_html(
+            type_name, field, text, target_locale, dnt, exclude_similarity_tokens
+        )
 
         if field == "handle":
             if preserve_handle:
