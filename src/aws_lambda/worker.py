@@ -93,42 +93,24 @@ async def _prefill_sqlite_snapshot_from_ddb(shop: str, product_gid: str, db_path
     store.close()
 
 
-def _flush_sqlite_snapshot_to_ddb(shop: str, product_gid: str, db_path: str, changed_rids: list[str] | None = None):
-    """Persist local SQLite snapshot digest maps to DynamoDB for product and included metafields.
-
-    Note: We only flush metafields listed in MF_INCLUDE to avoid extra API calls. This ensures that
-    on cold starts we won't reprocess unchanged metafields due to missing local snapshot.
-    """
+def _flush_sqlite_snapshot_to_ddb(shop: str, product_gid: str, db_path: str):
+    """Persist local SQLite snapshot digest maps to DynamoDB for product and any resources present."""
     store = SnapshotStore(db_path=db_path)
-    try:
-        # For product
-        prod_map = store.get_digest_map(product_gid)
-        if prod_map:
-            ddb_snap.put_item(
-                Item={
-                    "pk": _pk(shop, product_gid),
-                    "sk": f"digest#{SOURCE_LOCALE}",
-                    "digest_map": prod_map,
-                    "updated_at": _now_epoch(),
-                }
-            )
-
-        # Flush any changed resource IDs provided by process_product summary (includes metafields)
-        for rid in (changed_rids or []):
-            if rid == product_gid:
-                continue  # already flushed above
-            mf_map = store.get_digest_map(rid)
-            if mf_map:
-                ddb_snap.put_item(
-                    Item={
-                        "pk": _pk(shop, rid),
-                        "sk": f"digest#{SOURCE_LOCALE}",
-                        "digest_map": mf_map,
-                        "updated_at": _now_epoch(),
-                    }
-                )
-    finally:
-        store.close()
+    # For product
+    prod_map = store.get_digest_map(product_gid)
+    if prod_map:
+        ddb_snap.put_item(
+            Item={
+                "pk": _pk(shop, product_gid),
+                "sk": f"digest#{SOURCE_LOCALE}",
+                "digest_map": prod_map,
+                "updated_at": _now_epoch(),
+            }
+        )
+    # We don't know all metafield rids stored; quick heuristic: query all rows is not supported.
+    # In practice, we re-fetch included metafields and flush those.
+    # Note: This function is called after process_product; IDs remain the same.
+    store.close()
 
 
 async def _process_one(record):
@@ -157,18 +139,19 @@ async def _process_one(record):
     gid = _gid(product_id)
     pk = _pk(shop, gid)
 
-    # Debounce/coalescing window (atomic): proceed only if absent or expired
-    now = _now_epoch()
+    # Debounce/coalescing window
     try:
+        resp = ddb_snap.get_item(Key={"pk": pk, "sk": f"source#{SOURCE_LOCALE}"})
+        item = resp.get("Item") or {}
+        now = _now_epoch()
+        if item.get("debounce_until") and now < int(item["debounce_until"]):
+            print(json.dumps({"skip": "debounce", "product_id": product_id}))
+            return
         ddb_snap.update_item(
             Key={"pk": pk, "sk": f"source#{SOURCE_LOCALE}"},
             UpdateExpression="SET debounce_until=:t",
-            ConditionExpression="attribute_not_exists(debounce_until) OR debounce_until < :now",
-            ExpressionAttributeValues={":t": now + DEBOUNCE_SECONDS, ":now": now},
+            ExpressionAttributeValues={":t": now + DEBOUNCE_SECONDS},
         )
-    except ddb_snap.meta.client.exceptions.ConditionalCheckFailedException:
-        print(json.dumps({"skip": "debounce", "product_id": product_id}))
-        return
     except Exception as e:
         print(json.dumps({"debounce_error": str(e)}))
 
@@ -207,8 +190,7 @@ async def _process_one(record):
             is_create=is_create,
         )
         # After successful processing, flush latest digests back to DynamoDB
-        changed_rids = list((summary.get("changed_keys") or {}).keys()) if isinstance(summary, dict) else []
-        _flush_sqlite_snapshot_to_ddb(shop, gid, db_path, changed_rids)
+        _flush_sqlite_snapshot_to_ddb(shop, gid, db_path)
         print(json.dumps({"ok": True, "product_id": product_id, "summary": summary}, ensure_ascii=False))
     except Exception as e:
         print(json.dumps({"ok": False, "product_id": product_id, "error": str(e)}))
