@@ -33,6 +33,7 @@ async def process_product(
     delay_ms_after_create: int = 8000,
     *,
     apply_on_dry_run: bool = False,
+    fill_missing_translations: bool | None = None,
 ) -> dict:
     """
     End-to-end sync for one product: diff translatable content, translate changed, push, snapshot.
@@ -84,6 +85,26 @@ async def process_product(
             changed = [c for c in contents if old.get(c.get("key")) != c.get("digest")]
         if changed:
             changed_per_resource[rid] = changed
+
+    # Optionally backfill: if requested, include unchanged contents as well (to fill missing locales)
+    do_fill_missing = SETTINGS.fill_missing_translations if fill_missing_translations is None else fill_missing_translations
+    if do_fill_missing:
+        for rid, contents in live_map.items():
+            if not contents:
+                continue
+            # Merge preserving existing list if already changed
+            base = changed_per_resource.get(rid, [])
+            # include only items with a key to be registered
+            extra = [c for c in contents if c.get("key")]
+            # Keep order and unique by key
+            keys_seen = set([c.get("key") for c in base])
+            for c in extra:
+                k = c.get("key")
+                if k and k not in keys_seen:
+                    base.append(c)
+                    keys_seen.add(k)
+            if base:
+                changed_per_resource[rid] = base
 
     summary = {
         "product_id": int(product_numeric_id),
