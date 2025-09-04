@@ -91,6 +91,26 @@ def _snippet_ell(s: object, limit: int = 500) -> str:
     return text if len(text) <= limit else (text[:limit] + "…")
 
 
+# --- Minor post-processing helpers ------------------------------------------
+_MD_EM_RE = re.compile(r"(\*{1,2}[^*]+?\*{1,2}|_{1,2}[^_]+?_{1,2})")
+
+def _fix_inline_markdown_spacing(s: str) -> str:
+    """
+    Inserisce spazi attorno a blocchi stile markdown (*bold*, **bold**, _em_, __strong__)
+    se adiacenti a caratteri non-spazio, per evitare incollaggi tipo 'parola*bold*parola'.
+    Non altera il contenuto interno ai marker.
+    """
+    if not s:
+        return s
+    # spazio prima
+    s = re.sub(r"([^\s])(\*{1,2}[^*]+?\*{1,2})", r"\1 \2", s)
+    s = re.sub(r"([^\s](_{1,2}[^_]+?_{1,2}))", r" \1", s)
+    # spazio dopo
+    s = re.sub(r"(\*{1,2}[^*]+?\*{1,2})([^\s])", r"\1 \2", s)
+    s = re.sub(r"(_{1,2}[^_]+?_{1,2})([^\s])", r"\1 \2", s)
+    return s
+
+
 # --- JSON parsing helpers -----------------------------------------------------
 
 def _safe_json_loads(text: str) -> dict:
@@ -403,11 +423,17 @@ def _build_system_prompt(
     - meta_description: 150–160 char, senza emoji/markdown
     """
     dont = ", ".join(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
+    spec = getattr(SETTINGS, "translator_specialization", "")
+    src_name = getattr(SETTINGS, "source_language_name", "italiano")
+    domain_line = (
+        f"Sei un traduttore tecnico specializzato in {spec}, conosci i termini specifici del dominio. "
+        if spec else "Sei un traduttore tecnico accurato. "
+    )
     base = (
-        "Sei un traduttore tecnico specializzato in attrazzatura per il giardinaggio e l'agricoltura, conosci tutti i termini specifici di questo campo."
-        f"Traduci dall'italiano a {target_locale} il contenuto del campo '{field}' "
-        f"per il tipo '{type_name}'. Non tradurre marchi, unità di misura, sigle e i seguenti termini esatti: {dont}. "
-        "Mantieni numeri, codici e punteggiatura. Niente markdown o spiegazioni; restituisci solo il testo tradotto."
+        domain_line
+        + f"Traduci da {src_name} a {target_locale} il contenuto del campo '{field}' "
+        + f"per il tipo '{type_name}'. Non tradurre marchi, unità di misura, sigle e i seguenti termini esatti: {dont}. "
+        + "Mantieni numeri, codici e punteggiatura. Niente markdown o spiegazioni; restituisci solo il testo tradotto."
     )
     if field == "meta_title":
         if type_name == "PRODUCT":
@@ -902,7 +928,9 @@ class Translator:
                 translations = obj.get("translations")
                 if not isinstance(translations, list):
                     raise ValueError("missing 'translations' list")
-                translated_list = [str(x or "").strip() for x in translations]
+                # Preserve leading/trailing spaces inside segments to avoid
+                # collapsing boundaries around inline markers or tags.
+                translated_list = [str(x) if x is not None else "" for x in translations]
             except Exception as e:
                 logger.error(
                     "openai_json_error",
@@ -923,10 +951,17 @@ class Translator:
                 self.cache.set(key, {"translated": txt}, model=self.model)
 
 
-        # 4) Ricostruzione segmenti completi
+        # 4) Ricostruzione segmenti completi (aggiusta spazi attorno a *...*/_..._)
         translated_segments: list[str] = []
         for i in range(len(segments)):
-            translated_segments.append(cached_out.get(i, fresh_map.get(i, segments[i])))
+            if i in cached_out:
+                val = cached_out[i]
+                translated_segments.append(_fix_inline_markdown_spacing(val))
+            elif i in fresh_map:
+                val = fresh_map[i]
+                translated_segments.append(_fix_inline_markdown_spacing(val))
+            else:
+                translated_segments.append(segments[i])
 
         # 5) Re-iniezione testi e Liquid
         out_html = reinject_text(html_map, translated_segments)

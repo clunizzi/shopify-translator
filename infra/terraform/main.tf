@@ -202,6 +202,10 @@ resource "aws_lambda_function" "worker" {
       RETRIES          = var.retries
       DEBOUNCE_SECONDS = var.debounce_seconds
       DRY_RUN          = var.dry_run
+      FILL_MISSING_TRANSLATIONS = var.fill_missing_translations
+      # Prompt specialization (optional)
+      TRANSLATOR_SPECIALIZATION = var.translator_specialization
+      SOURCE_LANGUAGE_NAME      = var.source_language_name
     }
   }
 }

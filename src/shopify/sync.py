@@ -122,17 +122,51 @@ async def process_product(
         return summary
 
     # Build per-locale translations and optionally push
+    do_fill_missing = SETTINGS.fill_missing_translations if fill_missing_translations is None else fill_missing_translations
     for locale in target_locales:
         for rid, items in changed_per_resource.items():
+            # For product resource, capture current defaults to enable fallbacks (seo -> title/body)
+            is_product = (rid == gid)
+            # Map available values by key for quick fallback lookup
+            existing: dict[str, str] = { (x.get("key") or ""): (x.get("value") or "") for x in items if x.get("key") }
+
+            # Ensure SEO keys are present when doing backfill (some shops omit empty SEO in translatableContent diffs)
+            if is_product and do_fill_missing:
+                want_keys = {"title", "body_html", "seo.title", "seo.description", "product_type"}
+                have_keys = set(existing.keys())
+                if rid in live_map:
+                    all_nodes = live_map[rid] or []
+                    for node in all_nodes:
+                        k = node.get("key") or ""
+                        if k in want_keys and k not in have_keys:
+                            items.append(node)
+                            existing[k] = node.get("value") or ""
+                            have_keys.add(k)
+
+            # If filling missing, ensure we process title before handle to allow handle generation from translated title
+            def _priority(k: str) -> int:
+                order = {
+                    "title": 10,
+                    "body_html": 20,
+                    "seo.title": 30,
+                    "seo.description": 40,
+                    "product_type": 50,
+                    "handle": 60,
+                }
+                return order.get(k, 100)
+
+            items_sorted = sorted(items, key=lambda x: _priority(x.get("key") or ""))
+
             translations_payload: list[dict] = []
-            for it in items:
+            translated_title_for_handle: str | None = None
+            for it in items_sorted:
                 key = it.get("key") or ""
                 digest = it.get("digest") or ""
                 value = (it.get("value") or "")
 
                 translated_value = ""
                 try:
-                    if rid == gid:
+                    if is_product:
                         # Product resource
                         # Map Shopify keys to our translator fields
                         field_map = {
@@ -141,19 +175,41 @@ async def process_product(
                             "seo.title": "meta_title",
                             "seo.description": "meta_description",
                             "product_type": "product_type",
+                            "handle": "handle",
                         }
                         field = field_map.get(key)
                         if not field:
                             # Skip unsupported product key
                             continue
+                        # Fallbacks: if seo fields are empty, use product defaults (title/body)
+                        if key == "seo.title" and not value:
+                            # Prefer explicit product title from existing map
+                            value = existing.get("title", value)
+                        elif key == "seo.description" and not value:
+                            value = existing.get("body_html", value)
                         if field == "body_html":
                             translated_value = translator.translate_html(
                                 "PRODUCT", field, value, locale, dnt, exclude_tokens
+                            )
+                        elif field == "handle":
+                            # Use translated title if available to derive handle; otherwise fall back to default content
+                            tv = translated_title_for_handle
+                            translated_value = translator.translate_field(
+                                "PRODUCT",
+                                field,
+                                default_content=value,
+                                target_locale=locale,
+                                dnt=dnt,
+                                exclude_similarity_tokens=exclude_tokens,
+                                title_translated=tv,
+                                preserve_handle=False,
                             )
                         else:
                             translated_value = translator.translate_plain(
                                 "PRODUCT", field, value, locale, dnt, exclude_tokens
                             )
+                            if key == "title":
+                                translated_title_for_handle = translated_value or translated_title_for_handle
                     else:
                         # Metafield resource: only key == "value" is translatable
                         if key != "value":
