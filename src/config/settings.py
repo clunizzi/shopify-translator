@@ -89,6 +89,17 @@ class Settings:
     delay_ms_after_create: int = _get_int("DELAY_MS_AFTER_CREATE", 8000)
     # Optional path to DNT yaml
     do_not_translate_path: str | None = os.getenv("DO_NOT_TRANSLATE_YAML")
+    # Backfill: translate even if digest unchanged when locale missing (best-effort)
+    fill_missing_translations: bool = _get_bool("FILL_MISSING_TRANSLATIONS", False)
+
+    # Prompt specialization (domain) and source language label
+    # Customize to adapt the translator tone/domain without changing code.
+    translator_specialization: str = os.getenv(
+        "TRANSLATOR_SPECIALIZATION",
+        "attrezzatura per il giardinaggio e l'agricoltura",
+    )
+    # Human-friendly name of source language for prompts (e.g., "italiano", "inglese")
+    source_language_name: str = os.getenv("SOURCE_LANGUAGE_NAME", "italiano")
 
     @property
     def has_shopify(self) -> bool:

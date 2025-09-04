@@ -116,3 +116,22 @@ variable "dry_run" {
   type        = string
   default     = "false"
 }
+
+variable "fill_missing_translations" {
+  description = "Backfill missing locale translations on update"
+  type        = string
+  default     = "false"
+}
+
+# Prompt specialization for translator (optional)
+variable "translator_specialization" {
+  description = "Domain specialization for prompts (e.g., 'elettrodomestici industriali')"
+  type        = string
+  default     = ""
+}
+
+variable "source_language_name" {
+  description = "Human label for source language (e.g., 'italiano', 'inglese')"
+  type        = string
+  default     = ""
+}

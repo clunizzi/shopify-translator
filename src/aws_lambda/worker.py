@@ -24,6 +24,7 @@ MF_INCLUDE = [tuple(s.strip().split(".", 1)) for s in os.environ.get("MF_INCLUDE
 MF_JSON_PATHS = [s.strip() for s in os.environ.get("MF_JSON_PATHS", "").split(",") if s.strip()]
 DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "20"))
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in {"1", "true", "yes", "y"}
+FILL_MISSING = os.environ.get("FILL_MISSING_TRANSLATIONS", "false").lower() in {"1", "true", "yes", "y"}
 
 # Secrets Manager ARNs (optional but recommended)
 OPENAI_API_KEY_SECRET_ARN = os.environ.get("OPENAI_API_KEY_SECRET_ARN")
@@ -188,6 +189,7 @@ async def _process_one(record):
             source_locale=SOURCE_LOCALE,
             dry_run=DRY_RUN,
             is_create=is_create,
+            fill_missing_translations=FILL_MISSING,
         )
         # After successful processing, flush latest digests back to DynamoDB
         _flush_sqlite_snapshot_to_ddb(shop, gid, db_path)
