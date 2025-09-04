@@ -360,10 +360,25 @@ def detect_lang_fast(text: str) -> tuple[str, float]:
     return (best_lang, conf)
 
 
-try:
-    from openai import OpenAI  # SDK v1
+"""
+Compat layer for OpenAI SDKs:
+- Prefer SDK v1 (`from openai import OpenAI`) if available
+- Fallback to legacy v0 (`import openai` and use `openai.ChatCompletion.create`)
+This avoids `'NoneType' object is not callable'` when v1 class is missing.
+"""
+try:  # SDK v1
+    from openai import OpenAI as _OpenAI  # type: ignore
+    import openai as _openai  # for typing/usage extraction
+    _OPENAI_STYLE = "v1"
 except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+    try:  # Legacy v0
+        import openai as _openai  # type: ignore
+        _OpenAI = None  # type: ignore
+        _OPENAI_STYLE = "v0"
+    except Exception:  # no SDK available
+        _openai = None  # type: ignore
+        _OpenAI = None  # type: ignore
+        _OPENAI_STYLE = "none"
 
 
 @dataclass
@@ -431,7 +446,15 @@ class Translator:
         if not SETTINGS.has_openai:
             raise RuntimeError("OPENAI_API_KEY mancante")
         if self._client is None:
-            self._client = OpenAI()
+            if _OPENAI_STYLE == "v1" and _OpenAI is not None:
+                # SDK v1 client
+                self._client = _OpenAI()
+            elif _OPENAI_STYLE == "v0" and _openai is not None:
+                # Legacy SDK v0 uses module-level api_key and ChatCompletion
+                _openai.api_key = SETTINGS.openai_api_key
+                self._client = _openai
+            else:
+                raise RuntimeError("OpenAI SDK non disponibile: installa 'openai' nel runtime")
         return self._client
 
     def _cache_key(self, type_name: str, field: str, locale: str, text_norm: str) -> str:
@@ -457,19 +480,36 @@ class Translator:
                 snippet_req=text[: SETTINGS.log_payload_max],
             )
         t0 = time.perf_counter()
-        resp = client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            response_format={"type": "text"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-        )
+        # SDK v1 vs legacy v0
+        if hasattr(client, "chat") and hasattr(client.chat, "completions"):
+            resp = client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                response_format={"type": "text"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            usage = getattr(resp, "usage", None) and resp.usage.model_dump() or {}
+        else:
+            # Legacy v0 path
+            resp = client.ChatCompletion.create(  # type: ignore[attr-defined]
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+            )
+            choice0 = (resp.get("choices") or [{}])[0]
+            msg = choice0.get("message") or {}
+            out = (msg.get("content") or "").strip()
+            usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
-        out = (resp.choices[0].message.content or "").strip()
         meta = {
-            "usage": getattr(resp, "usage", None) and resp.usage.model_dump() or {},
+            "usage": usage,
             "duration_ms": dt,
             "resp_hash": _hash_text(out),
         }
@@ -508,24 +548,40 @@ class Translator:
                 snippet_req=user_content[: SETTINGS.log_payload_max],
             )
         t0 = time.perf_counter()
-        resp = client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-        )
+        if hasattr(client, "chat") and hasattr(client.chat, "completions"):
+            resp = client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            usage = getattr(resp, "usage", None) and resp.usage.model_dump() or {}
+        else:
+            # Legacy v0: no response_format; ask JSON via prompt and parse
+            resp = client.ChatCompletion.create(  # type: ignore[attr-defined]
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            choice0 = (resp.get("choices") or [{}])[0]
+            msg = choice0.get("message") or {}
+            text = (msg.get("content") or "").strip()
+            usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
-        text = (resp.choices[0].message.content or "").strip()
         try:
             obj = json.loads(text)
         except Exception as e:
             logger.warning("openai_json_parse_error", error=str(e))
             raise
         meta = {
-            "usage": getattr(resp, "usage", None) and resp.usage.model_dump() or {},
+            "usage": usage,
             "duration_ms": dt,
             "resp_hash": _hash_text(text),
         }

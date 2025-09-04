@@ -1,0 +1,13 @@
+openai>=1.40.0
+httpx
+tenacity
+structlog
+beautifulsoup4
+html5lib
+PyYAML
+python-dotenv
+python-slugify
+anyio
+sniffio
+typing_extensions
+pydantic>=2

@@ -6,6 +6,9 @@ import typer
 
 from src.config.settings import SETTINGS
 from src.pipeline.process_csv import process_file
+from src.shopify.sync import process_product as sync_process_product
+from src.shopify.graphql import make_product_gid
+import asyncio
 
 app = typer.Typer(add_completion=False, help="Shopify CSV translator")
 
@@ -100,3 +103,71 @@ def process(
         import json
 
         print(json.dumps(summary, ensure_ascii=False))
+
+
+@app.command("sync-shopify")
+def sync_shopify(
+    product_id: list[int] = typer.Option(
+        ..., "--product-id", help="ID numerico prodotto (ripetibile)",
+    ),  # noqa: B008
+    target_locales: str | None = typer.Option(
+        None, "--target-locales", help="Locali di destinazione separati da virgola"
+    ),  # noqa: B008
+    mf_include: str | None = typer.Option(
+        None, "--mf-include", help="Lista namespace.key separati da virgola"
+    ),  # noqa: B008
+    mf_json_paths: str | None = typer.Option(
+        None, "--mf-json-paths", help="JSON path rules (coma-separati)"
+    ),  # noqa: B008
+    create: bool = typer.Option(False, "--create", help="Tratta come products/create"),  # noqa: B008
+    update: bool = typer.Option(True, "--update/--no-update", help="Tratta come update"),  # noqa: B008
+    dry_run: bool = typer.Option(None, "--dry-run", help="Dry-run (override SETTINGS.DRY_RUN)"),  # noqa: B008
+    apply_on_dry_run: bool = typer.Option(
+        False, "--apply-on-dry-run", help="Aggiorna snapshot anche in dry-run"
+    ),  # noqa: B008
+):
+    """Sincronizza traduzioni per prodotti esistenti su Shopify (products/create|update)."""
+    if create and not update:
+        is_create = True
+    elif update and not create:
+        is_create = False
+    else:
+        # default: update
+        is_create = False
+
+    tl = (
+        [x.strip() for x in target_locales.split(",") if x.strip()]
+        if target_locales
+        else (SETTINGS.get_target_locales() or [SETTINGS.target_locale])
+    )
+    mf_inc = (
+        [(a.strip(), b.strip()) for a, b in (s.split(".", 1) for s in mf_include.split(",") if "." in s)]
+        if mf_include
+        else SETTINGS.get_mf_include()
+    )
+    mf_paths = (
+        [x.strip() for x in mf_json_paths.split(",") if x.strip()] if mf_json_paths else SETTINGS.get_mf_json_paths()
+    )
+    dr = SETTINGS.dry_run_default if dry_run is None else bool(dry_run)
+
+    async def _run():
+        results = []
+        for pid in product_id:
+            res = await sync_process_product(
+                product_numeric_id=pid,
+                target_locales=tl,
+                mf_include=mf_inc,
+                mf_json_paths=mf_paths,
+                source_locale=SETTINGS.source_locale,
+                dry_run=dr,
+                is_create=is_create,
+                delay_ms_after_create=SETTINGS.delay_ms_after_create,
+                apply_on_dry_run=apply_on_dry_run,
+            )
+            results.append(res)
+        return results
+
+    out = asyncio.run(_run())
+    import json as _json
+
+    print(_json.dumps(out, ensure_ascii=False))
