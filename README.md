@@ -269,6 +269,7 @@ Accetta anche `--dry-run` e `--apply-on-dry-run` per aggiornare lo snapshot in m
 - Verifica import SDK OpenAI nel worker: cerca log `{"openai_import_ok": true, ...}` in CloudWatch.
 - Errori di packaging (pydantic_core): assicurati di buildare in Docker Amazon Linux.
 - Dimensioni zip > 70MB: usa S3 (`worker_s3_bucket`/`worker_s3_key`).
+- Pausa rapida della sync (bulk import): imposta `DISABLE_SYNC=true` su Receiver/Worker per ignorare i webhook. Da CLI: `shopify-translator sync-toggle --disable --target both --receiver-name <fn> --worker-name <fn>`.
 
 ## Licenza
 

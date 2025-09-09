@@ -199,6 +199,10 @@ async def _process_one(record):
 
 
 def handler(event, context):
+    # Allow runtime disable via env
+    if os.environ.get("DISABLE_SYNC", "false").lower() in {"1", "true", "yes", "y"}:
+        print(json.dumps({"ok": True, "skip": "disabled", "component": "worker", "records": len(event.get("Records", []))}))
+        return {"statusCode": 200}
     loop = asyncio.get_event_loop()
     tasks = [_process_one(r) for r in event.get("Records", [])]
     loop.run_until_complete(asyncio.gather(*tasks))
