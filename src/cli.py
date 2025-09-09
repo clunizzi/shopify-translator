@@ -24,8 +24,11 @@ OPT_AUTO_CLASSIFY: bool = True
 def process(
     input: Path = typer.Option(..., "--input", "-i", help="Path CSV input"),  # noqa: B008
     output: Path = typer.Option(..., "--output", "-o", help="Path CSV output"),  # noqa: B008
-    target_locale: str = typer.Option(
-        SETTINGS.target_locale, "--target-locale", help="Locale target es. fr-FR"
+    target_locales: str = typer.Option(
+        SETTINGS.target_locale,
+        "--target-locales",
+        "--target-locale",
+        help="Locale target singolo o lista separata da virgola (es. fr-FR oppure de-DE,fr-FR)",
     ),  # noqa: B008
     dnt: Path | None = typer.Option(None, "--dnt", help="Path YAML do_not_translate"),  # noqa: B008
     preserve_handle: bool = typer.Option(
@@ -66,8 +69,10 @@ def process(
     no_stdout: bool = typer.Option(
         OPT_NO_STDOUT, "--no-stdout", help="Silenzia stdout (solo file)"
     ),  # noqa: B008
-    truncate_output: bool = typer.Option(
-        OPT_TRUNCATE, "--truncate-output", help="Tronca l'output invece che appenderlo"
+    overwrite_output: bool = typer.Option(
+        True,
+        "--overwrite-output/--append-output",
+        help="Sovrascrive l'output (default) invece di appenderlo",
     ),  # noqa: B008
     auto_classify: bool = typer.Option(
         OPT_AUTO_CLASSIFY,
@@ -78,10 +83,15 @@ def process(
     """
     Esegue la pipeline di traduzione.
     """
+    # Parse locale/i: accetta singolo o lista separata da virgola
+    t_locales_list = [x.strip() for x in (target_locales or "").split(",") if x.strip()] or [SETTINGS.target_locale]
+    primary_locale = t_locales_list[0]
+
     summary = process_file(
         input_csv=input,
         output_csv=output,
-        target_locale=target_locale,
+        target_locale=primary_locale,
+        target_locales=t_locales_list,
         dnt_config_path=dnt,
         preserve_handle=preserve_handle,
         resume=resume,
@@ -95,7 +105,7 @@ def process(
         id_range=id_range,
         log_file=log_file,
         no_stdout=no_stdout,
-        truncate_output=truncate_output,
+        overwrite_output=overwrite_output,
         auto_classify=auto_classify,
     )
     # Non stampo "Done ..." per non rompere piping | jq
