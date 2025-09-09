@@ -1,0 +1,31 @@
+# Project naming
+project = "my-translator"
+
+# Zips (receiver è leggero e si può passare localmente; worker via S3 per zip grandi)
+receiver_zip = "../../build/receiver.zip"
+worker_zip   = "../../build/worker.zip"
+
+# Oppure usa S3 per il worker (consigliato in produzione)
+#worker_s3_bucket = "my-artifacts-bucket"
+#worker_s3_key    = "worker/worker-20250101T120000.zip"
+
+# Shopify
+shop_domain = "your-shop.myshopify.com"
+
+# Secrets Manager ARNs (consigliato)
+openai_api_key_secret_arn      = "arn:aws:secretsmanager:eu-central-1:111111111111:secret:openai_api_key-xxxx"
+shopify_admin_token_secret_arn = "arn:aws:secretsmanager:eu-central-1:111111111111:secret:shopify_admin_token-xxxx"
+shopify_webhook_secret_arn     = "arn:aws:secretsmanager:eu-central-1:111111111111:secret:shopify_webhook_secret-xxxx"
+
+# Localizzazione
+source_locale   = "en"
+target_locales  = "fr-FR,de-DE"
+mf_include      = "" # es. "meta.namespace1.key1,meta.ns2.key2"
+mf_json_paths   = ""
+
+# Worker runtime
+request_timeout      = 30
+retries              = 3
+debounce_seconds     = 20
+dry_run              = "false"
+fill_missing_translations = "true"

@@ -3,14 +3,31 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import errno
+import os
 from pathlib import Path
 
 
 class TranslationCache:
-    def __init__(self, db_path: str | Path = "state/cache.sqlite") -> None:
-        self.path = Path(db_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        """
+        SQLite-backed cache with safe default path.
+        - Default path comes from env TRANSLATION_CACHE_PATH or 'state/cache.sqlite'.
+        - If the filesystem is read-only (e.g., AWS Lambda), falls back to '/tmp/cache.sqlite'.
+        """
+        desired = Path(
+            db_path if db_path is not None else os.getenv("TRANSLATION_CACHE_PATH", "state/cache.sqlite")
+        )
+        self.path = desired
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(self.path)
+        except Exception as e:
+            # Read-only FS or invalid path: fallback to /tmp
+            fallback = Path("/tmp/cache.sqlite")
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            self.path = fallback
+            self.conn = sqlite3.connect(self.path)
         self._init()
 
     def _init(self) -> None:

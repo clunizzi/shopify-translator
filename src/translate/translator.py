@@ -91,6 +91,26 @@ def _snippet_ell(s: object, limit: int = 500) -> str:
     return text if len(text) <= limit else (text[:limit] + "…")
 
 
+# --- Minor post-processing helpers ------------------------------------------
+_MD_EM_RE = re.compile(r"(\*{1,2}[^*]+?\*{1,2}|_{1,2}[^_]+?_{1,2})")
+
+def _fix_inline_markdown_spacing(s: str) -> str:
+    """
+    Inserisce spazi attorno a blocchi stile markdown (*bold*, **bold**, _em_, __strong__)
+    se adiacenti a caratteri non-spazio, per evitare incollaggi tipo 'parola*bold*parola'.
+    Non altera il contenuto interno ai marker.
+    """
+    if not s:
+        return s
+    # spazio prima
+    s = re.sub(r"([^\s])(\*{1,2}[^*]+?\*{1,2})", r"\1 \2", s)
+    s = re.sub(r"([^\s](_{1,2}[^_]+?_{1,2}))", r" \1", s)
+    # spazio dopo
+    s = re.sub(r"(\*{1,2}[^*]+?\*{1,2})([^\s])", r"\1 \2", s)
+    s = re.sub(r"(_{1,2}[^_]+?_{1,2})([^\s])", r"\1 \2", s)
+    return s
+
+
 # --- JSON parsing helpers -----------------------------------------------------
 
 def _safe_json_loads(text: str) -> dict:
@@ -360,10 +380,25 @@ def detect_lang_fast(text: str) -> tuple[str, float]:
     return (best_lang, conf)
 
 
-try:
-    from openai import OpenAI  # SDK v1
+"""
+Compat layer for OpenAI SDKs:
+- Prefer SDK v1 (`from openai import OpenAI`) if available
+- Fallback to legacy v0 (`import openai` and use `openai.ChatCompletion.create`)
+This avoids `'NoneType' object is not callable'` when v1 class is missing.
+"""
+try:  # SDK v1
+    from openai import OpenAI as _OpenAI  # type: ignore
+    import openai as _openai  # for typing/usage extraction
+    _OPENAI_STYLE = "v1"
 except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+    try:  # Legacy v0
+        import openai as _openai  # type: ignore
+        _OpenAI = None  # type: ignore
+        _OPENAI_STYLE = "v0"
+    except Exception:  # no SDK available
+        _openai = None  # type: ignore
+        _OpenAI = None  # type: ignore
+        _OPENAI_STYLE = "none"
 
 
 @dataclass
@@ -388,11 +423,17 @@ def _build_system_prompt(
     - meta_description: 150–160 char, senza emoji/markdown
     """
     dont = ", ".join(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
+    spec = getattr(SETTINGS, "translator_specialization", "")
+    src_name = getattr(SETTINGS, "source_language_name", "italiano")
+    domain_line = (
+        f"Sei un traduttore tecnico specializzato in {spec}, conosci i termini specifici del dominio. "
+        if spec else "Sei un traduttore tecnico accurato. "
+    )
     base = (
-        "Sei un traduttore tecnico specializzato in attrazzatura per il giardinaggio e l'agricoltura, conosci tutti i termini specifici di questo campo."
-        f"Traduci dall'italiano a {target_locale} il contenuto del campo '{field}' "
-        f"per il tipo '{type_name}'. Non tradurre marchi, unità di misura, sigle e i seguenti termini esatti: {dont}. "
-        "Mantieni numeri, codici e punteggiatura. Niente markdown o spiegazioni; restituisci solo il testo tradotto."
+        domain_line
+        + f"Traduci da {src_name} a {target_locale} il contenuto del campo '{field}' "
+        + f"per il tipo '{type_name}'. Non tradurre marchi, unità di misura, sigle e i seguenti termini esatti: {dont}. "
+        + "Mantieni numeri, codici e punteggiatura. Niente markdown o spiegazioni; restituisci solo il testo tradotto."
     )
     if field == "meta_title":
         if type_name == "PRODUCT":
@@ -431,7 +472,15 @@ class Translator:
         if not SETTINGS.has_openai:
             raise RuntimeError("OPENAI_API_KEY mancante")
         if self._client is None:
-            self._client = OpenAI()
+            if _OPENAI_STYLE == "v1" and _OpenAI is not None:
+                # SDK v1 client
+                self._client = _OpenAI()
+            elif _OPENAI_STYLE == "v0" and _openai is not None:
+                # Legacy SDK v0 uses module-level api_key and ChatCompletion
+                _openai.api_key = SETTINGS.openai_api_key
+                self._client = _openai
+            else:
+                raise RuntimeError("OpenAI SDK non disponibile: installa 'openai' nel runtime")
         return self._client
 
     def _cache_key(self, type_name: str, field: str, locale: str, text_norm: str) -> str:
@@ -457,19 +506,36 @@ class Translator:
                 snippet_req=text[: SETTINGS.log_payload_max],
             )
         t0 = time.perf_counter()
-        resp = client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            response_format={"type": "text"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-        )
+        # SDK v1 vs legacy v0
+        if hasattr(client, "chat") and hasattr(client.chat, "completions"):
+            resp = client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                response_format={"type": "text"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            usage = getattr(resp, "usage", None) and resp.usage.model_dump() or {}
+        else:
+            # Legacy v0 path
+            resp = client.ChatCompletion.create(  # type: ignore[attr-defined]
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+            )
+            choice0 = (resp.get("choices") or [{}])[0]
+            msg = choice0.get("message") or {}
+            out = (msg.get("content") or "").strip()
+            usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
-        out = (resp.choices[0].message.content or "").strip()
         meta = {
-            "usage": getattr(resp, "usage", None) and resp.usage.model_dump() or {},
+            "usage": usage,
             "duration_ms": dt,
             "resp_hash": _hash_text(out),
         }
@@ -508,24 +574,40 @@ class Translator:
                 snippet_req=user_content[: SETTINGS.log_payload_max],
             )
         t0 = time.perf_counter()
-        resp = client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-        )
+        if hasattr(client, "chat") and hasattr(client.chat, "completions"):
+            resp = client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            usage = getattr(resp, "usage", None) and resp.usage.model_dump() or {}
+        else:
+            # Legacy v0: no response_format; ask JSON via prompt and parse
+            resp = client.ChatCompletion.create(  # type: ignore[attr-defined]
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            choice0 = (resp.get("choices") or [{}])[0]
+            msg = choice0.get("message") or {}
+            text = (msg.get("content") or "").strip()
+            usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
-        text = (resp.choices[0].message.content or "").strip()
         try:
             obj = json.loads(text)
         except Exception as e:
             logger.warning("openai_json_parse_error", error=str(e))
             raise
         meta = {
-            "usage": getattr(resp, "usage", None) and resp.usage.model_dump() or {},
+            "usage": usage,
             "duration_ms": dt,
             "resp_hash": _hash_text(text),
         }
@@ -846,7 +928,9 @@ class Translator:
                 translations = obj.get("translations")
                 if not isinstance(translations, list):
                     raise ValueError("missing 'translations' list")
-                translated_list = [str(x or "").strip() for x in translations]
+                # Preserve leading/trailing spaces inside segments to avoid
+                # collapsing boundaries around inline markers or tags.
+                translated_list = [str(x) if x is not None else "" for x in translations]
             except Exception as e:
                 logger.error(
                     "openai_json_error",
@@ -867,10 +951,17 @@ class Translator:
                 self.cache.set(key, {"translated": txt}, model=self.model)
 
 
-        # 4) Ricostruzione segmenti completi
+        # 4) Ricostruzione segmenti completi (aggiusta spazi attorno a *...*/_..._)
         translated_segments: list[str] = []
         for i in range(len(segments)):
-            translated_segments.append(cached_out.get(i, fresh_map.get(i, segments[i])))
+            if i in cached_out:
+                val = cached_out[i]
+                translated_segments.append(_fix_inline_markdown_spacing(val))
+            elif i in fresh_map:
+                val = fresh_map[i]
+                translated_segments.append(_fix_inline_markdown_spacing(val))
+            else:
+                translated_segments.append(segments[i])
 
         # 5) Re-iniezione testi e Liquid
         out_html = reinject_text(html_map, translated_segments)

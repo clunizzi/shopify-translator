@@ -262,10 +262,19 @@ def _is_technical_value(s: str) -> bool:
     return bool(RE_TECH.match((s or "").strip()))
 
 
+def _csv_locale_from(target: str) -> str:
+    """Shopify CSV accetta locale in minuscolo (lingua). 'fr-FR' -> 'fr'."""
+    s = (target or "").strip()
+    if not s:
+        return s
+    return s.split("-", 1)[0].lower()
+
+
 def process_file(
     input_csv: str | Path,
     output_csv: str | Path,
     target_locale: str,
+    target_locales: list[str] | None,
     dnt_config_path: str | Path | None,
     preserve_handle: bool,
     resume: bool,
@@ -280,7 +289,7 @@ def process_file(
     id_range: str | None = None,
     log_file: str | Path | None = None,
     no_stdout: bool = False,
-    truncate_output: bool = False,
+    overwrite_output: bool = True,
     auto_classify: bool = True,  # <— nuovo: per gestire CSV “generici”
 ) -> dict:
     _configure_logging(
@@ -324,12 +333,20 @@ def process_file(
     if allowed_ids is not None:
         df = df.filter(pl.col("Identification").cast(pl.Int64).is_in(list(allowed_ids)))
 
-    init_output(out_path, truncate=truncate_output)
+    init_output(out_path, truncate=overwrite_output)
 
-    # Checkpoint
-    cp_new = _checkpoint_path_for(input_hash, target_locale)
+    # Decide locales to process (single vs multi)
+    locales: list[str] = (
+        [x for x in (target_locales or []) if x]
+        if target_locales and len(target_locales) > 0
+        else [target_locale]
+    )
+
+    # Checkpoint (use combined key when multiple locales)
+    cp_locale_key = locales[0] if len(locales) == 1 else ",".join(locales)
+    cp_new = _checkpoint_path_for(input_hash, cp_locale_key)
     cp_old = Path("state/checkpoint.json")
-    cp_loaded = _load_checkpoint_any(cp_new, cp_old, input_hash, target_locale)
+    cp_loaded = _load_checkpoint_any(cp_new, cp_old, input_hash, cp_locale_key)
 
     run_id = _new_run_id()
     host = {"hostname": socket.gethostname(), "pid": os.getpid()}
@@ -343,7 +360,7 @@ def process_file(
         "resume": resume,
         "force": force,
         "dry_run": dry_run,
-        "truncate_output": truncate_output,
+        "overwrite_output": overwrite_output,
         "log_file": str(log_file) if log_file else None,
         "no_stdout": no_stdout,
         "auto_classify": auto_classify,
@@ -388,12 +405,12 @@ def process_file(
         "started_at": _now_iso(),
         "updated_at": _now_iso(),
         "input_hash": input_hash,
-        "locale": target_locale,
+        "locale": cp_locale_key,
         "input_path": str(in_path.resolve()),
         "output_path": str(out_path.resolve()),
         "input_basename": in_path.name,
         "output_basename": out_path.name,
-        "options": options,
+        "options": {**options, "target_locales": locales},
         "env": env,
         "host": host,
         "progress": {
@@ -408,7 +425,7 @@ def process_file(
         {
             "run_id": run_id,
             "input_hash": input_hash,
-            "locale": target_locale,
+            "locale": cp_locale_key,
             "input_basename": in_path.name,
             "output_basename": out_path.name,
             "started_at": cp["started_at"],
@@ -436,7 +453,8 @@ def process_file(
         if product_ids_for_status:
             active_map = get_active_products_map(product_ids_for_status, dry_run=dry_run)
         else:
-            active_map = {}
+            # Nessun filtro su Type o nessun PRODUCT nel DF: non abbiamo mappa di stato → considera attivi
+            active_map = None  # sentinel: non applicare skip_inactive
             logger.info(
                 "shopify_status_skip",
                 reason="no_PRODUCT_in_types" if has_type_col else "no_type_column",
@@ -492,212 +510,241 @@ def process_file(
                     logger.info("skip_metafield_inactive_owner", metafield_id=int(pid))
                     continue
 
-            if is_product_group and not active_map.get(pid, False):
-                summary["skipped_inactive"] += len(sub)
-                logger.info("skip_inactive", product_id=pid)
-                continue
-
-            rows_out: list[pl.DataFrame] = []
-            title_translated: str | None = None
-
-            for row in sub.iter_rows(named=True):
-                for c in TEXT_COLS:
-                    if row.get(c) is None:
-                        row[c] = ""
-
-                # Fallback di type_name se la colonna manca
-                type_name = (row.get("Type") or "GENERIC").strip().upper()
-                field_csv = (row.get("Field") or "").strip()
-                default = row.get("Default content") or ""
-                translated_existing = row.get("Translated content") or ""
-
-                if field_csv == "body_html" and not default.strip():
-                    summary["skipped_empty_body_html"] += 1
-                    logger.info("skip_empty_body_html", product_id=pid, type_name=type_name)
+            if is_product_group:
+                active_ok = active_map.get(pid, True) if isinstance(active_map, dict) else True
+                if not active_ok:
+                    summary["skipped_inactive"] += len(sub)
+                    logger.info("skip_inactive", product_id=pid)
                     continue
 
-                if translated_existing and not force:
-                    rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-                    summary["translated_rows"] += 1
-                    continue
+            # Per CSV->CSV: per Shopify serve una riga per ogni locale target.
+            is_multi = len(locales) > 1
+            rows_accum: list[pl.DataFrame] = []  # accumula righe per tutti i locali, poi un solo append
+            for target_locale_eff in locales:
+                rows_out: list[pl.DataFrame] = []
+                title_translated: str | None = None
 
-                translated = ""
+                for row in sub.iter_rows(named=True):
+                    for c in TEXT_COLS:
+                        if row.get(c) is None:
+                            row[c] = ""
 
-                # --- rami esistenti invariati (PRODUCT / OPTIONS / COLLECTION / METAFIELD) ---
-                # Nota: se has_type_col è False, si cade nell’else GENERIC più sotto.
+                    # Forza sempre il locale di output (Shopify CSV: lingua minuscola es. 'fr','de')
+                    row["Locale"] = _csv_locale_from(target_locale_eff)
 
-                if type_name == "PRODUCT":
-                    if field_csv == "title":
-                        title_translated = translator.translate_field(
-                            "PRODUCT",
-                            "title",
-                            default,
-                            target_locale,
-                            dnt=dnt,
-                            exclude_similarity_tokens=exclude_tokens,
-                        )
-                        translated = title_translated
-                    else:
-                        translated = translator.translate_field(
-                            "PRODUCT",
-                            field_csv,
-                            default,
-                            target_locale,
-                            dnt=dnt,
-                            exclude_similarity_tokens=exclude_tokens,
-                            title_translated=title_translated,
-                            preserve_handle=preserve_handle,
-                        )
+                    # Fallback di type_name se la colonna manca
+                    type_name = (row.get("Type") or "GENERIC").strip().upper()
+                    field_csv = (row.get("Field") or "").strip()
+                    default = row.get("Default content") or ""
+                    translated_existing = (row.get("Translated content") or "") if not is_multi else ""
 
-                elif type_name == "PRODUCT_OPTION":
-                    skip, reason = should_skip_option_name(default)
-                    if skip:
-                        summary["skipped_by_rule_option"] += 1
-                        logger.info(
-                            "skip_option_rule", reason=reason, product_id=pid, value=default[:120]
-                        )
+                    if field_csv == "body_html" and not default.strip():
+                        summary["skipped_empty_body_html"] += 1
+                        logger.info("skip_empty_body_html", product_id=pid, type_name=type_name)
                         continue
-                    label_norm, had_colon = normalize_option_label(default)
-                    translated = translator.translate_plain(
-                        "PRODUCT_OPTION",
-                        "option_name",
-                        label_norm,
-                        target_locale,
-                        dnt=dnt,
-                        exclude_similarity_tokens=exclude_tokens,
-                    )
-                    if translated == "":
-                        row["Status"] = "ERROR_SIMILARITY_OPTION"
-                    if had_colon and translated:
-                        translated = translated + ":"
-                    summary["translated_option_rows"] += 1
 
-                elif type_name == "PRODUCT_OPTION_VALUE":
-                    skip, reason = should_skip_option_value_name(default, dnt.units)
-                    if skip:
-                        if reason == "value_default_title":
-                            summary["skipped_by_rule_option_value"] += 1
+                    if translated_existing and not force:
+                        # Manteniamo la riga ma forziamo comunque il Locale di output
+                        row_out = dict(row)
+                        row_out["Locale"] = _csv_locale_from(target_locale_eff)
+                        rows_out.append(pl.DataFrame([row_out], schema=SCHEMA))
+                        summary["translated_rows"] += 1
+                        lp = _csv_locale_from(target_locale_eff)
+                        summary.setdefault("rows_per_locale", {})
+                        summary["rows_per_locale"][lp] = summary["rows_per_locale"].get(lp, 0) + 1
+                        continue
+
+                    translated = ""
+
+                    # --- rami esistenti invariati (PRODUCT / OPTIONS / COLLECTION / METAFIELD) ---
+                    # Nota: se has_type_col è False, si cade nell’else GENERIC più sotto.
+
+                    if type_name == "PRODUCT":
+                        if field_csv == "title":
+                            title_translated = translator.translate_field(
+                                "PRODUCT",
+                                "title",
+                                default,
+                                target_locale_eff,
+                                dnt=dnt,
+                                exclude_similarity_tokens=exclude_tokens,
+                            )
+                            translated = title_translated
+                        else:
+                            translated = translator.translate_field(
+                                "PRODUCT",
+                                field_csv,
+                                default,
+                                target_locale_eff,
+                                dnt=dnt,
+                                exclude_similarity_tokens=exclude_tokens,
+                                title_translated=title_translated,
+                                preserve_handle=preserve_handle,
+                            )
+
+                    elif type_name == "PRODUCT_OPTION":
+                        skip, reason = should_skip_option_name(default)
+                        if skip:
+                            summary["skipped_by_rule_option"] += 1
                             logger.info(
-                                "skip_value_rule",
+                                "skip_option_rule", reason=reason, product_id=pid, value=default[:120]
+                            )
+                            continue
+                        label_norm, had_colon = normalize_option_label(default)
+                        translated = translator.translate_plain(
+                            "PRODUCT_OPTION",
+                            "option_name",
+                            label_norm,
+                            target_locale_eff,
+                            dnt=dnt,
+                            exclude_similarity_tokens=exclude_tokens,
+                        )
+                        if translated == "":
+                            row["Status"] = "ERROR_SIMILARITY_OPTION"
+                        if had_colon and translated:
+                            translated = translated + ":"
+                        summary["translated_option_rows"] += 1
+
+                    elif type_name == "PRODUCT_OPTION_VALUE":
+                        skip, reason = should_skip_option_value_name(default, dnt.units)
+                        if skip:
+                            if reason == "value_default_title":
+                                summary["skipped_by_rule_option_value"] += 1
+                                logger.info(
+                                    "skip_value_rule",
+                                    reason=reason,
+                                    product_id=pid,
+                                    value=default[:120],
+                                )
+                                continue
+                            row["Translated content"] = default
+                            row["Status"] = f"UNCHANGED_BY_RULE_VALUE:{reason}"
+                            rows_out.append(pl.DataFrame([row], schema=SCHEMA))
+                            summary["translated_rows"] += 1
+                            summary["unchanged_by_rule_value"] += 1
+                            logger.info(
+                                "value_rule_unchanged",
                                 reason=reason,
                                 product_id=pid,
                                 value=default[:120],
                             )
                             continue
-                        row["Translated content"] = default
-                        row["Status"] = f"UNCHANGED_BY_RULE_VALUE:{reason}"
-                        rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-                        summary["translated_rows"] += 1
-                        summary["unchanged_by_rule_value"] += 1
-                        logger.info(
-                            "value_rule_unchanged",
-                            reason=reason,
-                            product_id=pid,
-                            value=default[:120],
+
+                        translated = translator.translate_plain(
+                            "PRODUCT_OPTION_VALUE",
+                            "option_value_name",
+                            default,
+                            target_locale_eff,
+                            dnt=dnt,
+                            exclude_similarity_tokens=exclude_tokens,
                         )
+                        if translated == "":
+                            row["Status"] = "ERROR_SIMILARITY_VALUE"
+                        summary["translated_option_value_rows"] += 1
+
+                    elif type_name == "COLLECTION":
+                        if field_csv == "title":
+                            title_translated = translator.translate_field(
+                                "COLLECTION",
+                                "title",
+                                default,
+                                target_locale_eff,
+                                dnt=dnt,
+                                exclude_similarity_tokens=exclude_tokens,
+                            )
+                            translated = title_translated
+                        else:
+                            translated = translator.translate_field(
+                                "COLLECTION",
+                                field_csv,
+                                default,
+                                target_locale_eff,
+                                dnt=dnt,
+                                exclude_similarity_tokens=exclude_tokens,
+                                title_translated=title_translated,
+                                preserve_handle=preserve_handle,
+                            )
+
+                    elif type_name == "METAFIELD":
+                        info = metafield_owner_map.get(int(pid), {}) if metafield_owner_map else {}
+                        key = (info.get("key") or "").strip()
+                        if key == "title_tag":
+                            field_logical = "meta_title"
+                        elif key == "description_tag":
+                            field_logical = "meta_description"
+                        else:
+                            field_logical = "value"
+
+                        translated = translator.translate_json_value(
+                            "METAFIELD",
+                            field_logical,
+                            default,
+                            target_locale_eff,
+                            dnt=dnt,
+                            exclude_similarity_tokens=exclude_tokens,
+                        )
+
+                    else:
+                        # GENERIC (o Type non gestito): traduzione “plain”
+                        translated = translator.translate_field(
+                            type_name,
+                            field_csv or "value",
+                            default,
+                            target_locale_eff,
+                            dnt=dnt,
+                            exclude_similarity_tokens=exclude_tokens,
+                            title_translated=None,
+                            preserve_handle=False,
+                        )
+
+                    # Sentinel JSON error (se integrato nel Translator)
+                    if translated == OPENAI_JSON_ERROR_SENTINEL:
+                        row_out = dict(row)
+                        row_out["Locale"] = _csv_locale_from(target_locale_eff)
+                        row_out["Status"] = "ERROR_OPENAI_JSON"
+                        row_out["Translated content"] = ""
+                        summary["json_errors"] += 1
+                        rows_out.append(pl.DataFrame([row_out], schema=SCHEMA))
                         continue
 
-                    translated = translator.translate_plain(
-                        "PRODUCT_OPTION_VALUE",
-                        "option_value_name",
-                        default,
-                        target_locale,
-                        dnt=dnt,
-                        exclude_similarity_tokens=exclude_tokens,
-                    )
-                    if translated == "":
-                        row["Status"] = "ERROR_SIMILARITY_VALUE"
-                    summary["translated_option_value_rows"] += 1
-
-                elif type_name == "COLLECTION":
-                    if field_csv == "title":
-                        title_translated = translator.translate_field(
-                            "COLLECTION",
-                            "title",
-                            default,
-                            target_locale,
-                            dnt=dnt,
-                            exclude_similarity_tokens=exclude_tokens,
+                    if type_name in {"PRODUCT", "COLLECTION"} and translated == "":
+                        err_code = (
+                            "ERROR_SIMILARITY_HTML"
+                            if field_csv == "body_html"
+                            else f"ERROR_SIMILARITY_{field_csv.upper()}"
                         )
-                        translated = title_translated
-                    else:
-                        translated = translator.translate_field(
-                            "COLLECTION",
-                            field_csv,
-                            default,
-                            target_locale,
-                            dnt=dnt,
-                            exclude_similarity_tokens=exclude_tokens,
-                            title_translated=title_translated,
-                            preserve_handle=preserve_handle,
+                        row["Status"] = err_code
+
+                    row_out = dict(row)
+                    row_out["Locale"] = _csv_locale_from(target_locale_eff)
+                    row_out["Translated content"] = translated
+                    rows_out.append(pl.DataFrame([row_out], schema=SCHEMA))
+                    summary["translated_rows"] += 1
+                    lp = _csv_locale_from(target_locale_eff)
+                    summary.setdefault("rows_per_locale", {})
+                    summary["rows_per_locale"][lp] = summary["rows_per_locale"].get(lp, 0) + 1
+
+                # Accumula righe per questo locale
+                if rows_out:
+                    rows_accum.append(
+                        pl.concat(rows_out, rechunk=True).with_columns(
+                            pl.col("Identification").cast(pl.Int64),
+                            *(pl.col(c).cast(pl.Utf8) for c in TEXT_COLS),
                         )
-
-                elif type_name == "METAFIELD":
-                    info = metafield_owner_map.get(int(pid), {}) if metafield_owner_map else {}
-                    key = (info.get("key") or "").strip()
-                    if key == "title_tag":
-                        field_logical = "meta_title"
-                    elif key == "description_tag":
-                        field_logical = "meta_description"
-                    else:
-                        field_logical = "value"
-
-                    translated = translator.translate_json_value(
-                        "METAFIELD",
-                        field_logical,
-                        default,
-                        target_locale,
-                        dnt=dnt,
-                        exclude_similarity_tokens=exclude_tokens,
                     )
 
-                else:
-                    # GENERIC (o Type non gestito): traduzione “plain”
-                    translated = translator.translate_field(
-                        type_name,
-                        field_csv or "value",
-                        default,
-                        target_locale,
-                        dnt=dnt,
-                        exclude_similarity_tokens=exclude_tokens,
-                        title_translated=None,
-                        preserve_handle=False,
-                    )
+            # Scrivi un unico batch per tutti i locali di questo prodotto
+            if rows_accum:
+                batch_all = pl.concat(rows_accum, rechunk=True)
+                append_rows(out_path, batch_all)
 
-                # Sentinel JSON error (se integrato nel Translator)
-                if translated == OPENAI_JSON_ERROR_SENTINEL:
-                    row["Status"] = "ERROR_OPENAI_JSON"
-                    row["Translated content"] = ""
-                    summary["json_errors"] += 1
-                    rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-                    continue
-
-                if type_name in {"PRODUCT", "COLLECTION"} and translated == "":
-                    err_code = (
-                        "ERROR_SIMILARITY_HTML"
-                        if field_csv == "body_html"
-                        else f"ERROR_SIMILARITY_{field_csv.upper()}"
-                    )
-                    row["Status"] = err_code
-
-                row["Translated content"] = translated
-                rows_out.append(pl.DataFrame([row], schema=SCHEMA))
-                summary["translated_rows"] += 1
-
-            if rows_out:
-                batch = pl.concat(rows_out, rechunk=True).with_columns(
-                    pl.col("Identification").cast(pl.Int64),
-                    *(pl.col(c).cast(pl.Utf8) for c in TEXT_COLS),
-                )
-                append_rows(out_path, batch)
-
-            completed.add(pid)
-            summary["processed_products"] += 1
-            cp["updated_at"] = _now_iso()
-            cp["progress"]["completed_identifications"] = sorted(list(completed))
-            cp["progress"]["processed_products"] = summary["processed_products"]
-            cp["stats"] = summary
-            cp_new.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
+        completed.add(pid)
+        summary["processed_products"] += 1
+        cp["updated_at"] = _now_iso()
+        cp["progress"]["completed_identifications"] = sorted(list(completed))
+        cp["progress"]["processed_products"] = summary["processed_products"]
+        cp["stats"] = summary
+        cp_new.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
 
     except Exception:
         cp["run_status"] = "aborted"
@@ -739,4 +786,3 @@ def process_file(
             logger.info("summary", **summary)
 
     return summary
-

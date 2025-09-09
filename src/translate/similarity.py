@@ -3,7 +3,18 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-from rapidfuzz import fuzz
+# Try to use rapidfuzz if available; otherwise fall back to difflib
+try:  # pragma: no cover - import guard
+    from rapidfuzz import fuzz as _rf_fuzz
+
+    def _ratio(a: str, b: str) -> float:
+        return _rf_fuzz.ratio(a, b) / 100.0
+
+except Exception:  # pragma: no cover - fallback path
+    import difflib
+
+    def _ratio(a: str, b: str) -> float:
+        return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def normalize_text(s: str, exclude_tokens: Sequence[str] | None = None) -> str:
@@ -25,4 +36,4 @@ def similarity(a: str, b: str, exclude_tokens: Sequence[str] | None = None) -> f
     nb = normalize_text(b, exclude_tokens)
     if not na and not nb:
         return 1.0
-    return fuzz.ratio(na, nb) / 100.0
+    return _ratio(na, nb)
