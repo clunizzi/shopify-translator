@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import typer
 
@@ -11,6 +12,7 @@ from src.shopify.graphql import make_product_gid
 import asyncio
 
 app = typer.Typer(add_completion=False, help="Shopify CSV translator")
+cache_app = typer.Typer(help="Cache SQLite utilities")
 
 
 # Opzioni predefinite centralizzate (evita B008 nelle signature)
@@ -79,32 +81,6 @@ def process(
         "--auto-classify/--no-auto-classify",
         help="Riconosce automaticamente JSON/HTML/URL/valori tecnici/plain se Field non è informativo",
     ),  # noqa: B008
-    # Opzioni opzionali per mettere in pausa la sync AWS durante l'elaborazione CSV
-    no_sync: bool = typer.Option(
-        False,
-        "--no-sync",
-        help="Metti in pausa la sync webhook su AWS (DISABLE_SYNC=true su Receiver/Worker)",
-    ),  # noqa: B008
-    sync_target: str = typer.Option(
-        "both",
-        "--sync-target",
-        help="Target Lambda da disabilitare se --no-sync: receiver|worker|both",
-    ),  # noqa: B008
-    receiver_name: str | None = typer.Option(
-        None,
-        "--receiver-name",
-        help="Nome funzione Lambda receiver (richiesto se --no-sync e --sync-target include receiver)",
-    ),  # noqa: B008
-    worker_name: str | None = typer.Option(
-        None,
-        "--worker-name",
-        help="Nome funzione Lambda worker (richiesto se --no-sync e --sync-target include worker)",
-    ),  # noqa: B008
-    re_enable_sync: bool = typer.Option(
-        False,
-        "--re-enable-sync",
-        help="Riabilita la sync (DISABLE_SYNC=false) a fine elaborazione se era stata disabilitata",
-    ),  # noqa: B008
 ):
     """
     Esegue la pipeline di traduzione.
@@ -112,39 +88,6 @@ def process(
     # Parse locale/i: accetta singolo o lista separata da virgola
     t_locales_list = [x.strip() for x in (target_locales or "").split(",") if x.strip()] or [SETTINGS.target_locale]
     primary_locale = t_locales_list[0]
-
-    # Opzionale: disabilita la sync AWS prima dell'elaborazione
-    if no_sync:
-        targets: list[tuple[str, str]] = []
-        st = (sync_target or "").strip().lower()
-        if st in ("receiver", "both"):
-            if not receiver_name:
-                raise typer.BadParameter("--receiver-name richiesto con --no-sync per target receiver/both")
-            targets.append(("receiver", receiver_name))
-        if st in ("worker", "both"):
-            if not worker_name:
-                raise typer.BadParameter("--worker-name richiesto con --no-sync per target worker/both")
-            targets.append(("worker", worker_name))
-
-        try:
-            import boto3  # type: ignore
-
-            lam = boto3.client("lambda")
-            for kind, fn in targets:
-                cfg = lam.get_function_configuration(FunctionName=fn)
-                env = (cfg.get("Environment") or {}).get("Variables") or {}
-                env["DISABLE_SYNC"] = "true"
-                lam.update_function_configuration(FunctionName=fn, Environment={"Variables": env})
-                typer.echo(f"[{kind}] DISABLE_SYNC=true impostato su {fn}")
-        except Exception as e:  # pragma: no cover - fallback
-            typer.echo(f"Impossibile aggiornare Lambda via boto3: {e}")
-            typer.echo("Esegui i seguenti comandi AWS CLI equivalenti:")
-            for kind, fn in targets:
-                typer.echo(
-                    "aws lambda update-function-configuration --function-name "
-                    + fn
-                    + " --environment 'Variables={DISABLE_SYNC=true}'"
-                )
 
     summary = {}
     try:
@@ -170,36 +113,7 @@ def process(
             auto_classify=auto_classify,
         )
     finally:
-        # Riabilita la sync se richiesto
-        if no_sync and re_enable_sync:
-            targets2: list[tuple[str, str]] = []
-            st2 = (sync_target or "").strip().lower()
-            if st2 in ("receiver", "both"):
-                if not receiver_name:
-                    raise typer.BadParameter("--receiver-name richiesto per --re-enable-sync su receiver/both")
-                targets2.append(("receiver", receiver_name))
-            if st2 in ("worker", "both"):
-                if not worker_name:
-                    raise typer.BadParameter("--worker-name richiesto per --re-enable-sync su worker/both")
-                targets2.append(("worker", worker_name))
-            try:
-                import boto3  # type: ignore
-                lam = boto3.client("lambda")
-                for kind, fn in targets2:
-                    cfg = lam.get_function_configuration(FunctionName=fn)
-                    env = (cfg.get("Environment") or {}).get("Variables") or {}
-                    env["DISABLE_SYNC"] = "false"
-                    lam.update_function_configuration(FunctionName=fn, Environment={"Variables": env})
-                    typer.echo(f"[{kind}] DISABLE_SYNC=false impostato su {fn}")
-            except Exception as e:  # pragma: no cover
-                typer.echo(f"Impossibile riabilitare la sync via boto3: {e}")
-                typer.echo("Comandi AWS CLI equivalenti:")
-                for kind, fn in targets2:
-                    typer.echo(
-                        "aws lambda update-function-configuration --function-name "
-                        + fn
-                        + " --environment 'Variables={DISABLE_SYNC=false}'"
-                    )
+        pass
     # Non stampo "Done ..." per non rompere piping | jq
     if stats:
         import json
@@ -273,6 +187,259 @@ def sync_shopify(
     import json as _json
 
     print(_json.dumps(out, ensure_ascii=False))
+
+
+# --- Cache utilities ---------------------------------------------------------
+def _resolve_cache_path(override: Path | None = None) -> Path:
+    if override is not None:
+        return override
+    env = os.getenv("TRANSLATION_CACHE_PATH")
+    if env and env.strip():
+        return Path(env.strip())
+    return Path("state/cache.sqlite")
+
+
+@cache_app.command("info")
+def cache_info(
+    db_path: Path | None = typer.Option(None, "--db-path", help="Path SQLite cache"),  # noqa: B008
+):
+    """Show effective cache DB path and table stats."""
+    path = _resolve_cache_path(db_path)
+    exists = path.exists()
+    info = {
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": (path.stat().st_size if exists else 0),
+        "tables": {},
+    }
+    try:
+        import sqlite3
+
+        if exists:
+            conn = sqlite3.connect(path)
+            cur = conn.cursor()
+            # list tables
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall()]
+            for t in tables:
+                try:
+                    cur.execute(f"SELECT COUNT(*) FROM {t}")
+                    cnt = int(cur.fetchone()[0])
+                except Exception:
+                    cnt = None  # view or unreadable
+                info["tables"][t] = cnt
+            conn.close()
+    except Exception as e:  # pragma: no cover - defensive
+        info["error"] = str(e)
+
+    import json as _json
+
+    print(_json.dumps(info, ensure_ascii=False))
+
+
+@cache_app.command("purge")
+def cache_purge(
+    db_path: Path | None = typer.Option(None, "--db-path", help="Path SQLite cache"),  # noqa: B008
+    all: bool = typer.Option(
+        False,
+        "--all/--translations-only",
+        help="Drop both translations and snapshot tables (default: only translations)",
+    ),  # noqa: B008
+    vacuum: bool = typer.Option(False, "--vacuum/--no-vacuum", help="Run VACUUM after purge"),  # noqa: B008
+):
+    """Purge cache data. By default clears only translations table."""
+    path = _resolve_cache_path(db_path)
+    # If DB doesn't exist, nothing to do
+    if not path.exists():
+        typer.echo(f"No DB at {path}; nothing to purge.")
+        return
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        with conn:
+            # remove translations table rows or whole table if schema changed
+            try:
+                conn.execute("DELETE FROM translations")
+            except Exception:
+                conn.execute("DROP TABLE IF EXISTS translations")
+            # also clear cell_cache
+            try:
+                conn.execute("DELETE FROM cell_cache")
+            except Exception:
+                conn.execute("DROP TABLE IF EXISTS cell_cache")
+            if all:
+                conn.execute("DROP TABLE IF EXISTS snapshot_translatable")
+        if vacuum:
+            try:
+                conn.execute("VACUUM")
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    typer.echo(f"Purged cache at {path} (all={all}, vacuum={vacuum}).")
+
+
+app.add_typer(cache_app, name="cache")
+
+@app.command("sync-webhook")
+def sync_webhook(
+    disable: bool = typer.Option(True, "--disable/--enable", help="Disabilita/abilita la sync webhook"),  # noqa: B008
+    target: str = typer.Option("both", "--target", help="receiver|worker|both"),  # noqa: B008
+    project: str | None = typer.Option(
+        None,
+        "--project",
+        help="Prefisso 'project' usato da Terraform per dedurre i nomi (es. <project>-shopify-...)",
+    ),  # noqa: B008
+    tfvars_path: Path = typer.Option(
+        Path("infra/terraform/terraform.tfvars"),
+        "--tfvars-path",
+        help="Percorso a terraform.tfvars per dedurre automaticamente project",
+    ),  # noqa: B008
+    tfstate_path: Path = typer.Option(
+        Path("infra/terraform/terraform.tfstate"),
+        "--tfstate-path",
+        help="Percorso a terraform.tfstate per dedurre nomi o project",
+    ),  # noqa: B008
+    receiver_name: str | None = typer.Option(None, "--receiver-name", help="Override nome Lambda receiver"),  # noqa: B008
+    worker_name: str | None = typer.Option(None, "--worker-name", help="Override nome Lambda worker"),  # noqa: B008
+    dry_run: bool = typer.Option(False, "--dry-run", help="Mostra cosa farebbe senza applicare"),  # noqa: B008
+):
+    """
+    Abilita/Disabilita la sync lato Lambda impostando DISABLE_SYNC su receiver/worker.
+    Se non passi i nomi, prova a dedurli da --project secondo lo schema Terraform:
+      <project>-shopify-webhook-receiver / <project>-shopify-webhook-worker
+    In alternativa usa env RECEIVER_LAMBDA_NAME/WORKER_LAMBDA_NAME.
+    """
+    tgt = (target or "").strip().lower()
+    if tgt not in {"receiver", "worker", "both"}:
+        raise typer.BadParameter("--target deve essere receiver|worker|both")
+
+    def _read_project_from_tfvars(p: Path) -> str | None:
+        try:
+            if not p.exists():
+                return None
+            txt = p.read_text(encoding="utf-8")
+            import re as _re
+            m = _re.search(r"^\s*project\s*=\s*\"([^\"]+)\"", txt, flags=_re.MULTILINE)
+            return m.group(1).strip() if m else None
+        except Exception:
+            return None
+
+    def _read_names_from_tfstate(p: Path) -> tuple[str | None, str | None, str | None]:
+        """Ritorna (receiver_name, worker_name, project) deducendo da tfstate se possibile."""
+        try:
+            if not p.exists():
+                return (None, None, None)
+            import json as _json
+            data = _json.loads(p.read_text(encoding="utf-8"))
+            resources = (data.get("resources") or [])
+            rn = None
+            wn = None
+            proj = None
+            for r in resources:
+                if r.get("type") == "aws_lambda_function":
+                    for inst in r.get("instances") or []:
+                        attrs = inst.get("attributes") or {}
+                        fn = attrs.get("function_name") or ""
+                        if fn.endswith("-shopify-webhook-receiver"):
+                            rn = fn
+                            if "-shopify-webhook-receiver" in fn:
+                                proj = fn[: fn.rfind("-shopify-webhook-receiver")]
+                        if fn.endswith("-shopify-webhook-worker"):
+                            wn = fn
+                            if "-shopify-webhook-worker" in fn and proj is None:
+                                proj = fn[: fn.rfind("-shopify-webhook-worker")]
+                if r.get("type") == "aws_dynamodb_table":
+                    for inst in r.get("instances") or []:
+                        attrs = inst.get("attributes") or {}
+                        name = attrs.get("name") or ""
+                        if name.endswith("-shopify-product-snapshots") and proj is None:
+                            proj = name[: name.rfind("-shopify-product-snapshots")]
+            return (rn, wn, proj)
+        except Exception:
+            return (None, None, None)
+
+    def _deduce_names() -> tuple[str | None, str | None]:
+        rn = receiver_name or os.getenv("RECEIVER_LAMBDA_NAME")
+        wn = worker_name or os.getenv("WORKER_LAMBDA_NAME")
+        if (rn and wn) or (tgt == "receiver" and rn) or (tgt == "worker" and wn):
+            return rn, wn
+        proj = project or _read_project_from_tfvars(tfvars_path)
+        if not proj:
+            rn2, wn2, proj2 = _read_names_from_tfstate(tfstate_path)
+            # Se tfstate ha già i nomi, usiamoli direttamente
+            rname = rn or rn2
+            wname = wn or wn2
+            if (tgt in {"receiver", "both"} and not rname) or (tgt in {"worker", "both"} and not wname):
+                # come fallback, prova a costruire dai proj se presente
+                proj = proj2
+            else:
+                return rname, wname
+        if proj:
+            base = f"{proj}-shopify"
+            rn2 = f"{base}-webhook-receiver"
+            wn2 = f"{base}-webhook-worker"
+            return rn or (rn2 if tgt in {"receiver", "both"} else None), wn or (wn2 if tgt in {"worker", "both"} else None)
+        # Fallback estremo: prova a individuare da AWS le funzioni con suffisso noto
+        try:
+            import boto3  # type: ignore
+            lam = boto3.client("lambda")
+            funcs = []
+            paginator = lam.get_paginator("list_functions")
+            for page in paginator.paginate():
+                funcs.extend(page.get("Functions") or [])
+            cand_r = [f["FunctionName"] for f in funcs if f.get("FunctionName", "").endswith("-shopify-webhook-receiver")]
+            cand_w = [f["FunctionName"] for f in funcs if f.get("FunctionName", "").endswith("-shopify-webhook-worker")]
+            rname = rn or (cand_r[0] if cand_r else None)
+            wname = wn or (cand_w[0] if cand_w else None)
+            return rname if tgt in {"receiver", "both"} else None, wname if tgt in {"worker", "both"} else None
+        except Exception:
+            return rn, wn
+        return rn, wn
+
+    rn, wn = _deduce_names()
+    missing: list[str] = []
+    if tgt in {"receiver", "both"} and not rn:
+        missing.append("receiver_name o --project")
+    if tgt in {"worker", "both"} and not wn:
+        missing.append("worker_name o --project")
+    if missing:
+        raise typer.BadParameter("Servono " + ", ".join(missing))
+
+    desired = "true" if disable else "false"
+    pairs: list[tuple[str, str]] = []
+    if tgt in {"receiver", "both"} and rn:
+        pairs.append(("receiver", rn))
+    if tgt in {"worker", "both"} and wn:
+        pairs.append(("worker", wn))
+
+    if dry_run:
+        for kind, fn in pairs:
+            typer.echo(f"[dry-run] {kind}: set DISABLE_SYNC={desired} on {fn}")
+        return
+
+    try:
+        import boto3  # type: ignore
+
+        lam = boto3.client("lambda")
+        for kind, fn in pairs:
+            cfg = lam.get_function_configuration(FunctionName=fn)
+            env = (cfg.get("Environment") or {}).get("Variables") or {}
+            env["DISABLE_SYNC"] = desired
+            lam.update_function_configuration(FunctionName=fn, Environment={"Variables": env})
+            typer.echo(f"[{kind}] DISABLE_SYNC={desired} impostato su {fn}")
+    except Exception as e:  # pragma: no cover
+        typer.echo(f"Errore aggiornando le Lambda: {e}")
+        typer.echo("Comandi AWS CLI equivalenti:")
+        for kind, fn in pairs:
+            typer.echo(
+                "aws lambda update-function-configuration --function-name "
+                + fn
+                + " --environment 'Variables={DISABLE_SYNC="
+                + desired
+                + "}'"
+            )
 
 
     # (sync-toggle command rimosso su richiesta)

@@ -434,7 +434,12 @@ def process_file(
     )
 
     cache = TranslationCache()
-    translator = Translator(cache=cache, model=SETTINGS.openai_model, dry_run=dry_run)
+    translator = Translator(
+        cache=cache,
+        model=SETTINGS.openai_model,
+        dry_run=dry_run,
+        ignore_cache=bool(force),
+    )
     dnt = load_do_not_translate(dnt_config_path)
     exclude_tokens = [*dnt.brands, *dnt.units, *dnt.tokens]
 

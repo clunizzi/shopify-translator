@@ -457,10 +457,18 @@ PLACEHOLDER_PREFIX_RE = r"^\[[a-z]{2}(?:-[A-Z]{2})?\]\s"
 
 
 class Translator:
-    def __init__(self, cache: TranslationCache, model: str | None = None, dry_run: bool = False):
+    def __init__(
+        self,
+        cache: TranslationCache,
+        model: str | None = None,
+        dry_run: bool = False,
+        *,
+        ignore_cache: bool = False,
+    ):
         self.cache = cache
         self.model = model or SETTINGS.openai_model
         self.dry_run = dry_run
+        self.ignore_cache = ignore_cache
         self._client = None
         # stats cache (per processo)
         self.cache_hits = 0
@@ -487,6 +495,61 @@ class Translator:
         return self.cache.make_key(
             type_name, field, locale, text_norm, SETTINGS.rules_version, self.model
         )
+
+    # --- Cell-level cache helpers -------------------------------------------
+    def _cell_key_plain(self, type_name: str, field: str, locale: str, text: str, exclude_similarity_tokens: Sequence[str]) -> str:
+        sig = normalize_text(text or "", exclude_tokens=exclude_similarity_tokens)
+        payload = f"cell|plain|{type_name}|{field}|{locale}|{sig}|{SETTINGS.rules_version}|{self.model}|{SETTINGS.cache_algo_version}"
+        return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _cell_key_html(self, type_name: str, field: str, locale: str, html: str, exclude_similarity_tokens: Sequence[str]) -> str:
+        # Proteggi Liquid solo per la firma, poi estrai segmenti testuali e normalizza
+        try:
+            from src.htmlmap.liquid import detect_has_liquid, protect_liquid
+            from src.htmlmap.extract import extract_text_segments
+            html_in = html or ""
+            html_prot = protect_liquid(html_in)[0] if detect_has_liquid(html_in) else html_in
+            _, segs = extract_text_segments(html_prot)
+        except Exception:
+            segs = [html or ""]
+        norm = [normalize_text(s or "", exclude_tokens=exclude_similarity_tokens) for s in segs]
+        sig = "||".join(norm)
+        payload = f"cell|html|{type_name}|{field}|{locale}|{sig}|{SETTINGS.rules_version}|{self.model}|{SETTINGS.cache_algo_version}"
+        return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _cell_key_json(self, type_name: str, field: str, locale: str, raw: str, exclude_similarity_tokens: Sequence[str]) -> str:
+        # Parse tollerante e raccogli solo leaf string normalizzate in ordine
+        try:
+            obj = try_extract_json(raw)
+        except Exception:
+            obj = None
+        leaves: list[str] = []
+        def _walk(o):
+            from typing import Any
+            if isinstance(o, dict):
+                for v in o.values():
+                    _walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    _walk(v)
+            elif isinstance(o, str):
+                s = o or ""
+                # Applica le stesse regole “skip tecnico” impiegate a runtime
+                if is_technical_value(s):
+                    return
+                p = split_prefix_tech_text(s)
+                if p:
+                    _, s2 = p
+                    s = s2
+                leaves.append(s)
+        if obj is None:
+            leaves = [raw or ""]
+        else:
+            _walk(obj)
+        norm = [normalize_text(s or "", exclude_tokens=exclude_similarity_tokens) for s in leaves]
+        sig = "||".join(norm)
+        payload = f"cell|json|{type_name}|{field}|{locale}|{sig}|{SETTINGS.rules_version}|{self.model}|{SETTINGS.cache_algo_version}"
+        return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
     @retry(
         reraise=True,
@@ -869,8 +932,21 @@ class Translator:
         - Re-inietta testi e poi Liquid
         - Similarità/lang: solo log
         """
-
         html_in = html or ""
+
+        # Cell-level cache (intero HTML pronto): early-return se presente
+        try:
+            if not self.ignore_cache:
+                # per la firma usa exclude_similarity_tokens come nel resto della pipeline
+                dnt = dnt  # no-op per chiarezza tipo
+                cell_key = self._cell_key_html(type_name, field, target_locale, html_in, exclude_similarity_tokens)
+                found = self.cache.get_cell(cell_key)
+                if found and isinstance(found.get("value"), str):
+                    self.cache_hits += 1
+                    logger.info("cell_cache_hit_html", type_name=type_name, field=field)
+                    return found["value"]
+        except Exception:
+            pass
 
         # 0) Protezione Liquid
         liquid_map: dict[int, str] = {}
@@ -977,6 +1053,14 @@ class Translator:
             lang, conf = ("unknown", 0.0)
         sim = similarity(plain_src, plain_dst, exclude_tokens=exclude_similarity_tokens)
         logger.info("html_similarity", extra={"sim": sim, "lang": lang, "conf": conf})
+        # Salva cell-level cache (HTML completo) per futuri hit
+        try:
+            if not self.ignore_cache:
+                cell_key = self._cell_key_html(type_name, field, target_locale, html_in, exclude_similarity_tokens)
+                meta = {"segments": len(segments)}
+                self.cache.set_cell(cell_key, out_html, self.model, meta=meta)
+        except Exception:
+            pass
         return out_html
 
 
@@ -1038,6 +1122,17 @@ class Translator:
 
 
         if field in {"meta_title", "meta_description", "title", "product_type"}:
+            # Cell-level cache per campi plain
+            try:
+                if not self.ignore_cache:
+                    cell_key = self._cell_key_plain(type_name, field, target_locale, default_content or "", exclude_similarity_tokens)
+                    found = self.cache.get_cell(cell_key)
+                    if found and isinstance(found.get("value"), str):
+                        self.cache_hits += 1
+                        logger.info("cell_cache_hit_plain", field=field)
+                        return found["value"]
+            except Exception:
+                pass
             result = self.translate_plain(
                 type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens
             )
@@ -1053,6 +1148,13 @@ class Translator:
             if field == "meta_description":
                 _, adjusted = validate_meta_length(result, MetaRules().max_desc_len)
                 result = adjusted
+            # Salva cell-level cache
+            try:
+                if not self.ignore_cache:
+                    cell_key = self._cell_key_plain(type_name, field, target_locale, default_content or "", exclude_similarity_tokens)
+                    self.cache.set_cell(cell_key, result, self.model, meta={})
+            except Exception:
+                pass
             return result
 
         return self.translate_plain(
@@ -1078,6 +1180,18 @@ class Translator:
         Tollerante: non solleva, in errore ritorna "" per permettere al chiamante di impostare Status.
         """
         logger.info("json_detect", type_name=type_name, field=field_logical)
+
+        # Cell-level cache (intero JSON string tradotto): early-return se presente
+        try:
+            if not self.ignore_cache:
+                cell_key = self._cell_key_json(type_name, field_logical, target_locale, default_content or "", exclude_similarity_tokens)
+                found = self.cache.get_cell(cell_key)
+                if found and isinstance(found.get("value"), str):
+                    self.cache_hits += 1
+                    logger.info("cell_cache_hit_json", field=field_logical)
+                    return found["value"]
+        except Exception:
+            pass
 
         # 0) Parse JSON; se fallisce → tratta come plain
         obj = try_extract_json(default_content)
@@ -1277,4 +1391,13 @@ class Translator:
             },
         )
 
-        return json.dumps(out_obj, ensure_ascii=False)
+        out_str = json.dumps(out_obj, ensure_ascii=False)
+        # Salva cell-level cache
+        try:
+            if not self.ignore_cache:
+                meta = {"leaves": len(leaves)} if 'leaves' in locals() else {}
+                cell_key = self._cell_key_json(type_name, field_logical, target_locale, default_content or "", exclude_similarity_tokens)
+                self.cache.set_cell(cell_key, out_str, self.model, meta=meta)
+        except Exception:
+            pass
+        return out_str

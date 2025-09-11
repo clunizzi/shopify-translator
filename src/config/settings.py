@@ -70,6 +70,8 @@ class Settings:
     retry_max_value: int = _get_int("RETRY_MAX_VALUE", 1)
 
     rules_version: int = _get_int("RULES_VERSION", 1)
+    # Cache algorithm version (bump to invalidate cell-cache signatures)
+    cache_algo_version: int = _get_int("CACHE_ALGO_VERSION", 1)
 
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO")

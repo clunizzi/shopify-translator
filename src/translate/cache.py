@@ -41,6 +41,18 @@ class TranslationCache:
                 hits INTEGER DEFAULT 0
             )"""
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cell_cache (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                model TEXT,
+                meta  TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                hits INTEGER DEFAULT 0
+            )
+            """
+        )
         self.conn.commit()
 
     @staticmethod
@@ -69,6 +81,28 @@ class TranslationCache:
         self.conn.execute(
             "INSERT OR REPLACE INTO translations (key, value, model) VALUES (?, ?, ?)",
             (key, json.dumps(value, ensure_ascii=False), model),
+        )
+        self.conn.commit()
+
+    # --- Cell-level cache ----------------------------------------------------
+    def get_cell(self, key: str) -> dict | None:
+        cur = self.conn.execute("SELECT value, meta, hits FROM cell_cache WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        value_text, meta_text, hits = row
+        self.conn.execute("UPDATE cell_cache SET hits = ? WHERE key = ?", (int(hits) + 1, key))
+        self.conn.commit()
+        try:
+            meta = json.loads(meta_text) if meta_text else {}
+        except Exception:
+            meta = {}
+        return {"value": value_text, "meta": meta}
+
+    def set_cell(self, key: str, value: str, model: str, meta: dict | None = None) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cell_cache (key, value, model, meta) VALUES (?, ?, ?, ?)",
+            (key, value, model, json.dumps(meta or {}, ensure_ascii=False)),
         )
         self.conn.commit()
 
