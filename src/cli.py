@@ -79,6 +79,32 @@ def process(
         "--auto-classify/--no-auto-classify",
         help="Riconosce automaticamente JSON/HTML/URL/valori tecnici/plain se Field non è informativo",
     ),  # noqa: B008
+    # Opzioni opzionali per mettere in pausa la sync AWS durante l'elaborazione CSV
+    no_sync: bool = typer.Option(
+        False,
+        "--no-sync",
+        help="Metti in pausa la sync webhook su AWS (DISABLE_SYNC=true su Receiver/Worker)",
+    ),  # noqa: B008
+    sync_target: str = typer.Option(
+        "both",
+        "--sync-target",
+        help="Target Lambda da disabilitare se --no-sync: receiver|worker|both",
+    ),  # noqa: B008
+    receiver_name: str | None = typer.Option(
+        None,
+        "--receiver-name",
+        help="Nome funzione Lambda receiver (richiesto se --no-sync e --sync-target include receiver)",
+    ),  # noqa: B008
+    worker_name: str | None = typer.Option(
+        None,
+        "--worker-name",
+        help="Nome funzione Lambda worker (richiesto se --no-sync e --sync-target include worker)",
+    ),  # noqa: B008
+    re_enable_sync: bool = typer.Option(
+        False,
+        "--re-enable-sync",
+        help="Riabilita la sync (DISABLE_SYNC=false) a fine elaborazione se era stata disabilitata",
+    ),  # noqa: B008
 ):
     """
     Esegue la pipeline di traduzione.
@@ -87,27 +113,93 @@ def process(
     t_locales_list = [x.strip() for x in (target_locales or "").split(",") if x.strip()] or [SETTINGS.target_locale]
     primary_locale = t_locales_list[0]
 
-    summary = process_file(
-        input_csv=input,
-        output_csv=output,
-        target_locale=primary_locale,
-        target_locales=t_locales_list,
-        dnt_config_path=dnt,
-        preserve_handle=preserve_handle,
-        resume=resume,
-        force=force,
-        dry_run=dry_run,
-        stats=stats,
-        types=types,
-        first_n=first_n,
-        ids=ids,
-        ids_file=ids_file,
-        id_range=id_range,
-        log_file=log_file,
-        no_stdout=no_stdout,
-        overwrite_output=overwrite_output,
-        auto_classify=auto_classify,
-    )
+    # Opzionale: disabilita la sync AWS prima dell'elaborazione
+    if no_sync:
+        targets: list[tuple[str, str]] = []
+        st = (sync_target or "").strip().lower()
+        if st in ("receiver", "both"):
+            if not receiver_name:
+                raise typer.BadParameter("--receiver-name richiesto con --no-sync per target receiver/both")
+            targets.append(("receiver", receiver_name))
+        if st in ("worker", "both"):
+            if not worker_name:
+                raise typer.BadParameter("--worker-name richiesto con --no-sync per target worker/both")
+            targets.append(("worker", worker_name))
+
+        try:
+            import boto3  # type: ignore
+
+            lam = boto3.client("lambda")
+            for kind, fn in targets:
+                cfg = lam.get_function_configuration(FunctionName=fn)
+                env = (cfg.get("Environment") or {}).get("Variables") or {}
+                env["DISABLE_SYNC"] = "true"
+                lam.update_function_configuration(FunctionName=fn, Environment={"Variables": env})
+                typer.echo(f"[{kind}] DISABLE_SYNC=true impostato su {fn}")
+        except Exception as e:  # pragma: no cover - fallback
+            typer.echo(f"Impossibile aggiornare Lambda via boto3: {e}")
+            typer.echo("Esegui i seguenti comandi AWS CLI equivalenti:")
+            for kind, fn in targets:
+                typer.echo(
+                    "aws lambda update-function-configuration --function-name "
+                    + fn
+                    + " --environment 'Variables={DISABLE_SYNC=true}'"
+                )
+
+    summary = {}
+    try:
+        summary = process_file(
+            input_csv=input,
+            output_csv=output,
+            target_locale=primary_locale,
+            target_locales=t_locales_list,
+            dnt_config_path=dnt,
+            preserve_handle=preserve_handle,
+            resume=resume,
+            force=force,
+            dry_run=dry_run,
+            stats=stats,
+            types=types,
+            first_n=first_n,
+            ids=ids,
+            ids_file=ids_file,
+            id_range=id_range,
+            log_file=log_file,
+            no_stdout=no_stdout,
+            overwrite_output=overwrite_output,
+            auto_classify=auto_classify,
+        )
+    finally:
+        # Riabilita la sync se richiesto
+        if no_sync and re_enable_sync:
+            targets2: list[tuple[str, str]] = []
+            st2 = (sync_target or "").strip().lower()
+            if st2 in ("receiver", "both"):
+                if not receiver_name:
+                    raise typer.BadParameter("--receiver-name richiesto per --re-enable-sync su receiver/both")
+                targets2.append(("receiver", receiver_name))
+            if st2 in ("worker", "both"):
+                if not worker_name:
+                    raise typer.BadParameter("--worker-name richiesto per --re-enable-sync su worker/both")
+                targets2.append(("worker", worker_name))
+            try:
+                import boto3  # type: ignore
+                lam = boto3.client("lambda")
+                for kind, fn in targets2:
+                    cfg = lam.get_function_configuration(FunctionName=fn)
+                    env = (cfg.get("Environment") or {}).get("Variables") or {}
+                    env["DISABLE_SYNC"] = "false"
+                    lam.update_function_configuration(FunctionName=fn, Environment={"Variables": env})
+                    typer.echo(f"[{kind}] DISABLE_SYNC=false impostato su {fn}")
+            except Exception as e:  # pragma: no cover
+                typer.echo(f"Impossibile riabilitare la sync via boto3: {e}")
+                typer.echo("Comandi AWS CLI equivalenti:")
+                for kind, fn in targets2:
+                    typer.echo(
+                        "aws lambda update-function-configuration --function-name "
+                        + fn
+                        + " --environment 'Variables={DISABLE_SYNC=false}'"
+                    )
     # Non stampo "Done ..." per non rompere piping | jq
     if stats:
         import json
@@ -181,3 +273,6 @@ def sync_shopify(
     import json as _json
 
     print(_json.dumps(out, ensure_ascii=False))
+
+
+    # (sync-toggle command rimosso su richiesta)

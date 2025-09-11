@@ -12,6 +12,7 @@ SQS_URL = os.environ["SQS_URL"]
 # Prefer Secrets Manager; fallback to plain env if provided (for local testing)
 _WEBHOOK_SECRET_ARN = os.environ.get("SHOPIFY_WEBHOOK_SECRET_ARN")
 _WEBHOOK_SECRET_PLAIN = os.environ.get("SHOPIFY_WEBHOOK_SECRET")
+_DISABLE_SYNC = (os.environ.get("DISABLE_SYNC", "false").lower() in {"1", "true", "yes", "y"})
 sqs = boto3.client("sqs")
 secrets = boto3.client("secretsmanager")
 
@@ -42,6 +43,9 @@ def _valid_hmac(raw: bytes, header_hmac: str) -> bool:
 
 def handler(event, context):
     try:
+        if _DISABLE_SYNC:
+            print(json.dumps({"ok": True, "skip": "disabled", "component": "receiver"}))
+            return {"statusCode": 200, "body": "OK"}
         headers = {(k or "").lower(): v for k, v in (event.get("headers") or {}).items()}
         topic = headers.get("x-shopify-topic", "")
         shop = headers.get("x-shopify-shop-domain", "")
