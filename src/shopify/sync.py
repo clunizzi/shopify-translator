@@ -42,6 +42,13 @@ async def process_product(
       - Always include translatableContentDigest for concurrency control.
     """
     gid = make_product_gid(product_numeric_id)
+    # Bind product identifiers into log context
+    try:
+        getattr(structlog, "contextvars").bind_contextvars(
+            product_id=int(product_numeric_id), product_gid=gid
+        )
+    except Exception:
+        pass
     if is_create and delay_ms_after_create > 0:
         await asyncio.sleep(delay_ms_after_create / 1000.0)
 
@@ -119,6 +126,11 @@ async def process_product(
     if not changed_per_resource:
         cache.close()
         snapshot.close()
+        # Unbind at function exit (nothing to do)
+        try:
+            getattr(structlog, "contextvars").unbind_contextvars("product_id", "product_gid")
+        except Exception:
+            pass
         return summary
 
     # Build per-locale translations and optionally push
@@ -264,4 +276,8 @@ async def process_product(
 
     cache.close()
     snapshot.close()
+    try:
+        getattr(structlog, "contextvars").unbind_contextvars("product_id", "product_gid")
+    except Exception:
+        pass
     return summary

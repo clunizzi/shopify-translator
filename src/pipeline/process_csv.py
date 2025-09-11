@@ -110,6 +110,8 @@ def _configure_logging(log_file: Path | None, no_stdout: bool) -> None:
         processors=[
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.stdlib.add_log_level,
+            # Merge per-request/per-product context (e.g., product_id) into every log
+            getattr(structlog, "contextvars").merge_contextvars,
             structlog.processors.dict_tracebacks,
             structlog.processors.UnicodeDecoder(),
             structlog.processors.JSONRenderer(),
@@ -500,6 +502,11 @@ def process_file(
 
         # --- LOOP PRINCIPALE ---
         for pid, sub in iter_groups_in_input_order(df):
+            try:
+                # Bind product_id so all downstream logs (translator, etc.) include it
+                getattr(structlog, "contextvars").bind_contextvars(product_id=int(pid))
+            except Exception:
+                pass
             if pid in completed and not force:
                 logger.info("skip_completed", product_id=pid)
                 continue
@@ -743,13 +750,18 @@ def process_file(
                 batch_all = pl.concat(rows_accum, rechunk=True)
                 append_rows(out_path, batch_all)
 
-        completed.add(pid)
+            completed.add(pid)
         summary["processed_products"] += 1
         cp["updated_at"] = _now_iso()
         cp["progress"]["completed_identifications"] = sorted(list(completed))
         cp["progress"]["processed_products"] = summary["processed_products"]
         cp["stats"] = summary
         cp_new.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
+            # Unbind product_id at end of this product processing
+            try:
+                getattr(structlog, "contextvars").unbind_contextvars("product_id")
+            except Exception:
+                pass
 
     except Exception:
         cp["run_status"] = "aborted"
