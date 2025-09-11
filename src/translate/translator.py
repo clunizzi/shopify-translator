@@ -10,6 +10,7 @@ from typing import Any
 
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential
+from bs4 import BeautifulSoup
 
 from src.config.settings import SETTINGS
 from src.htmlmap.extract import extract_text_segments
@@ -983,50 +984,115 @@ class Translator:
             self.cache_misses += misses
             logger.info("cache_miss_html", type_name=type_name, field=field, segments=misses)
 
-        # 3) Call OpenAI unica per i miss
+        # 3) Traduzione miss: per blocchi (default) o unica batch per segmenti (legacy)
         fresh_map: dict[int, str] = {}
+        mode = getattr(SETTINGS, "html_translate_mode", "block").strip().lower()
         if misses > 0 and not self.dry_run:
-            payload = {
-                "target_locale": target_locale,
-                "field": field,
-                "do_not_translate": list(sorted(set(dnt.brands + dnt.units + dnt.tokens))),
-                "segments": todo,
-            }
-            system = (
-                _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
-                + " Restituisci SOLO un oggetto JSON con chiave 'translations' (lista di stringhe) nello stesso ordine di 'segments'."
-            )
-            logger.info("openai_call_html", type_name=type_name, field=field, segments=len(todo))
-            try:
-                resp = self._call_openai(system=system, text=json.dumps(payload, ensure_ascii=False))
-                resp_text = resp[0] if isinstance(resp, tuple) else resp  # compat log meta
-                obj = _safe_json_loads(resp_text)
-                translations = obj.get("translations")
-                if not isinstance(translations, list):
-                    raise ValueError("missing 'translations' list")
-                # Preserve leading/trailing spaces inside segments to avoid
-                # collapsing boundaries around inline markers or tags.
-                translated_list = [str(x) if x is not None else "" for x in translations]
-            except Exception as e:
-                logger.error(
-                    "openai_json_error",
-                    error=str(e),
-                    sample=_snippet_ell(resp_text if 'resp_text' in locals() else "", 500),
-                    field=field,
-                )
-                translated_list = list(todo)  # fallback no-op
-            # ricostruisci posizioni e aggiorna cache
-            for pos, txt in zip(idxs, translated_list, strict=False):
-                fresh_map[pos] = txt
-                key = self._cache_key(
-                    type_name,
-                    field,
-                    target_locale,
-                    normalize_text(todo[idxs.index(pos)])
-                )
-                self.cache.set(key, {"translated": txt}, model=self.model)
+            dont = list(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
+            if mode == "block":
+                # Costruisci gruppi di indici per blocco (p, li, h1..h6, blockquote, figcaption, td, th, dt, dd)
+                try:
+                    soup2 = BeautifulSoup(html_map or "", "html5lib")
+                    root2 = soup2.body if soup2.body else soup2
+                    BLOCK_TAGS = {"p","li","h1","h2","h3","h4","h5","h6","blockquote","figcaption","td","th","dt","dd"}
+                    # raccogli gruppi in ordine
+                    groups: list[list[int]] = []
+                    seen = set()
+                    import re as _re
+                    ph_re = _re.compile(r"\[\[T(\d+)\]\]")
+                    for el in root2.find_all(BLOCK_TAGS):
+                        inner = el.decode_contents()
+                        idxs_in = [int(m.group(1)) for m in ph_re.finditer(inner)]
+                        if idxs_in:
+                            groups.append(idxs_in)
+                            for _i in idxs_in:
+                                seen.add(_i)
+                    # aggiungi eventuali indici non coperti da blocchi
+                    all_idxs = list(range(len(segments)))
+                    for i in all_idxs:
+                        if i not in seen:
+                            groups.append([i])
+                except Exception:
+                    groups = [idxs]  # fallback: tutti i miss insieme
 
-
+                # Per ogni gruppo, chiedi traduzione in ordine (lista), tenendo conto dei cache hit
+                for g in groups:
+                    # Costruisci la lista completa dei testi del gruppo (non solo miss) per dare contesto
+                    values = [segments[i] for i in g]
+                    system = (
+                        _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
+                        + " Considera l'intero elenco come un paragrafo unico; traduci ogni elemento usando il contesto degli altri."
+                        + " Restituisci SOLO un oggetto JSON con chiave 'translations' (lista di stringhe) nello stesso ordine dell'elenco fornito."
+                    )
+                    user_payload = json.dumps(
+                        {"target_locale": target_locale, "field": field, "do_not_translate": dont, "segments": values},
+                        ensure_ascii=False,
+                    )
+                    try:
+                        resp = self._call_openai(system=system, text=user_payload)
+                        resp_text = resp[0] if isinstance(resp, tuple) else resp
+                        obj = _safe_json_loads(resp_text)
+                        arr = obj.get("translations")
+                        if not isinstance(arr, list):
+                            raise ValueError("missing 'translations' list")
+                        # riallinea lunghezze
+                        if len(arr) < len(values):
+                            arr += [""] * (len(values) - len(arr))
+                        elif len(arr) > len(values):
+                            arr = arr[: len(values)]
+                    except Exception as e:
+                        logger.error(
+                            "openai_json_error",
+                            error=str(e),
+                            sample=_snippet_ell(resp_text if 'resp_text' in locals() else "", 500),
+                            field=field,
+                        )
+                        arr = values  # no-op fallback
+                    # Applica a tutte le posizioni del gruppo e aggiorna cache segmenti
+                    for j, out_txt in enumerate(arr):
+                        idx = g[j]
+                        fresh_map[idx] = str(out_txt) if out_txt is not None else ""
+                        key = self._cache_key(type_name, field, target_locale, normalize_text(segments[idx]))
+                        self.cache.set(key, {"translated": fresh_map[idx]}, model=self.model)
+                logger.info("openai_call_html", type_name=type_name, field=field, segments=misses, mode="block")
+            else:
+                # Legacy: unica batch per tutti i miss
+                payload = {
+                    "target_locale": target_locale,
+                    "field": field,
+                    "do_not_translate": dont,
+                    "segments": todo,
+                }
+                system = (
+                    _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
+                    + " Restituisci SOLO un oggetto JSON con chiave 'translations' (lista di stringhe) nello stesso ordine di 'segments'."
+                )
+                logger.info("openai_call_html", type_name=type_name, field=field, segments=len(todo), mode="segment")
+                try:
+                    resp = self._call_openai(system=system, text=json.dumps(payload, ensure_ascii=False))
+                    resp_text = resp[0] if isinstance(resp, tuple) else resp  # compat log meta
+                    obj = _safe_json_loads(resp_text)
+                    translations = obj.get("translations")
+                    if not isinstance(translations, list):
+                        raise ValueError("missing 'translations' list")
+                    translated_list = [str(x) if x is not None else "" for x in translations]
+                except Exception as e:
+                    logger.error(
+                        "openai_json_error",
+                        error=str(e),
+                        sample=_snippet_ell(resp_text if 'resp_text' in locals() else "", 500),
+                        field=field,
+                    )
+                    translated_list = list(todo)  # fallback no-op
+                for pos, txt in zip(idxs, translated_list, strict=False):
+                    fresh_map[pos] = txt
+                    key = self._cache_key(
+                        type_name,
+                        field,
+                        target_locale,
+                        normalize_text(todo[idxs.index(pos)])
+                    )
+                    self.cache.set(key, {"translated": txt}, model=self.model)
         # 4) Ricostruzione segmenti completi (aggiusta spazi attorno a *...*/_..._)
         translated_segments: list[str] = []
         for i in range(len(segments)):

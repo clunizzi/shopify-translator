@@ -103,6 +103,9 @@ class Settings:
     # Human-friendly name of source language for prompts (e.g., "italiano", "inglese")
     source_language_name: str = os.getenv("SOURCE_LANGUAGE_NAME", "italiano")
 
+    # HTML translation mode: 'block' (default) or 'segment'
+    html_translate_mode: str = os.getenv("HTML_TRANSLATE_MODE", "block")
+
     @property
     def has_shopify(self) -> bool:
         return bool(self.shopify_domain and self.shopify_token)
