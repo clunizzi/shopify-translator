@@ -4,11 +4,11 @@
 .env.local
 
 # --- Project data & outputs ---
-data/
 logs/
 state/
 out/
 arn.yaml
+data/
 
 # --- SQLite / local DB / logs ---
 *.sqlite
