@@ -274,6 +274,23 @@ async def process_product(
                     if k:
                         snapshot.upsert_digest(rid, k, d)
 
+    # Telemetria dal translator
+    try:
+        tel = translator.get_telemetry()
+        summary["telemetry"] = tel
+        logger.info(
+            "telemetry",
+            kind="sync",
+            product_id=int(product_numeric_id),
+            cache_hits=int(tel.get("cache_hits", 0)),
+            cache_misses=int(tel.get("cache_misses", 0)),
+            openai_calls=int(tel.get("openai_calls", 0)),
+            openai_ms_total=int(tel.get("openai_ms_total", 0)),
+            openai_prompt_tokens=int(tel.get("openai_prompt_tokens", 0)),
+            openai_completion_tokens=int(tel.get("openai_completion_tokens", 0)),
+        )
+    except Exception:
+        pass
     cache.close()
     snapshot.close()
     try:

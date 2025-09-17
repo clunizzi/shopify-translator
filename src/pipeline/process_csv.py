@@ -721,9 +721,9 @@ def process_file(
 
                     if type_name in {"PRODUCT", "COLLECTION"} and translated == "":
                         err_code = (
-                            "ERROR_SIMILARITY_HTML"
+                            "ERROR_TRANSLATION_HTML"
                             if field_csv == "body_html"
-                            else f"ERROR_SIMILARITY_{field_csv.upper()}"
+                            else f"ERROR_TRANSLATION_{field_csv.upper()}"
                         )
                         row["Status"] = err_code
 
@@ -757,11 +757,11 @@ def process_file(
         cp["progress"]["processed_products"] = summary["processed_products"]
         cp["stats"] = summary
         cp_new.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
-            # Unbind product_id at end of this product processing
-            try:
-                getattr(structlog, "contextvars").unbind_contextvars("product_id")
-            except Exception:
-                pass
+        # Unbind product_id at end of this product processing
+        try:
+            getattr(structlog, "contextvars").unbind_contextvars("product_id")
+        except Exception:
+            pass
 
     except Exception:
         cp["run_status"] = "aborted"
@@ -797,9 +797,26 @@ def process_file(
             }
         )
     finally:
-        summary["cache_hit"] = getattr(translator, "cache_hits", 0)
+        # Telemetria: counters principali dal Translator
+        summary["cache_hit"] = int(getattr(translator, "cache_hits", 0))
+        summary["cache_miss"] = int(getattr(translator, "cache_misses", 0))
+        summary["openai_calls"] = int(getattr(translator, "openai_calls", 0))
+        summary["openai_ms_total"] = int(getattr(translator, "openai_ms_total", 0))
+        summary["openai_prompt_tokens"] = int(getattr(translator, "openai_prompt_tokens", 0))
+        summary["openai_completion_tokens"] = int(getattr(translator, "openai_completion_tokens", 0))
         cache.close()
         if stats:
             logger.info("summary", **summary)
+            # Event separato per facilitare ingestion metrica
+            logger.info(
+                "telemetry",
+                kind="pipeline",
+                cache_hit=summary["cache_hit"],
+                cache_miss=summary["cache_miss"],
+                openai_calls=summary["openai_calls"],
+                openai_ms_total=summary["openai_ms_total"],
+                openai_prompt_tokens=summary["openai_prompt_tokens"],
+                openai_completion_tokens=summary["openai_completion_tokens"],
+            )
 
     return summary

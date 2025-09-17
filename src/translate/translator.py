@@ -17,7 +17,7 @@ from src.htmlmap.extract import extract_text_segments
 from src.htmlmap.liquid import detect_has_liquid, protect_liquid, unprotect_liquid
 from src.htmlmap.reinject import reinject_text
 from src.translate.cache import TranslationCache
-from src.translate.similarity import normalize_text, similarity
+from src.translate.similarity import normalize_text
 from src.translate.validators import (
     MetaRules,
     enforce_meta_title_format,
@@ -110,6 +110,23 @@ def _fix_inline_markdown_spacing(s: str) -> str:
     s = re.sub(r"(\*{1,2}[^*]+?\*{1,2})([^\s])", r"\1 \2", s)
     s = re.sub(r"(_{1,2}[^_]+?_{1,2})([^\s])", r"\1 \2", s)
     return s
+
+
+def _preserve_edge_whitespace(src: str, dst: str) -> str:
+    """
+    Riapplica gli spazi iniziali/finali del segmento sorgente attorno alla traduzione.
+    Evita di perdere spazi adiacenti a tag inline (es. ... </strong> testo).
+    """
+    try:
+        s = src or ""
+        t = dst or ""
+        import re as _re
+        pre = _re.match(r"^\s*", s).group(0)
+        suf = _re.search(r"\s*$", s).group(0)
+        core = t.strip()
+        return f"{pre}{core}{suf}"
+    except Exception:
+        return dst
 
 
 # --- JSON parsing helpers -----------------------------------------------------
@@ -434,7 +451,8 @@ def _build_system_prompt(
         domain_line
         + f"Traduci da {src_name} a {target_locale} il contenuto del campo '{field}' "
         + f"per il tipo '{type_name}'. Non tradurre marchi, unità di misura, sigle e i seguenti termini esatti: {dont}. "
-        + "Mantieni numeri, codici e punteggiatura. Niente markdown o spiegazioni; restituisci solo il testo tradotto."
+        + "Mantieni numeri, codici e punteggiatura. Non aggiungere frasi, esempi, brand o informazioni che non sono presenti nel testo originale. "
+        + "Non inventare marchi. Niente markdown o spiegazioni; restituisci solo il testo tradotto."
     )
     if field == "meta_title":
         if type_name == "PRODUCT":
@@ -446,7 +464,7 @@ def _build_system_prompt(
             " Scrivi una descrizione naturale tra 150 e 160 caratteri, informativa, senza emoji."
         )
     if strict:
-        base += " Evita parafrasi inutili: traduci fedelmente, nessuna omissione."
+        base += " Evita parafrasi inutili: traduci fedelmente, nessuna omissione, nessun contenuto aggiuntivo."
     return base
 
 
@@ -474,6 +492,11 @@ class Translator:
         # stats cache (per processo)
         self.cache_hits = 0
         self.cache_misses = 0
+        # telemetry (per processo)
+        self.openai_calls = 0
+        self.openai_ms_total = 0
+        self.openai_prompt_tokens = 0
+        self.openai_completion_tokens = 0
 
     def _client_openai(self):
         if self.dry_run:
@@ -504,52 +527,35 @@ class Translator:
         return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
     def _cell_key_html(self, type_name: str, field: str, locale: str, html: str, exclude_similarity_tokens: Sequence[str]) -> str:
-        # Proteggi Liquid solo per la firma, poi estrai segmenti testuali e normalizza
+        """
+        Robust HTML cell-cache key: hash the Liquid-protected HTML instead of normalized segments.
+        This avoids collisions across different HTMLs that normalize to similar text.
+        """
         try:
             from src.htmlmap.liquid import detect_has_liquid, protect_liquid
-            from src.htmlmap.extract import extract_text_segments
             html_in = html or ""
             html_prot = protect_liquid(html_in)[0] if detect_has_liquid(html_in) else html_in
-            _, segs = extract_text_segments(html_prot)
         except Exception:
-            segs = [html or ""]
-        norm = [normalize_text(s or "", exclude_tokens=exclude_similarity_tokens) for s in segs]
-        sig = "||".join(norm)
-        payload = f"cell|html|{type_name}|{field}|{locale}|{sig}|{SETTINGS.rules_version}|{self.model}|{SETTINGS.cache_algo_version}"
+            html_prot = html or ""
+        sha = hashlib.sha256(html_prot.encode("utf-8", errors="ignore")).hexdigest()
+        payload = f"cell|html|{type_name}|{field}|{locale}|{SETTINGS.rules_version}|{self.model}|{SETTINGS.cache_algo_version}|sha256={sha}"
         return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
     def _cell_key_json(self, type_name: str, field: str, locale: str, raw: str, exclude_similarity_tokens: Sequence[str]) -> str:
-        # Parse tollerante e raccogli solo leaf string normalizzate in ordine
+        """
+        Robust JSON cell-cache key: hash a canonical JSON string when possible.
+        Falls back to hashing the raw string if parsing fails.
+        """
         try:
             obj = try_extract_json(raw)
+            if obj is None:
+                canon = raw or ""
+            else:
+                canon = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         except Exception:
-            obj = None
-        leaves: list[str] = []
-        def _walk(o):
-            from typing import Any
-            if isinstance(o, dict):
-                for v in o.values():
-                    _walk(v)
-            elif isinstance(o, list):
-                for v in o:
-                    _walk(v)
-            elif isinstance(o, str):
-                s = o or ""
-                # Applica le stesse regole “skip tecnico” impiegate a runtime
-                if is_technical_value(s):
-                    return
-                p = split_prefix_tech_text(s)
-                if p:
-                    _, s2 = p
-                    s = s2
-                leaves.append(s)
-        if obj is None:
-            leaves = [raw or ""]
-        else:
-            _walk(obj)
-        norm = [normalize_text(s or "", exclude_tokens=exclude_similarity_tokens) for s in leaves]
-        sig = "||".join(norm)
-        payload = f"cell|json|{type_name}|{field}|{locale}|{sig}|{SETTINGS.rules_version}|{self.model}|{SETTINGS.cache_algo_version}"
+            canon = raw or ""
+        sha = hashlib.sha256(canon.encode("utf-8", errors="ignore")).hexdigest()
+        payload = f"cell|json|{type_name}|{field}|{locale}|{SETTINGS.rules_version}|{self.model}|{SETTINGS.cache_algo_version}|sha256={sha}"
         return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
 
     @retry(
@@ -598,6 +604,19 @@ class Translator:
             out = (msg.get("content") or "").strip()
             usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
+        # Telemetry counters
+        try:
+            self.openai_calls += 1
+            self.openai_ms_total += dt
+            pt = 0
+            ct = 0
+            if isinstance(usage, dict):
+                pt = int(usage.get("prompt_tokens") or 0)
+                ct = int(usage.get("completion_tokens") or 0)
+            self.openai_prompt_tokens += pt
+            self.openai_completion_tokens += ct
+        except Exception:
+            pass
         meta = {
             "usage": usage,
             "duration_ms": dt,
@@ -665,6 +684,19 @@ class Translator:
             text = (msg.get("content") or "").strip()
             usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
+        # Telemetry counters
+        try:
+            self.openai_calls += 1
+            self.openai_ms_total += dt
+            pt = 0
+            ct = 0
+            if isinstance(usage, dict):
+                pt = int(usage.get("prompt_tokens") or 0)
+                ct = int(usage.get("completion_tokens") or 0)
+            self.openai_prompt_tokens += pt
+            self.openai_completion_tokens += ct
+        except Exception:
+            pass
         try:
             obj = json.loads(text)
         except Exception as e:
@@ -687,23 +719,6 @@ class Translator:
                 snippet_resp=text[: SETTINGS.log_payload_max],
             )
         return obj, meta
-
-    def _threshold_for_field(self, field: str) -> float:
-        if field == "body_html":
-            return SETTINGS.sim_t_html
-        if field in {"meta_title", "meta_description"}:
-            return SETTINGS.sim_t_meta
-        if field == "product_type":
-            return SETTINGS.sim_t_product_type
-        if field == "title":
-            return SETTINGS.sim_t_title
-        if field == "handle":
-            return SETTINGS.sim_t_handle
-        if field == "option_name":
-            return SETTINGS.sim_t_option
-        if field == "option_value_name":
-            return SETTINGS.sim_t_value
-        return SETTINGS.sim_t_title
 
     def _retry_max_for_field(self, field: str) -> int:
         if field == "option_name":
@@ -730,6 +745,18 @@ class Translator:
         except Exception:
             return (str(resp), {})
 
+    def get_telemetry(self) -> dict:
+        """Raccoglie counters utili per telemetria/log finale."""
+        return {
+            "cache_hits": int(getattr(self, "cache_hits", 0)),
+            "cache_misses": int(getattr(self, "cache_misses", 0)),
+            "openai_calls": int(getattr(self, "openai_calls", 0)),
+            "openai_ms_total": int(getattr(self, "openai_ms_total", 0)),
+            "openai_prompt_tokens": int(getattr(self, "openai_prompt_tokens", 0)),
+            "openai_completion_tokens": int(getattr(self, "openai_completion_tokens", 0)),
+            "model": self.model,
+        }
+
     def _translate_and_validate(
         self,
         field: str,
@@ -751,18 +778,14 @@ class Translator:
                 "translate",
                 field=field,
                 attempt=1,
-                sim=0.0,
-                threshold=self._threshold_for_field(field),
                 lang_out=lang,
                 decision="accept_dry_run",
-                reason="",
                 model=self.model,
                 duration_ms=0,
                 usage={},
             )
             return out
 
-        threshold = self._threshold_for_field(field)
         max_attempts = max(1, self._retry_max_for_field(field))
 
         last_out: str = text
@@ -777,8 +800,6 @@ class Translator:
                     "translate",
                     field=field,
                     attempt=attempt,
-                    sim=None,
-                    threshold=threshold,
                     lang_out="unknown",
                     decision=decision,
                     reason=str(e),
@@ -794,53 +815,16 @@ class Translator:
             duration_ms = int((time.monotonic() - t0) * 1000)
             usage = meta.get("usage", {}) if isinstance(meta, dict) else {}
 
-            # lingua + similarità
-            try:
-                lang, conf = detect_lang_fast(last_out)
-            except Exception:
-                lang, conf = ("unknown", 0.0)
-
-            try:
-                sim = similarity(text, last_out, exclude_tokens=exclude_similarity_tokens)
-            except TypeError:
-                from difflib import SequenceMatcher
-                sim = SequenceMatcher(None, (text or "").lower(), (last_out or "").lower()).ratio()
-
-            suspicious = (lang.split("-")[0] == "it") or (sim >= threshold and (target_locale[:2] != lang[:2]))
-
-            if suspicious and attempt < max_attempts:
-                logger.info(
-                    "translate",
-                    field=field,
-                    attempt=attempt,
-                    sim=sim,
-                    threshold=threshold,
-                    lang_out=lang,
-                    decision="retry",
-                    reason="lang_it_or_high_similarity",
-                    model=self.model,
-                    duration_ms=duration_ms,
-                    usage=usage,
-                )
-                continue
-
-            decision = "accept_suspect" if suspicious else "accept"
-            reason = "lang_it_or_high_similarity" if suspicious else ""
+            # Log minimale (niente similarità/lingua)
             logger.info(
                 "translate",
                 field=field,
                 attempt=attempt,
-                sim=sim,
-                threshold=threshold,
-                lang_out=lang,
-                decision=("reject" if (suspicious and strict) else decision),
-                reason=reason,
+                decision="accept",
                 model=self.model,
                 duration_ms=duration_ms,
                 usage=usage,
             )
-            if suspicious and strict:
-                return ""
             return last_out
 
         return "" if strict else last_out
@@ -889,27 +873,57 @@ class Translator:
         dnt: DoNotTranslateConfig,
         exclude_similarity_tokens: Sequence[str],
     ) -> str:
-        """Traduzione testo plain con lookup cache alias; scrive solo sulla chiave primaria."""
+        """Traduzione testo plain con cell-cache first e lookup cache alias; scrive solo sulla chiave primaria."""
         text = (default_content or "").strip()
         if not text:
             return ""
+
+        # 0) Cell-level cache (prima di tutto)
+        try:
+            if not self.ignore_cache:
+                cell_key = self._cell_key_plain(type_name, field, target_locale, text, exclude_similarity_tokens)
+                found = self.cache.get_cell(cell_key)
+                if found and isinstance(found.get("value"), str):
+                    self.cache_hits += 1
+                    logger.info("cell_cache_hit_plain_any", field=field)
+                    return found["value"]
+        except Exception:
+            pass
 
         text_norm = normalize_text(text)
 
         # 1) cache read-through con alias
         cached = self._cache_get_with_alias(type_name, field, target_locale, text_norm)
         if cached:
+            # consolida anche in cell-cache per coerenza futura
+            try:
+                if not self.ignore_cache:
+                    cell_key = self._cell_key_plain(type_name, field, target_locale, text, exclude_similarity_tokens)
+                    self.cache.set_cell(cell_key, cached, self.model, meta={})
+            except Exception:
+                pass
             return cached
 
         # 2) OpenAI
+        # conto come cache miss (nessun hit in cell-cache/alias)
+        try:
+            self.cache_misses += 1
+        except Exception:
+            pass
         system = _build_system_prompt(type_name, field, target_locale, dnt, strict=False)
         translated = self._translate_and_validate(
             field, text, target_locale, exclude_similarity_tokens, system
         )
 
-        # 3) scrittura cache solo su chiave primaria
+        # 3) scrittura cache solo su chiave primaria + cell-level
         key = self._cache_key(type_name, field, target_locale, text_norm)
         self.cache.set(key, {"translated": translated or ""}, model=self.model)
+        try:
+            if not self.ignore_cache:
+                cell_key = self._cell_key_plain(type_name, field, target_locale, text, exclude_similarity_tokens)
+                self.cache.set_cell(cell_key, translated or "", self.model, meta={})
+        except Exception:
+            pass
         return translated
 
     def translate_html(
@@ -966,12 +980,22 @@ class Translator:
         idxs: list[int] = []
         for i, seg in enumerate(segments):
             text_norm = normalize_text(seg)
-            key = self._cache_key(type_name, field, target_locale, text_norm)
-            entry = self.cache.get(key)
-            translated = (entry.get("translated") or "").strip() if entry else ""
-            if translated:
-                cached_out[i] = translated
+            use_seg_cache = (
+                (not self.ignore_cache)
+                and getattr(SETTINGS, "segment_cache_html", False)
+                and len(text_norm) >= getattr(SETTINGS, "segment_cache_min_chars", 4)
+            )
+            if use_seg_cache:
+                key = self._cache_key(type_name, field, target_locale, text_norm)
+                entry = self.cache.get(key)
+                translated = (entry.get("translated") or "").strip() if entry else ""
+                if translated:
+                    cached_out[i] = translated
+                else:
+                    todo.append(seg)
+                    idxs.append(i)
             else:
+                # Skip segment-cache for this piece (too short or disabled) → force translate
                 todo.append(seg)
                 idxs.append(i)
 
@@ -986,7 +1010,8 @@ class Translator:
 
         # 3) Traduzione miss: per blocchi (default) o unica batch per segmenti (legacy)
         fresh_map: dict[int, str] = {}
-        mode = getattr(SETTINGS, "html_translate_mode", "block").strip().lower()
+        # In strict mode for HTML, force 'segment' to reduce cross-segment hallucinations
+        mode = ("segment" if strict else getattr(SETTINGS, "html_translate_mode", "block")).strip().lower()
         if misses > 0 and not self.dry_run:
             dont = list(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
             if mode == "block":
@@ -994,7 +1019,11 @@ class Translator:
                 try:
                     soup2 = BeautifulSoup(html_map or "", "html5lib")
                     root2 = soup2.body if soup2.body else soup2
-                    BLOCK_TAGS = {"p","li","h1","h2","h3","h4","h5","h6","blockquote","figcaption","td","th","dt","dd"}
+                    # Allow customization of block tags via settings
+                    try:
+                        BLOCK_TAGS = SETTINGS.get_html_block_tags() or {"p","li","h1","h2","h3","h4","h5","h6","blockquote","figcaption","td","th","dt","dd"}
+                    except Exception:
+                        BLOCK_TAGS = {"p","li","h1","h2","h3","h4","h5","h6","blockquote","figcaption","td","th","dt","dd"}
                     # raccogli gruppi in ordine
                     groups: list[list[int]] = []
                     seen = set()
@@ -1051,9 +1080,30 @@ class Translator:
                     # Applica a tutte le posizioni del gruppo e aggiorna cache segmenti
                     for j, out_txt in enumerate(arr):
                         idx = g[j]
-                        fresh_map[idx] = str(out_txt) if out_txt is not None else ""
-                        key = self._cache_key(type_name, field, target_locale, normalize_text(segments[idx]))
-                        self.cache.set(key, {"translated": fresh_map[idx]}, model=self.model)
+                        val = str(out_txt) if out_txt is not None else ""
+                        # Length guard in strict mode: evita aggiunte eccessive
+                        if strict:
+                            src_seg = values[j] if j < len(values) else ""
+                            try:
+                                max_len = max(int(len(src_seg) * 1.6), len(src_seg) + 80)
+                                if len(val) > max_len:
+                                    # taglia alla prima frase che rientra nel limite
+                                    cut = val[:max_len]
+                                    for p in [". ", "! ", "? "]:
+                                        k = cut.rfind(p)
+                                        if k > 20:  # evita tagli troppo corti
+                                            cut = cut[: k + 1]
+                                            break
+                                    val = cut
+                            except Exception:
+                                pass
+                        fresh_map[idx] = val
+                        # Optionally update segment-cache for longer segments if enabled
+                        if getattr(SETTINGS, "segment_cache_html", False):
+                            norm_i = normalize_text(segments[idx])
+                            if len(norm_i) >= getattr(SETTINGS, "segment_cache_min_chars", 4):
+                                key = self._cache_key(type_name, field, target_locale, norm_i)
+                                self.cache.set(key, {"translated": val}, model=self.model)
                 logger.info("openai_call_html", type_name=type_name, field=field, segments=misses, mode="block")
             else:
                 # Legacy: unica batch per tutti i miss
@@ -1076,6 +1126,25 @@ class Translator:
                     if not isinstance(translations, list):
                         raise ValueError("missing 'translations' list")
                     translated_list = [str(x) if x is not None else "" for x in translations]
+                    # Length guard in strict mode (segment path)
+                    if strict:
+                        safe_list: list[str] = []
+                        for j, val in enumerate(translated_list):
+                            src_seg = todo[j] if j < len(todo) else ""
+                            try:
+                                max_len = max(int(len(src_seg) * 1.6), len(src_seg) + 80)
+                                if len(val) > max_len:
+                                    cut = val[:max_len]
+                                    for p in [". ", "! ", "? "]:
+                                        k = cut.rfind(p)
+                                        if k > 20:
+                                            cut = cut[: k + 1]
+                                            break
+                                    val = cut
+                            except Exception:
+                                pass
+                            safe_list.append(val)
+                        translated_list = safe_list
                 except Exception as e:
                     logger.error(
                         "openai_json_error",
@@ -1086,21 +1155,24 @@ class Translator:
                     translated_list = list(todo)  # fallback no-op
                 for pos, txt in zip(idxs, translated_list, strict=False):
                     fresh_map[pos] = txt
-                    key = self._cache_key(
-                        type_name,
-                        field,
-                        target_locale,
-                        normalize_text(todo[idxs.index(pos)])
-                    )
-                    self.cache.set(key, {"translated": txt}, model=self.model)
+                    if getattr(SETTINGS, "segment_cache_html", False):
+                        norm = normalize_text(todo[idxs.index(pos)])
+                        if len(norm) >= getattr(SETTINGS, "segment_cache_min_chars", 4):
+                            key = self._cache_key(
+                                type_name,
+                                field,
+                                target_locale,
+                                norm,
+                            )
+                            self.cache.set(key, {"translated": txt}, model=self.model)
         # 4) Ricostruzione segmenti completi (aggiusta spazi attorno a *...*/_..._)
         translated_segments: list[str] = []
         for i in range(len(segments)):
             if i in cached_out:
-                val = cached_out[i]
+                val = _preserve_edge_whitespace(segments[i], cached_out[i])
                 translated_segments.append(_fix_inline_markdown_spacing(val))
             elif i in fresh_map:
-                val = fresh_map[i]
+                val = _preserve_edge_whitespace(segments[i], fresh_map[i])
                 translated_segments.append(_fix_inline_markdown_spacing(val))
             else:
                 translated_segments.append(segments[i])
@@ -1110,15 +1182,7 @@ class Translator:
         if liquid_map:
             out_html = unprotect_liquid(out_html, liquid_map)
 
-        # 6) Similarità/Lang: log informativi
-        plain_src = " ".join(s.strip() for s in segments if s and s.strip())
-        plain_dst = " ".join(s.strip() for s in translated_segments if s and s.strip())
-        try:
-            lang, conf = detect_lang_fast(plain_dst)  # già definito nel modulo
-        except Exception:
-            lang, conf = ("unknown", 0.0)
-        sim = similarity(plain_src, plain_dst, exclude_tokens=exclude_similarity_tokens)
-        logger.info("html_similarity", extra={"sim": sim, "lang": lang, "conf": conf})
+        # Nessun log di similarità/lingua
         # Salva cell-level cache (HTML completo) per futuri hit
         try:
             if not self.ignore_cache:
@@ -1146,14 +1210,16 @@ class Translator:
         text  = default_content or ""
 
         if field == "body_html":
+            # Usa strict=True per ridurre inserimenti non desiderati (no frasi/brand aggiunti)
             return self.translate_html(
-                type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens
+                type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens, strict=True
             )
         
         if detect_has_liquid(text):
+            # Campi con Liquid: usa strict=True
             return self.translate_html(
-            type_name, field, text, target_locale, dnt, exclude_similarity_tokens
-        )
+                type_name, field, text, target_locale, dnt, exclude_similarity_tokens, strict=True
+            )
 
         if field == "handle":
             # recupera suffisso numerico dall'handle originale (Default content)
@@ -1423,39 +1489,7 @@ class Translator:
             else:
                 _set_in(out_obj, path, leaves[i])
 
-        # 5) Similarità / lingua: solo logging, mai bloccare
-        plain_src = " ".join(x.strip() for x in leaves if x and isinstance(x, str))
-        # dst flatten
-        # prendi valori string dall'oggetto finale
-        flat_dst: list[str] = []
-
-        def _walk2(x: Any):
-            if isinstance(x, dict):
-                for v in x.values():
-                    _walk2(v)
-            elif isinstance(x, list):
-                for v in x:
-                    _walk2(v)
-            elif isinstance(x, str):
-                flat_dst.append(x)
-
-        _walk2(out_obj)
-        plain_dst = " ".join(x.strip() for x in flat_dst if x)
-        try:
-            lang, conf = detect_lang_fast(plain_dst)  # già importato altrove nel file
-        except Exception:
-            lang, conf = ("unknown", 0.0)
-        sim = similarity(plain_src, plain_dst, exclude_tokens=exclude_similarity_tokens)
-        logger.info(
-            "json_similarity",
-            extra={
-                "field": field_logical,
-                "lang": lang,
-                "conf": conf,
-                "sim": sim,
-                "threshold": self._threshold_for_field(field_logical),
-            },
-        )
+        # Nessun log di similarità/lingua
 
         out_str = json.dumps(out_obj, ensure_ascii=False)
         # Salva cell-level cache

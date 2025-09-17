@@ -71,7 +71,7 @@ class Settings:
 
     rules_version: int = _get_int("RULES_VERSION", 1)
     # Cache algorithm version (bump to invalidate cell-cache signatures)
-    cache_algo_version: int = _get_int("CACHE_ALGO_VERSION", 1)
+    cache_algo_version: int = _get_int("CACHE_ALGO_VERSION", 2)
 
     # Logging
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
@@ -105,6 +105,14 @@ class Settings:
 
     # HTML translation mode: 'block' (default) or 'segment'
     html_translate_mode: str = os.getenv("HTML_TRANSLATE_MODE", "block")
+    # Segment cache controls (HTML): by default disabled to avoid over-fragmentation reuse
+    segment_cache_html: bool = _get_bool("SEGMENT_CACHE_HTML", False)
+    segment_cache_min_chars: int = _get_int("SEGMENT_CACHE_MIN_CHARS", 4)
+    # Block-level tags used to group HTML segments (comma-separated, lowercase)
+    html_block_tags_raw: str = os.getenv(
+        "HTML_BLOCK_TAGS",
+        "p,li,h1,h2,h3,h4,h5,h6,blockquote,figcaption,td,th,dt,dd",
+    )
 
     @property
     def has_shopify(self) -> bool:
@@ -135,6 +143,10 @@ class Settings:
     def get_mf_json_paths(self) -> list[str]:
         raw = (self.mf_json_paths_raw or "").strip()
         return [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+
+    def get_html_block_tags(self) -> set[str]:
+        raw = (self.html_block_tags_raw or "").strip()
+        return {x.strip().lower() for x in raw.split(",") if x.strip()} if raw else set()
 
 
 SETTINGS = Settings()

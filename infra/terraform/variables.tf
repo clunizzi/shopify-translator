@@ -15,8 +15,9 @@ variable "receiver_zip" {
 }
 
 variable "worker_zip" {
-  description = "Path to worker lambda zip"
+  description = "Path to worker lambda zip (leave null when using worker_s3_bucket/key)"
   type        = string
+  default     = null
 }
 
 # Optional: use S3 for worker code to bypass direct upload size limits
@@ -33,9 +34,10 @@ variable "worker_s3_key" {
 }
 
 variable "shopify_webhook_secret" {
-  description = "Shopify webhook shared secret"
+  description = "Shopify webhook shared secret (optional; prefer ARN)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 # When using Secrets Manager, pass ARNs below (recommended). If set, Terraform will
@@ -64,9 +66,10 @@ variable "shop_domain" {
 }
 
 variable "shopify_admin_token" {
-  description = "Admin access token"
+  description = "Admin access token (optional; prefer ARN)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "source_locale" {
