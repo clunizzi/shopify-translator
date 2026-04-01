@@ -1,0 +1,49 @@
+allowed_resource_types:
+  - ONLINE_STORE_THEME_JSON_TEMPLATE
+  - ONLINE_STORE_THEME_SECTION_GROUP
+
+allowed_key_fragments:
+  - announcement
+  - button_label
+  - button_name
+  - caption
+  - description
+  - heading
+  - link_label
+  - link_name
+  - subheading
+  - text
+  - title
+
+blocked_key_fragments:
+  - alignment
+  - autoplay
+  - block_order
+  - collection_handle
+  - color
+  - column
+  - desktop
+  - icon
+  - image
+  - layout
+  - link
+  - logo_svg
+  - margin
+  - mobile
+  - opacity
+  - overlay
+  - padding
+  - product_handle
+  - speed
+  - svg
+  - url
+  - video
+  - width
+
+blocked_value_patterns:
+  - '^\s*$'
+  - '^\s*\{\{.*\}\}\s*$'
+  - '^\s*\{%.*%\}\s*$'
+  - '^\s*<svg[\s>].*</svg>\s*$'
+  - '^\s*https?://'
+  - '^\s*[\[{].*[\]}]\s*$'

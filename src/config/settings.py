@@ -84,15 +84,12 @@ class Settings:
     source_locale: str = os.getenv("SOURCE_LOCALE", "en")
     target_locales_raw: str = os.getenv("TARGET_LOCALES", "")
     mf_include_raw: str = os.getenv("MF_INCLUDE", "")
-    mf_json_paths_raw: str = os.getenv("MF_JSON_PATHS", "")
     request_timeout: float = float(os.getenv("REQUEST_TIMEOUT", "30"))
     retries: int = _get_int("RETRIES", 2)
     dry_run_default: bool = _get_bool("DRY_RUN", False)
     delay_ms_after_create: int = _get_int("DELAY_MS_AFTER_CREATE", 8000)
     # Optional path to DNT yaml
     do_not_translate_path: str | None = os.getenv("DO_NOT_TRANSLATE_YAML")
-    # Backfill: translate even if digest unchanged when locale missing (best-effort)
-    fill_missing_translations: bool = _get_bool("FILL_MISSING_TRANSLATIONS", False)
 
     # Prompt specialization (domain) and source language label
     # Customize to adapt the translator tone/domain without changing code.
@@ -100,19 +97,25 @@ class Settings:
         "TRANSLATOR_SPECIALIZATION",
         "attrezzatura per il giardinaggio e l'agricoltura",
     )
+    translator_brand: str = os.getenv("TRANSLATOR_BRAND", "AgriEden")
+    translator_audience: str = os.getenv(
+        "TRANSLATOR_AUDIENCE",
+        "persone esperte di giardinaggio e agricoltura con aspettative di precisione tecnica",
+    )
+    metafield_translation_policy_path: str = os.getenv(
+        "METAFIELD_TRANSLATION_POLICY_PATH",
+        "src/config/metafield_translation.yaml",
+    )
+    theme_translation_policy_path: str = os.getenv(
+        "THEME_TRANSLATION_POLICY_PATH",
+        "src/config/theme_translation.yaml",
+    )
+    bootstrap_ids_file: str = os.getenv("BOOTSTRAP_IDS_FILE", "state/bootstrap_product_ids.txt")
+    bootstrap_apply_translations: bool = _get_bool("BOOTSTRAP_APPLY_TRANSLATIONS", False)
+    bootstrap_existing_products: bool = _get_bool("BOOTSTRAP_EXISTING_PRODUCTS", True)
     # Human-friendly name of source language for prompts (e.g., "italiano", "inglese")
     source_language_name: str = os.getenv("SOURCE_LANGUAGE_NAME", "italiano")
-
-    # HTML translation mode: 'block' (default) or 'segment'
-    html_translate_mode: str = os.getenv("HTML_TRANSLATE_MODE", "block")
-    # Segment cache controls (HTML): by default disabled to avoid over-fragmentation reuse
-    segment_cache_html: bool = _get_bool("SEGMENT_CACHE_HTML", False)
-    segment_cache_min_chars: int = _get_int("SEGMENT_CACHE_MIN_CHARS", 4)
-    # Block-level tags used to group HTML segments (comma-separated, lowercase)
-    html_block_tags_raw: str = os.getenv(
-        "HTML_BLOCK_TAGS",
-        "p,li,h1,h2,h3,h4,h5,h6,blockquote,figcaption,td,th,dt,dd",
-    )
+    neon_database_url: str = os.getenv("NEON_DATABASE_URL", "")
 
     @property
     def has_shopify(self) -> bool:
@@ -139,14 +142,5 @@ class Settings:
             ns, key = p.split(".", 1)
             items.append((ns.strip(), key.strip()))
         return items
-
-    def get_mf_json_paths(self) -> list[str]:
-        raw = (self.mf_json_paths_raw or "").strip()
-        return [x.strip() for x in raw.split(",") if x.strip()] if raw else []
-
-    def get_html_block_tags(self) -> set[str]:
-        raw = (self.html_block_tags_raw or "").strip()
-        return {x.strip().lower() for x in raw.split(",") if x.strip()} if raw else set()
-
 
 SETTINGS = Settings()
