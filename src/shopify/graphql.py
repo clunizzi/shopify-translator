@@ -98,6 +98,47 @@ async def get_translatable_by_ids(ids: list[str]) -> dict[str, list[dict]]:
     return out
 
 
+async def list_translatable_resources(
+    *,
+    resource_type: str,
+    first: int = 50,
+    after: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    q = (
+        "query TranslatableResources($first: Int!, $after: String, $resourceType: TranslatableResourceType!) {"
+        "  translatableResources(first: $first, after: $after, resourceType: $resourceType) {"
+        "    edges {"
+        "      cursor"
+        "      node { resourceId translatableContent { key value digest locale } }"
+        "    }"
+        "    pageInfo { hasNextPage endCursor }"
+        "  }"
+        "}"
+    )
+    data = await _post_graphql(
+        q,
+        {
+            "first": int(first),
+            "after": after,
+            "resourceType": resource_type,
+        },
+    )
+    conn = (((data.get("data") or {}).get("translatableResources")) or {})
+    edges = conn.get("edges") or []
+    nodes: list[dict[str, Any]] = []
+    for edge in edges:
+        node = (edge or {}).get("node") or {}
+        if node.get("resourceId"):
+            nodes.append(
+                {
+                    "cursor": (edge or {}).get("cursor"),
+                    "resourceId": node.get("resourceId"),
+                    "translatableContent": node.get("translatableContent") or [],
+                }
+            )
+    return nodes, (conn.get("pageInfo") or {})
+
+
 async def register_translations(resource_id: str, translations: list[dict]) -> list[dict]:
     """
     Executes translationsRegister with the provided list of TranslationInput.
@@ -113,6 +154,20 @@ async def register_translations(resource_id: str, translations: list[dict]) -> l
     )
     data = await _post_graphql(m, {"id": resource_id, "translations": translations})
     return (((data.get("data") or {}).get("translationsRegister") or {}).get("userErrors")) or []
+
+
+async def get_resource_translations(resource_id: str, locale: str) -> dict[str, str]:
+    q = (
+        "query ResourceTranslations($id: ID!, $locale: String!) {"
+        "  translatableResource(resourceId: $id) {"
+        "    resourceId"
+        "    translations(locale: $locale) { key value }"
+        "  }"
+        "}"
+    )
+    data = await _post_graphql(q, {"id": resource_id, "locale": locale})
+    items = (((data.get("data") or {}).get("translatableResource") or {}).get("translations")) or []
+    return {str(x.get("key") or ""): str(x.get("value") or "") for x in items if x.get("key")}
 
 
 async def get_product_all_metafields(product_gid: str, allowed_types: list[str] | None = None) -> list[dict]:
