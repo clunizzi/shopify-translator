@@ -7,6 +7,7 @@ import typer
 
 from src.bootstrap.catalog import bootstrap_products
 from src.bootstrap.incremental import sync_products_incremental
+from src.bootstrap.theme import bootstrap_theme, THEME_RESOURCE_TYPES
 from src.config.settings import SETTINGS
 from src.shopify.graphql import list_translatable_resources
 from src.state.neon import NeonTranslationStore
@@ -193,6 +194,45 @@ def theme_translatables_cmd(
     import json as _json
 
     print(_json.dumps(asyncio.run(_run()), ensure_ascii=False))
+
+
+@app.command("theme-bootstrap")
+def theme_bootstrap_cmd(
+    theme_id: str = typer.Option(..., "--theme-id", help="ID numerico del tema Shopify"),  # noqa: B008
+    target_locales: str | None = typer.Option(
+        None, "--target-locales", help="Locali target separati da virgola"
+    ),  # noqa: B008
+    resource_type: list[str] = typer.Option(
+        list(THEME_RESOURCE_TYPES),
+        "--resource-type",
+        help="TranslatableResourceType del tema da includere (ripetibile)",
+    ),  # noqa: B008
+    apply_translations: bool = typer.Option(
+        False,
+        "--apply-translations/--store-only",
+        help="Registra le traduzioni su Shopify oppure salva solo stato/memory su Neon",
+    ),  # noqa: B008
+    dry_run: bool = typer.Option(False, "--dry-run", help="Dry run"),  # noqa: B008
+):
+    """Bootstrap del theme editor content su Neon, con apply opzionale su Shopify."""
+    tl = (
+        [x.strip() for x in target_locales.split(",") if x.strip()]
+        if target_locales
+        else (SETTINGS.get_target_locales() or [SETTINGS.target_locale])
+    )
+    out = asyncio.run(
+        bootstrap_theme(
+            theme_id=theme_id,
+            target_locales=tl,
+            source_locale=SETTINGS.source_locale,
+            apply_translations=apply_translations,
+            dry_run=dry_run,
+            resource_types=resource_type or list(THEME_RESOURCE_TYPES),
+        )
+    )
+    import json as _json
+
+    print(_json.dumps(out, ensure_ascii=False))
 
 
 @app.command("bootstrap-products")
