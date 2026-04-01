@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
+
+import structlog
 
 from src.config.dnt_loader import load_do_not_translate
 from src.config.settings import SETTINGS
@@ -16,6 +19,7 @@ from src.state.neon import (
 from src.translate.cache import TranslationCache
 from src.translate.translator import Translator
 
+logger = structlog.get_logger("theme")
 
 THEME_RESOURCE_TYPES = [
     "ONLINE_STORE_THEME_JSON_TEMPLATE",
@@ -25,6 +29,38 @@ THEME_RESOURCE_TYPES = [
 
 def _theme_section_name(resource_type: str, key: str) -> str:
     return f"{resource_type}.{key}"
+
+
+def _build_theme_log_event(item_summary: dict[str, Any]) -> dict[str, Any]:
+    locales = item_summary.get("locales") or {}
+    return {
+        "ok": True,
+        "theme_id": item_summary.get("theme_id"),
+        "resource_type": item_summary.get("resource_type"),
+        "resource_id": item_summary.get("resource_id"),
+        "status": item_summary.get("status") or "unknown",
+        "changed_sections": item_summary.get("changed_sections") or [],
+        "target_locales": sorted(list(locales.keys())),
+        "translated_sections": {locale: data.get("translated_sections") or [] for locale, data in locales.items()},
+        "section_sources": {locale: data.get("section_sources") or {} for locale, data in locales.items()},
+    }
+
+
+def _build_theme_verbose_log_event(item_summary: dict[str, Any]) -> dict[str, Any] | None:
+    locales = item_summary.get("locales") or {}
+    payloads = {
+        locale: data.get("shopify_payloads")
+        for locale, data in locales.items()
+        if data.get("shopify_payloads")
+    }
+    if not payloads:
+        return None
+    return {
+        "theme_id": item_summary.get("theme_id"),
+        "resource_type": item_summary.get("resource_type"),
+        "resource_id": item_summary.get("resource_id"),
+        "shopify_payloads": payloads,
+    }
 
 
 async def fetch_theme_source_bundle(
@@ -244,6 +280,7 @@ async def bootstrap_theme(
             if not changed_sections and not pending_sync_locales:
                 item_summary["status"] = "unchanged"
                 summary["items"].append(item_summary)
+                logger.info("theme_translation", **_build_theme_log_event(item_summary))
                 continue
 
             if changed_sections:
@@ -331,8 +368,22 @@ async def bootstrap_theme(
             statuses = [v.get("status", "translated") for v in item_summary["locales"].values()]
             item_summary["status"] = "failed" if any(s == "failed" for s in statuses) else ("synced" if statuses and all(s == "synced" for s in statuses) else "translated")
             summary["items"].append(item_summary)
+            logger.info("theme_translation", **_build_theme_log_event(item_summary))
+            if os.environ.get("LOG_VERBOSE_SYNC", "false").lower() in {"1", "true", "yes", "y"}:
+                verbose = _build_theme_verbose_log_event(item_summary)
+                if verbose:
+                    logger.info("theme_translation_debug", **verbose)
     finally:
         cache.close()
         store.close()
 
+    logger.info(
+        "theme_translation_summary",
+        theme_id=str(theme_id),
+        resources=summary["resources"],
+        changed_resources=summary["changed_resources"],
+        changed_sections=summary["changed_sections"],
+        registered=summary["registered"],
+        target_locales=summary["target_locales"],
+    )
     return summary
