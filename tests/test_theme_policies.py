@@ -33,3 +33,16 @@ def test_theme_policy_skips_locale_content_even_if_textual():
         key="customloc.foo",
         value="Testo personalizzato",
     )
+
+
+def test_theme_policy_allows_text_fields_inside_image_with_text_sections():
+    assert should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.index.json.image_with_text_bg_kgBTcM.heading_7YbxBB.heading:1yfftwktofaeh",
+        value="Cos'è un Easy-Commerce?",
+    )
+    assert should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.index.json.image_with_text_bg_kgBTcM.text_rNjyhk.text:1bwq785q13jyp",
+        value="<p>AgriEden è un easy-commerce semplificato.</p>",
+    )

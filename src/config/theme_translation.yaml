@@ -24,9 +24,7 @@ blocked_key_fragments:
   - column
   - desktop
   - icon
-  - image
   - layout
-  - link
   - logo_svg
   - margin
   - mobile
@@ -37,7 +35,6 @@ blocked_key_fragments:
   - speed
   - svg
   - url
-  - video
   - width
 
 blocked_value_patterns:

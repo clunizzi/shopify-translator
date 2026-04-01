@@ -25,10 +25,16 @@ def should_translate_theme_entry(*, resource_type: str, key: str, value: str) ->
     if not key_l or not value_s.strip():
         return False
 
-    if any(fragment in key_l for fragment in policy.blocked_key_fragments):
+    key_path = key_l.split(":", 1)[0]
+    leaf_key = key_path.rsplit(".", 1)[-1]
+
+    allowed = any(fragment in leaf_key for fragment in policy.allowed_key_fragments) or any(
+        fragment in key_l for fragment in policy.allowed_key_fragments
+    )
+    if policy.allowed_key_fragments and not allowed:
         return False
 
-    if policy.allowed_key_fragments and not any(fragment in key_l for fragment in policy.allowed_key_fragments):
+    if any(fragment in leaf_key for fragment in policy.blocked_key_fragments):
         return False
 
     for pattern in policy.blocked_value_patterns:
