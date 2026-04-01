@@ -5,188 +5,15 @@ import os
 
 import typer
 
+from src.bootstrap.catalog import bootstrap_products
+from src.bootstrap.incremental import sync_products_incremental
 from src.config.settings import SETTINGS
-from src.pipeline.process_csv import process_file
-from src.shopify.sync import process_product as sync_process_product
-from src.shopify.graphql import make_product_gid
+from src.shopify.graphql import list_translatable_resources
+from src.state.neon import NeonTranslationStore
 import asyncio
 
-app = typer.Typer(add_completion=False, help="Shopify CSV translator")
-cache_app = typer.Typer(help="Cache SQLite utilities")
-
-
-# Opzioni predefinite centralizzate (evita B008 nelle signature)
-OPT_STATS: bool = True
-OPT_TRUNCATE: bool = False
-OPT_NO_STDOUT: bool = False
-OPT_AUTO_CLASSIFY: bool = True
-
-
-@app.command("process")
-def process(
-    input: Path = typer.Option(..., "--input", "-i", help="Path CSV input"),  # noqa: B008
-    output: Path = typer.Option(..., "--output", "-o", help="Path CSV output"),  # noqa: B008
-    target_locales: str = typer.Option(
-        SETTINGS.target_locale,
-        "--target-locales",
-        "--target-locale",
-        help="Locale target singolo o lista separata da virgola (es. fr-FR oppure de-DE,fr-FR)",
-    ),  # noqa: B008
-    dnt: Path | None = typer.Option(None, "--dnt", help="Path YAML do_not_translate"),  # noqa: B008
-    preserve_handle: bool = typer.Option(
-        False, "--preserve-handle", help="Tenta trad. handle invece di generarlo"
-    ),  # noqa: B008
-    resume: bool = typer.Option(
-        True, "--resume/--no-resume", help="Resume con checkpoint"
-    ),  # noqa: B008
-    force: bool = typer.Option(
-        False, "--force", help="Ignora cache/checkpoint e ritraduce"
-    ),  # noqa: B008
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Nessuna chiamata a Shopify/OpenAI"
-    ),  # noqa: B008
-    stats: bool = typer.Option(
-        OPT_STATS, "--stats/--no-stats", help="Logga summary finale"
-    ),  # noqa: B008
-    types: str = typer.Option(
-        "auto",
-        "--types",
-        help="Filtra Type (es. PRODUCT,COLLECTION). 'auto' elabora tutti i Type presenti",
-    ),  # noqa: B008
-    first_n: int | None = typer.Option(
-        None, "--first-n", help="Primi N Identification unici"
-    ),  # noqa: B008
-    ids: str | None = typer.Option(
-        None, "--ids", help="Lista ID numerici separati da virgola"
-    ),  # noqa: B008
-    ids_file: Path | None = typer.Option(
-        None, "--ids-file", help="File con un ID per riga"
-    ),  # noqa: B008
-    id_range: str | None = typer.Option(
-        None, "--id-range", help="Intervallo 'start:end'"
-    ),  # noqa: B008
-    log_file: Path | None = typer.Option(
-        None, "--log-file", help="Log JSONL su file"
-    ),  # noqa: B008
-    no_stdout: bool = typer.Option(
-        OPT_NO_STDOUT, "--no-stdout", help="Silenzia stdout (solo file)"
-    ),  # noqa: B008
-    overwrite_output: bool = typer.Option(
-        True,
-        "--overwrite-output/--append-output",
-        help="Sovrascrive l'output (default) invece di appenderlo",
-    ),  # noqa: B008
-    auto_classify: bool = typer.Option(
-        OPT_AUTO_CLASSIFY,
-        "--auto-classify/--no-auto-classify",
-        help="Riconosce automaticamente JSON/HTML/URL/valori tecnici/plain se Field non è informativo",
-    ),  # noqa: B008
-):
-    """
-    Esegue la pipeline di traduzione.
-    """
-    # Parse locale/i: accetta singolo o lista separata da virgola
-    t_locales_list = [x.strip() for x in (target_locales or "").split(",") if x.strip()] or [SETTINGS.target_locale]
-    primary_locale = t_locales_list[0]
-
-    summary = {}
-    try:
-        summary = process_file(
-            input_csv=input,
-            output_csv=output,
-            target_locale=primary_locale,
-            target_locales=t_locales_list,
-            dnt_config_path=dnt,
-            preserve_handle=preserve_handle,
-            resume=resume,
-            force=force,
-            dry_run=dry_run,
-            stats=stats,
-            types=types,
-            first_n=first_n,
-            ids=ids,
-            ids_file=ids_file,
-            id_range=id_range,
-            log_file=log_file,
-            no_stdout=no_stdout,
-            overwrite_output=overwrite_output,
-            auto_classify=auto_classify,
-        )
-    finally:
-        pass
-    # Non stampo "Done ..." per non rompere piping | jq
-    if stats:
-        import json
-
-        print(json.dumps(summary, ensure_ascii=False))
-
-
-@app.command("sync-shopify")
-def sync_shopify(
-    product_id: list[int] = typer.Option(
-        ..., "--product-id", help="ID numerico prodotto (ripetibile)",
-    ),  # noqa: B008
-    target_locales: str | None = typer.Option(
-        None, "--target-locales", help="Locali di destinazione separati da virgola"
-    ),  # noqa: B008
-    mf_include: str | None = typer.Option(
-        None, "--mf-include", help="Lista namespace.key separati da virgola"
-    ),  # noqa: B008
-    mf_json_paths: str | None = typer.Option(
-        None, "--mf-json-paths", help="JSON path rules (coma-separati)"
-    ),  # noqa: B008
-    create: bool = typer.Option(False, "--create", help="Tratta come products/create"),  # noqa: B008
-    update: bool = typer.Option(True, "--update/--no-update", help="Tratta come update"),  # noqa: B008
-    dry_run: bool = typer.Option(None, "--dry-run", help="Dry-run (override SETTINGS.DRY_RUN)"),  # noqa: B008
-    apply_on_dry_run: bool = typer.Option(
-        False, "--apply-on-dry-run", help="Aggiorna snapshot anche in dry-run"
-    ),  # noqa: B008
-):
-    """Sincronizza traduzioni per prodotti esistenti su Shopify (products/create|update)."""
-    if create and not update:
-        is_create = True
-    elif update and not create:
-        is_create = False
-    else:
-        # default: update
-        is_create = False
-
-    tl = (
-        [x.strip() for x in target_locales.split(",") if x.strip()]
-        if target_locales
-        else (SETTINGS.get_target_locales() or [SETTINGS.target_locale])
-    )
-    mf_inc = (
-        [(a.strip(), b.strip()) for a, b in (s.split(".", 1) for s in mf_include.split(",") if "." in s)]
-        if mf_include
-        else SETTINGS.get_mf_include()
-    )
-    mf_paths = (
-        [x.strip() for x in mf_json_paths.split(",") if x.strip()] if mf_json_paths else SETTINGS.get_mf_json_paths()
-    )
-    dr = SETTINGS.dry_run_default if dry_run is None else bool(dry_run)
-
-    async def _run():
-        results = []
-        for pid in product_id:
-            res = await sync_process_product(
-                product_numeric_id=pid,
-                target_locales=tl,
-                mf_include=mf_inc,
-                mf_json_paths=mf_paths,
-                source_locale=SETTINGS.source_locale,
-                dry_run=dr,
-                is_create=is_create,
-                delay_ms_after_create=SETTINGS.delay_ms_after_create,
-                apply_on_dry_run=apply_on_dry_run,
-            )
-            results.append(res)
-        return results
-
-    out = asyncio.run(_run())
-    import json as _json
-
-    print(_json.dumps(out, ensure_ascii=False))
+app = typer.Typer(add_completion=False, help="Shopify product translation CLI")
+cache_app = typer.Typer(help="Local translation-cache utilities")
 
 
 # --- Cache utilities ---------------------------------------------------------
@@ -201,7 +28,7 @@ def _resolve_cache_path(override: Path | None = None) -> Path:
 
 @cache_app.command("info")
 def cache_info(
-    db_path: Path | None = typer.Option(None, "--db-path", help="Path SQLite cache"),  # noqa: B008
+    db_path: Path | None = typer.Option(None, "--db-path", help="Path cache locale"),  # noqa: B008
 ):
     """Show effective cache DB path and table stats."""
     path = _resolve_cache_path(db_path)
@@ -239,15 +66,15 @@ def cache_info(
 
 @cache_app.command("purge")
 def cache_purge(
-    db_path: Path | None = typer.Option(None, "--db-path", help="Path SQLite cache"),  # noqa: B008
+    db_path: Path | None = typer.Option(None, "--db-path", help="Path cache locale"),  # noqa: B008
     all: bool = typer.Option(
         False,
         "--all/--translations-only",
-        help="Drop both translations and snapshot tables (default: only translations)",
+        help="Pulisce sia translations sia tabelle ausiliarie (default: solo translations)",
     ),  # noqa: B008
     vacuum: bool = typer.Option(False, "--vacuum/--no-vacuum", help="Run VACUUM after purge"),  # noqa: B008
 ):
-    """Purge cache data. By default clears only translations table."""
+    """Pulisce la cache locale del traduttore."""
     path = _resolve_cache_path(db_path)
     # If DB doesn't exist, nothing to do
     if not path.exists():
@@ -281,6 +108,276 @@ def cache_purge(
 
 
 app.add_typer(cache_app, name="cache")
+
+
+def _parse_product_ids(product_id: list[int], ids_file: Path | None = None) -> list[int]:
+    out = [int(x) for x in product_id]
+    if ids_file:
+        text = ids_file.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        if lines:
+            header = [part.strip().lower() for part in lines[0].split(",")]
+            if "id" in header or "product_id" in header:
+                import csv
+
+                reader = csv.DictReader(lines)
+                for row in reader:
+                    raw = (
+                        (row.get("ID") or row.get("id"))
+                        or (row.get("product_id") or row.get("PRODUCT_ID"))
+                        or ""
+                    )
+                    s = str(raw).strip()
+                    if not s:
+                        continue
+                    out.append(int(s))
+            else:
+                for line in lines:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    out.append(int(s))
+    return sorted(set(out))
+
+
+@app.command("theme-translatables")
+def theme_translatables_cmd(
+    resource_type: list[str] = typer.Option(
+        [
+            "ONLINE_STORE_THEME_SETTINGS_DATA_SECTIONS",
+            "ONLINE_STORE_THEME_JSON_TEMPLATE",
+            "ONLINE_STORE_THEME_SECTION_GROUP",
+            "ONLINE_STORE_THEME_LOCALE_CONTENT",
+        ],
+        "--resource-type",
+        help="TranslatableResourceType del tema (ripetibile)",
+    ),  # noqa: B008
+    first: int = typer.Option(50, "--first", min=1, max=250, help="Numero massimo per tipo"),  # noqa: B008
+    key_filter: str | None = typer.Option(
+        None,
+        "--key-filter",
+        help="Filtra solo i translatableContent.key che contengono questa stringa",
+    ),  # noqa: B008
+    value_filter: str | None = typer.Option(
+        None,
+        "--value-filter",
+        help="Filtra solo i translatableContent.value che contengono questa stringa",
+    ),  # noqa: B008
+):
+    """Ispeziona i translatable del tema via Shopify GraphQL."""
+    async def _run() -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {}
+        for rt in resource_type:
+            nodes, page_info = await list_translatable_resources(resource_type=rt, first=first)
+            rows: list[dict] = []
+            for node in nodes:
+                content = node.get("translatableContent") or []
+                if key_filter:
+                    content = [x for x in content if key_filter.lower() in str(x.get("key") or "").lower()]
+                if value_filter:
+                    content = [x for x in content if value_filter.lower() in str(x.get("value") or "").lower()]
+                if not content:
+                    continue
+                rows.append(
+                    {
+                        "resourceId": node.get("resourceId"),
+                        "translatableContent": content,
+                    }
+                )
+            out[rt] = {
+                "nodes": rows,
+                "pageInfo": page_info,
+            }
+        return out
+
+    import json as _json
+
+    print(_json.dumps(asyncio.run(_run()), ensure_ascii=False))
+
+
+@app.command("bootstrap-products")
+def bootstrap_products_cmd(
+    product_id: list[int] = typer.Option([], "--product-id", help="ID numerico prodotto (ripetibile)"),  # noqa: B008
+    ids_file: Path | None = typer.Option(
+        None,
+        "--ids-file",
+        help="File con un product ID per riga",
+    ),  # noqa: B008
+    target_locales: str | None = typer.Option(
+        None, "--target-locales", help="Locali target separati da virgola"
+    ),  # noqa: B008
+    mf_include: str | None = typer.Option(
+        None,
+        "--mf-include",
+        help="Lista namespace.key separati da virgola; vuoto = auto-discovery",
+    ),  # noqa: B008
+    apply_translations: bool = typer.Option(
+        SETTINGS.bootstrap_apply_translations,
+        "--apply-translations/--store-only",
+        help="Registra le traduzioni su Shopify oppure salva solo stato/memory su Neon",
+    ),  # noqa: B008
+    existing_products: bool = typer.Option(
+        SETTINGS.bootstrap_existing_products,
+        "--existing-products/--new-products",
+        help="Bootstrap prudente per catalogo esistente oppure onboarding di prodotti nuovi",
+    ),  # noqa: B008
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Non chiama OpenAI/Shopify; utile per verificare fetch e stato",
+    ),  # noqa: B008
+):
+    """Bootstrap field-by-field del catalogo da product IDs, con stato persistito su Neon."""
+    resolved_ids_file = ids_file or Path(SETTINGS.bootstrap_ids_file)
+    ids = _parse_product_ids(product_id, resolved_ids_file if resolved_ids_file.exists() else None)
+    if not ids:
+        raise typer.BadParameter("Serve almeno un --product-id o --ids-file")
+
+    tl = (
+        [x.strip() for x in target_locales.split(",") if x.strip()]
+        if target_locales
+        else (SETTINGS.get_target_locales() or [SETTINGS.target_locale])
+    )
+    mf_inc = (
+        [(a.strip(), b.strip()) for a, b in (s.split(".", 1) for s in mf_include.split(",") if "." in s)]
+        if mf_include
+        else []
+    )
+
+    out = asyncio.run(
+        bootstrap_products(
+            product_ids=ids,
+            target_locales=tl,
+            mf_include=mf_inc or None,
+            source_locale=SETTINGS.source_locale,
+            apply_translations=apply_translations,
+            dry_run=dry_run,
+            existing_products=existing_products,
+            is_create=not existing_products,
+        )
+    )
+    import json as _json
+
+    print(_json.dumps(out, ensure_ascii=False))
+
+
+@app.command("bootstrap")
+def bootstrap_alias_cmd(
+    product_id: list[int] = typer.Option([], "--product-id", help="ID numerico prodotto (ripetibile)"),  # noqa: B008
+    ids_file: Path | None = typer.Option(None, "--ids-file", help="File ID oppure CSV con header ID"),  # noqa: B008
+    apply_translations: bool = typer.Option(
+        SETTINGS.bootstrap_apply_translations,
+        "--apply-translations/--store-only",
+        help="Registra le traduzioni su Shopify oppure salva solo stato su Neon",
+    ),  # noqa: B008
+    dry_run: bool = typer.Option(False, "--dry-run", help="Dry run"),  # noqa: B008
+):
+    """Alias corto del bootstrap PDP-based."""
+    bootstrap_products_cmd(
+        product_id=product_id,
+        ids_file=ids_file,
+        target_locales=None,
+        mf_include=None,
+        apply_translations=apply_translations,
+        existing_products=SETTINGS.bootstrap_existing_products,
+        dry_run=dry_run,
+    )
+
+
+@app.command("sync-products-neon")
+def sync_products_neon_cmd(
+    product_id: list[int] = typer.Option([], "--product-id", help="ID numerico prodotto (ripetibile)"),  # noqa: B008
+    ids_file: Path | None = typer.Option(
+        None,
+        "--ids-file",
+        help="File con un product ID per riga",
+    ),  # noqa: B008
+    target_locales: str | None = typer.Option(
+        None, "--target-locales", help="Locali target separati da virgola"
+    ),  # noqa: B008
+    mf_include: str | None = typer.Option(
+        None,
+        "--mf-include",
+        help="Lista namespace.key separati da virgola; vuoto = auto-discovery",
+    ),  # noqa: B008
+    apply_translations: bool = typer.Option(
+        False,
+        "--apply-translations/--store-only",
+        help="Registra le traduzioni su Shopify oppure salva solo stato/memory su Neon",
+    ),  # noqa: B008
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Non chiama OpenAI/Shopify; utile per verificare il diff incrementale",
+    ),  # noqa: B008
+):
+    """Sync incrementale field-by-field basata su Neon/PostgreSQL."""
+    ids = _parse_product_ids(product_id, ids_file)
+    if not ids:
+        raise typer.BadParameter("Serve almeno un --product-id o --ids-file")
+
+    tl = (
+        [x.strip() for x in target_locales.split(",") if x.strip()]
+        if target_locales
+        else (SETTINGS.get_target_locales() or [SETTINGS.target_locale])
+    )
+    mf_inc = (
+        [(a.strip(), b.strip()) for a, b in (s.split(".", 1) for s in mf_include.split(",") if "." in s)]
+        if mf_include
+        else []
+    )
+
+    out = asyncio.run(
+        sync_products_incremental(
+            product_ids=ids,
+            target_locales=tl,
+            mf_include=mf_inc or None,
+            source_locale=SETTINGS.source_locale,
+            apply_translations=apply_translations,
+            dry_run=dry_run,
+            is_create=False,
+        )
+    )
+    import json as _json
+
+    print(_json.dumps(out, ensure_ascii=False))
+
+
+@app.command("sync")
+def sync_alias_cmd(
+    product_id: list[int] = typer.Option([], "--product-id", help="ID numerico prodotto (ripetibile)"),  # noqa: B008
+    ids_file: Path | None = typer.Option(None, "--ids-file", help="File ID oppure CSV con header ID"),  # noqa: B008
+    apply_translations: bool = typer.Option(
+        False,
+        "--apply-translations/--store-only",
+        help="Registra le traduzioni su Shopify oppure salva solo stato su Neon",
+    ),  # noqa: B008
+    dry_run: bool = typer.Option(False, "--dry-run", help="Dry run"),  # noqa: B008
+):
+    """Alias corto della sync incrementale Neon-based."""
+    sync_products_neon_cmd(
+        product_id=product_id,
+        ids_file=ids_file,
+        target_locales=None,
+        mf_include=None,
+        apply_translations=apply_translations,
+        dry_run=dry_run,
+    )
+
+
+@app.command("neon-reset")
+def neon_reset_cmd(
+    yes: bool = typer.Option(False, "--yes", help="Conferma il reset dello schema Neon"),  # noqa: B008
+):
+    """Resetta lo schema del nuovo backend Neon/PostgreSQL."""
+    if not yes:
+        raise typer.BadParameter("Passa --yes per confermare il reset dello schema Neon")
+    store = NeonTranslationStore()
+    try:
+        store.reset_schema()
+    finally:
+        store.close()
+    typer.echo("Schema Neon resettato.")
 
 @app.command("sync-webhook")
 def sync_webhook(
