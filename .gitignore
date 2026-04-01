@@ -6,6 +6,8 @@
 # --- Project data & outputs ---
 logs/
 state/
+!src/state/
+!src/state/*.py
 out/
 arn.yaml
 data/
