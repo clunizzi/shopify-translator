@@ -153,6 +153,14 @@ async def register_translations(resource_id: str, translations: list[dict]) -> l
         "}"
     )
     data = await _post_graphql(m, {"id": resource_id, "translations": translations})
+    graphql_errors = data.get("errors") or []
+    if graphql_errors:
+        out: list[dict[str, Any]] = []
+        for err in graphql_errors:
+            field = err.get("path") or err.get("field") or ["graphql"]
+            message = str(err.get("message") or "Unknown GraphQL error")
+            out.append({"field": field, "message": message})
+        return out
     return (((data.get("data") or {}).get("translationsRegister") or {}).get("userErrors")) or []
 
 
