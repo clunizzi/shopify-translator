@@ -197,6 +197,52 @@ def translate_theme_document(
     return translated_document, translated_hashes, payloads, section_sources
 
 
+def build_theme_payloads_from_stored_translation(
+    *,
+    source_document: dict[str, Any],
+    stored_document: dict[str, Any],
+    target_locale: str,
+    changed_sections: set[str],
+) -> tuple[dict[str, Any], dict[str, str], list[dict], dict[str, str]] | None:
+    stored_entries = dict((stored_document or {}).get("entries") or {})
+    if not stored_entries:
+        return None
+
+    translated_document: dict[str, Any] = {
+        "shop_domain": source_document["shop_domain"],
+        "theme_id": source_document["theme_id"],
+        "resource_type": source_document["resource_type"],
+        "resource_id": source_document["resource_id"],
+        "source_locale": source_document["source_locale"],
+        "target_locale": target_locale,
+        "entries": {},
+    }
+    translated_hashes: dict[str, str] = {}
+    payloads: list[dict] = []
+    section_sources: dict[str, str] = {}
+
+    for section_name in changed_sections:
+        _, key = section_name.split(".", 1)
+        source_entry = source_document["entries"].get(key)
+        if not source_entry or key not in stored_entries:
+            return None
+        translated_value = str(stored_entries[key])
+        translated_document["entries"][key] = translated_value
+        translated_hashes[section_name] = make_source_hash(source_entry["value"])
+        payloads.append(
+            {
+                "resource_id": source_entry["resource_id"],
+                "key": key,
+                "locale": target_locale,
+                "value": translated_value,
+                "translatableContentDigest": source_entry["digest"],
+            }
+        )
+        section_sources[section_name] = "stored_translation_state"
+
+    return translated_document, translated_hashes, payloads, section_sources
+
+
 async def bootstrap_theme(
     *,
     theme_id: str | int,
@@ -297,12 +343,28 @@ async def bootstrap_theme(
                         if previous_translation.section_hashes.get(section_name) != source_hash:
                             locale_changed_sections.add(section_name)
 
-                translated_document, translated_hashes, payloads, section_sources = translate_theme_document(
-                    source_document=source_document,
-                    changed_sections=locale_changed_sections,
-                    target_locale=target_locale,
-                    translator=translator,
-                )
+                reused = None
+                if (
+                    previous_translation is not None
+                    and previous_translation.status != "synced"
+                    and previous_translation.section_hashes == section_hashes
+                ):
+                    reused = build_theme_payloads_from_stored_translation(
+                        source_document=source_document,
+                        stored_document=previous_translation.document or {},
+                        target_locale=target_locale,
+                        changed_sections=locale_changed_sections,
+                    )
+
+                if reused is not None:
+                    translated_document, translated_hashes, payloads, section_sources = reused
+                else:
+                    translated_document, translated_hashes, payloads, section_sources = translate_theme_document(
+                        source_document=source_document,
+                        changed_sections=locale_changed_sections,
+                        target_locale=target_locale,
+                        translator=translator,
+                    )
 
                 for section_name in locale_changed_sections:
                     key = section_name.split(".", 1)[1]

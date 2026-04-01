@@ -1,6 +1,7 @@
 import asyncio
 
 from src.bootstrap import theme
+from src.state.neon import make_source_hash
 from src.state.neon import ThemeTranslationState
 
 
@@ -38,6 +39,7 @@ class _FakeStore:
         if not record:
             return None
         return ThemeTranslationState(
+            document=dict(record["document"]),
             section_hashes=dict(record["section_hashes"]),
             status=record["status"],
             metadata=dict(record["metadata"]),
@@ -168,3 +170,96 @@ def test_theme_apply_translations_after_store_only_pushes_even_when_source_is_un
         resource_id="gid://shopify/OnlineStoreThemeJsonTemplate/1",
         target_locale="de",
     ).status == "synced"
+
+
+def test_theme_apply_after_store_only_reuses_stored_translation_state(monkeypatch):
+    calls = []
+
+    async def _fake_fetch_theme_source_bundle(**kwargs):
+        return [
+            {
+                "resource_type": "ONLINE_STORE_THEME_JSON_TEMPLATE",
+                "resource_id": "gid://shopify/OnlineStoreThemeJsonTemplate/1",
+                "translatableContent": [
+                    {"key": "section.home.heading:abc", "value": "Benvenuti", "digest": "d1", "locale": "it"},
+                ],
+            }
+        ]
+
+    async def _fake_register_translations(resource_id, payloads):
+        calls.append((resource_id, payloads))
+        return []
+
+    translate_calls = {"count": 0}
+
+    def _fake_translate_theme_document(**kwargs):
+        translate_calls["count"] += 1
+        source_document = kwargs["source_document"]
+        target_locale = kwargs["target_locale"]
+        return (
+            {
+                "shop_domain": source_document["shop_domain"],
+                "theme_id": source_document["theme_id"],
+                "resource_type": source_document["resource_type"],
+                "resource_id": source_document["resource_id"],
+                "source_locale": source_document["source_locale"],
+                "target_locale": target_locale,
+                "entries": {"section.home.heading:abc": f"Benvenuti [{target_locale}]"},
+            },
+            {"ONLINE_STORE_THEME_JSON_TEMPLATE.section.home.heading:abc": make_source_hash("Benvenuti")},
+            [
+                {
+                    "resource_id": "gid://shopify/OnlineStoreThemeJsonTemplate/1",
+                    "key": "section.home.heading:abc",
+                    "locale": target_locale,
+                    "value": f"Benvenuti [{target_locale}]",
+                    "translatableContentDigest": "d1",
+                }
+            ],
+            {"ONLINE_STORE_THEME_JSON_TEMPLATE.section.home.heading:abc": "translator"},
+        )
+
+    monkeypatch.setattr(theme, "fetch_theme_source_bundle", _fake_fetch_theme_source_bundle)
+    monkeypatch.setattr(theme, "register_translations", _fake_register_translations)
+    monkeypatch.setattr(theme, "translate_theme_document", _fake_translate_theme_document)
+
+    store = _FakeStore()
+    monkeypatch.setattr(theme, "NeonTranslationStore", lambda: store)
+
+    asyncio.run(
+        theme.bootstrap_theme(
+            theme_id="111",
+            target_locales=["de"],
+            source_locale="it",
+            apply_translations=False,
+            dry_run=False,
+            resource_types=["ONLINE_STORE_THEME_JSON_TEMPLATE"],
+        )
+    )
+    assert translate_calls["count"] == 1
+
+    asyncio.run(
+        theme.bootstrap_theme(
+            theme_id="111",
+            target_locales=["de"],
+            source_locale="it",
+            apply_translations=True,
+            dry_run=False,
+            resource_types=["ONLINE_STORE_THEME_JSON_TEMPLATE"],
+        )
+    )
+
+    assert translate_calls["count"] == 1
+    assert calls == [
+        (
+            "gid://shopify/OnlineStoreThemeJsonTemplate/1",
+            [
+                {
+                    "key": "section.home.heading:abc",
+                    "locale": "de",
+                    "value": "Benvenuti [de]",
+                    "translatableContentDigest": "d1",
+                }
+            ],
+        )
+    ]

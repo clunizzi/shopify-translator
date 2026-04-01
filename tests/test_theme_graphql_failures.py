@@ -32,6 +32,7 @@ class _FakeStore:
         if not record:
             return None
         return ThemeTranslationState(
+            document=dict(record["document"]),
             section_hashes=dict(record["section_hashes"]),
             status=record["status"],
             metadata=dict(record["metadata"]),
@@ -44,6 +45,7 @@ class _FakeStore:
         self.translations[
             (record.shop_domain, record.theme_id, record.resource_type, record.resource_id, record.target_locale)
         ] = {
+            "document": dict(record.document),
             "section_hashes": dict(record.section_hashes),
             "status": record.status,
             "metadata": dict(record.metadata or {}),
