@@ -9,9 +9,12 @@ from src.bootstrap.catalog import bootstrap_products
 from src.bootstrap.incremental import sync_products_incremental
 from src.bootstrap.theme import bootstrap_theme, THEME_RESOURCE_TYPES
 from src.config.settings import SETTINGS
+from src.logging_setup import configure_logging
 from src.shopify.graphql import list_translatable_resources
 from src.state.neon import NeonTranslationStore
 import asyncio
+
+configure_logging()
 
 app = typer.Typer(add_completion=False, help="Shopify product translation CLI")
 cache_app = typer.Typer(help="Local translation-cache utilities")
