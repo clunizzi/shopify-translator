@@ -291,16 +291,25 @@ async def bootstrap_theme(
                     "section_sources": section_sources,
                 }
                 if apply_translations and not dry_run:
-                    user_errors = await register_translations(resource_id, payloads)
+                    shopify_payloads = [
+                        {
+                            "key": item["key"],
+                            "locale": item["locale"],
+                            "value": item["value"],
+                            "translatableContentDigest": item["translatableContentDigest"],
+                        }
+                        for item in payloads
+                    ]
+                    user_errors = await register_translations(resource_id, shopify_payloads)
                     if not user_errors:
-                        summary["registered"] += len(payloads)
+                        summary["registered"] += len(shopify_payloads)
                         translation_status = "synced"
                     else:
                         translation_status = "failed"
                         translation_metadata["user_errors"] = user_errors
                         locale_summary["user_errors"] = user_errors
                     if os.environ.get("LOG_VERBOSE_SYNC", "false").lower() in {"1", "true", "yes", "y"}:
-                        locale_summary["shopify_payloads"] = payloads
+                        locale_summary["shopify_payloads"] = shopify_payloads
 
                 store.upsert_theme_translation(
                     ThemeTranslationRecord(
