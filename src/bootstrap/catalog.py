@@ -4,6 +4,8 @@ import json
 import os
 from typing import Any
 
+import structlog
+
 from src.bootstrap.dictionary import resolve_dictionary_first, resolve_memory_second
 from src.config.dnt_loader import load_do_not_translate
 from src.config.field_policies import DEFAULT_HANDLE_POLICY, should_translate_product_key
@@ -34,6 +36,8 @@ AUTO_TYPES = [
     "json",
     "rich_text",
 ]
+
+logger = structlog.get_logger("bootstrap")
 
 
 def _section_name_product(key: str) -> str:
@@ -446,6 +450,7 @@ async def bootstrap_products(
     dry_run: bool,
     existing_products: bool = True,
     is_create: bool = False,
+    continue_on_error: bool = True,
 ) -> dict:
     store = NeonTranslationStore()
     store.ensure_schema()
@@ -457,32 +462,48 @@ async def bootstrap_products(
         "changed_products": 0,
         "changed_sections": 0,
         "registered": 0,
+        "failed_products": 0,
+        "failed_product_ids": [],
         "target_locales": target_locales,
     }
 
     try:
         for product_id in product_ids:
-            product_gid, metafields, live_map, existing_translations = await fetch_product_source_bundle(
-                product_id,
-                mf_include,
-                target_locales=target_locales,
-            )
-            await process_product_bundle(
-                store=store,
-                translator=translator,
-                product_id=int(product_id),
-                product_gid=product_gid,
-                metafields=metafields,
-                live_map=live_map,
-                existing_translations=existing_translations,
-                target_locales=target_locales,
-                source_locale=source_locale,
-                apply_translations=apply_translations,
-                dry_run=dry_run,
-                existing_products=existing_products,
-                is_create=is_create,
-                summary=summary,
-            )
+            try:
+                product_gid, metafields, live_map, existing_translations = await fetch_product_source_bundle(
+                    product_id,
+                    mf_include,
+                    target_locales=target_locales,
+                )
+                await process_product_bundle(
+                    store=store,
+                    translator=translator,
+                    product_id=int(product_id),
+                    product_gid=product_gid,
+                    metafields=metafields,
+                    live_map=live_map,
+                    existing_translations=existing_translations,
+                    target_locales=target_locales,
+                    source_locale=source_locale,
+                    apply_translations=apply_translations,
+                    dry_run=dry_run,
+                    existing_products=existing_products,
+                    is_create=is_create,
+                    summary=summary,
+                )
+            except Exception as exc:
+                summary["failed_products"] += 1
+                summary["failed_product_ids"].append(int(product_id))
+                logger.exception(
+                    "bootstrap_product_failed",
+                    product_id=int(product_id),
+                    apply_translations=apply_translations,
+                    dry_run=dry_run,
+                    continue_on_error=continue_on_error,
+                    error=str(exc),
+                )
+                if not continue_on_error:
+                    raise
     finally:
         cache.close()
         store.close()

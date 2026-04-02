@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import json
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -26,6 +28,24 @@ class _TeeWriter:
             stream.flush()
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, set):
+        return sorted(value)
+    return str(value)
+
+
+def _make_jsonl_file_writer(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a", encoding="utf-8")
+
+    def _write_jsonl(logger, method_name, event_dict):
+        handle.write(json.dumps(event_dict, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n")
+        handle.flush()
+        return event_dict
+
+    return _write_jsonl
+
+
 def configure_logging() -> None:
     global _CONFIGURED
     if _CONFIGURED:
@@ -37,13 +57,9 @@ def configure_logging() -> None:
     log_file = os.getenv("LOG_FILE", "logs/translator.jsonl").strip()
 
     log_output = sys.stdout
-    file_handle = None
+    file_writer = None
     if log_file:
-        path = Path(log_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        file_handle = path.open("a", encoding="utf-8")
-        if json_logs:
-            log_output = _TeeWriter(sys.stdout, file_handle)
+        file_writer = _make_jsonl_file_writer(Path(log_file))
 
     shared_processors = [
         structlog.stdlib.add_log_level,
@@ -61,6 +77,7 @@ def configure_logging() -> None:
             *shared_processors,
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            *([file_writer] if file_writer else []),
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),

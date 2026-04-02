@@ -269,6 +269,11 @@ def bootstrap_products_cmd(
         "--dry-run",
         help="Non chiama OpenAI/Shopify; utile per verificare fetch e stato",
     ),  # noqa: B008
+    continue_on_error: bool = typer.Option(
+        True,
+        "--continue-on-error/--fail-fast",
+        help="Continua col batch anche se un prodotto fallisce",
+    ),  # noqa: B008
 ):
     """Bootstrap field-by-field del catalogo da product IDs, con stato persistito su Neon."""
     resolved_ids_file = ids_file or Path(SETTINGS.bootstrap_ids_file)
@@ -297,6 +302,7 @@ def bootstrap_products_cmd(
             dry_run=dry_run,
             existing_products=existing_products,
             is_create=not existing_products,
+            continue_on_error=continue_on_error,
         )
     )
     import json as _json
@@ -314,6 +320,7 @@ def bootstrap_alias_cmd(
         help="Registra le traduzioni su Shopify oppure salva solo stato su Neon",
     ),  # noqa: B008
     dry_run: bool = typer.Option(False, "--dry-run", help="Dry run"),  # noqa: B008
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--fail-fast", help="Continua col batch anche se un prodotto fallisce"),  # noqa: B008
 ):
     """Alias corto del bootstrap PDP-based."""
     bootstrap_products_cmd(
@@ -324,6 +331,7 @@ def bootstrap_alias_cmd(
         apply_translations=apply_translations,
         existing_products=SETTINGS.bootstrap_existing_products,
         dry_run=dry_run,
+        continue_on_error=continue_on_error,
     )
 
 
