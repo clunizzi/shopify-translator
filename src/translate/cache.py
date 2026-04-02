@@ -7,6 +7,8 @@ import errno
 import os
 from pathlib import Path
 
+from src.state.neon import sanitize_json_value, sanitize_text
+
 
 class TranslationCache:
     def __init__(self, db_path: str | Path | None = None) -> None:
@@ -85,7 +87,7 @@ class TranslationCache:
     def set(self, key: str, value: dict, model: str) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO translations (key, value, model) VALUES (?, ?, ?)",
-            (key, json.dumps(value, ensure_ascii=False), model),
+            (sanitize_text(key), json.dumps(sanitize_json_value(value), ensure_ascii=False), sanitize_text(model)),
         )
         self.conn.commit()
 
@@ -107,7 +109,12 @@ class TranslationCache:
     def set_cell(self, key: str, value: str, model: str, meta: dict | None = None) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO cell_cache (key, value, model, meta) VALUES (?, ?, ?, ?)",
-            (key, value, model, json.dumps(meta or {}, ensure_ascii=False)),
+            (
+                sanitize_text(key),
+                sanitize_text(value),
+                sanitize_text(model),
+                json.dumps(sanitize_json_value(meta or {}), ensure_ascii=False),
+            ),
         )
         self.conn.commit()
 

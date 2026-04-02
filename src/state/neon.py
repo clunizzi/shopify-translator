@@ -13,8 +13,24 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def sanitize_text(value: str) -> str:
+    return (value or "").replace("\x00", "")
+
+
+def sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): sanitize_json_value(v) for k, v in value.items()}
+    return value
+
+
 def make_source_hash(value: str) -> str:
-    return hashlib.sha256((value or "").encode("utf-8", errors="ignore")).hexdigest()
+    return hashlib.sha256(sanitize_text(value).encode("utf-8", errors="ignore")).hexdigest()
 
 
 def default_sslrootcert() -> str | None:
@@ -300,9 +316,9 @@ class NeonTranslationStore:
                     record.shop_domain,
                     record.product_gid,
                     record.source_locale,
-                    json.dumps(record.document, ensure_ascii=False),
-                    json.dumps(record.section_hashes, ensure_ascii=False),
-                    json.dumps(record.metadata or {}, ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.document), ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.section_hashes), ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.metadata or {}), ensure_ascii=False),
                     _utc_now(),
                 ),
             )
@@ -330,11 +346,11 @@ class NeonTranslationStore:
                     record.shop_domain,
                     record.product_gid,
                     record.target_locale,
-                    json.dumps(record.document, ensure_ascii=False),
-                    json.dumps(record.section_hashes, ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.document), ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.section_hashes), ensure_ascii=False),
                     record.status,
                     record.model,
-                    json.dumps(record.metadata or {}, ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.metadata or {}), ensure_ascii=False),
                     _utc_now(),
                 ),
             )
@@ -428,10 +444,10 @@ class NeonTranslationStore:
                     field_key,
                     source_locale,
                     target_locale,
-                    source_value,
-                    translated_value,
-                    model,
-                    json.dumps(metadata or {}, ensure_ascii=False),
+                    sanitize_text(source_value),
+                    sanitize_text(translated_value),
+                    sanitize_text(model),
+                    json.dumps(sanitize_json_value(metadata or {}), ensure_ascii=False),
                     _utc_now(),
                 ),
             )
@@ -486,12 +502,12 @@ class NeonTranslationStore:
                   updated_at = EXCLUDED.updated_at
                 """,
                 (
-                    category,
+                    sanitize_text(category),
                     source_locale,
                     target_locale,
-                    source_value,
-                    translated_value,
-                    json.dumps(metadata or {}, ensure_ascii=False),
+                    sanitize_text(source_value),
+                    sanitize_text(translated_value),
+                    json.dumps(sanitize_json_value(metadata or {}), ensure_ascii=False),
                     _utc_now(),
                 ),
             )
@@ -574,9 +590,9 @@ class NeonTranslationStore:
                     record.resource_type,
                     record.resource_id,
                     record.source_locale,
-                    json.dumps(record.document, ensure_ascii=False),
-                    json.dumps(record.section_hashes, ensure_ascii=False),
-                    json.dumps(record.metadata or {}, ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.document), ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.section_hashes), ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.metadata or {}), ensure_ascii=False),
                     _utc_now(),
                 ),
             )
@@ -643,11 +659,11 @@ class NeonTranslationStore:
                     record.resource_type,
                     record.resource_id,
                     record.target_locale,
-                    json.dumps(record.document, ensure_ascii=False),
-                    json.dumps(record.section_hashes, ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.document), ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.section_hashes), ensure_ascii=False),
                     record.status,
                     record.model,
-                    json.dumps(record.metadata or {}, ensure_ascii=False),
+                    json.dumps(sanitize_json_value(record.metadata or {}), ensure_ascii=False),
                     _utc_now(),
                 ),
             )
