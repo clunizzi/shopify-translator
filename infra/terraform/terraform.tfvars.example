@@ -5,6 +5,10 @@ project = "my-translator"
 receiver_zip = "../../build/receiver.zip"
 worker_zip   = "../../build/worker.zip"
 
+# Oppure usa S3 anche per il receiver
+#receiver_s3_bucket = "my-artifacts-bucket"
+#receiver_s3_key    = "receiver/receiver-20260101T120000.zip"
+
 # Oppure usa S3 per il worker (consigliato in produzione)
 #worker_s3_bucket = "my-artifacts-bucket"
 #worker_s3_key    = "worker/worker-20250101T120000.zip"
@@ -19,13 +23,13 @@ shopify_webhook_secret_arn     = "arn:aws:secretsmanager:eu-central-1:1111111111
 
 # Localizzazione
 source_locale   = "en"
-target_locales  = "fr-FR,de-DE"
+target_locales  = "fr,de"
 mf_include      = "" # es. "meta.namespace1.key1,meta.ns2.key2"
-mf_json_paths   = ""
 
 # Worker runtime
 request_timeout      = 30
 retries              = 3
 debounce_seconds     = 20
 dry_run              = "false"
-fill_missing_translations = "true"
+disable_sync         = "false"
+log_verbose_sync     = "false"

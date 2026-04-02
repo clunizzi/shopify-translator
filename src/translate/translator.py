@@ -6,6 +6,7 @@ import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -13,9 +14,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from bs4 import BeautifulSoup
 
 from src.config.settings import SETTINGS
-from src.htmlmap.extract import extract_text_segments
-from src.htmlmap.liquid import detect_has_liquid, protect_liquid, unprotect_liquid
-from src.htmlmap.reinject import reinject_text
+from src.htmlmap.liquid import detect_has_liquid
 from src.translate.cache import TranslationCache
 from src.translate.similarity import normalize_text
 from src.translate.validators import (
@@ -92,87 +91,7 @@ def _snippet_ell(s: object, limit: int = 500) -> str:
     return text if len(text) <= limit else (text[:limit] + "…")
 
 
-# --- Minor post-processing helpers ------------------------------------------
-_MD_EM_RE = re.compile(r"(\*{1,2}[^*]+?\*{1,2}|_{1,2}[^_]+?_{1,2})")
-
-def _fix_inline_markdown_spacing(s: str) -> str:
-    """
-    Inserisce spazi attorno a blocchi stile markdown (*bold*, **bold**, _em_, __strong__)
-    se adiacenti a caratteri non-spazio, per evitare incollaggi tipo 'parola*bold*parola'.
-    Non altera il contenuto interno ai marker.
-    """
-    if not s:
-        return s
-    # spazio prima
-    s = re.sub(r"([^\s])(\*{1,2}[^*]+?\*{1,2})", r"\1 \2", s)
-    s = re.sub(r"([^\s](_{1,2}[^_]+?_{1,2}))", r" \1", s)
-    # spazio dopo
-    s = re.sub(r"(\*{1,2}[^*]+?\*{1,2})([^\s])", r"\1 \2", s)
-    s = re.sub(r"(_{1,2}[^_]+?_{1,2})([^\s])", r"\1 \2", s)
-    return s
-
-
-def _preserve_edge_whitespace(src: str, dst: str) -> str:
-    """
-    Riapplica gli spazi iniziali/finali del segmento sorgente attorno alla traduzione.
-    Evita di perdere spazi adiacenti a tag inline (es. ... </strong> testo).
-    """
-    try:
-        s = src or ""
-        t = dst or ""
-        import re as _re
-        pre = _re.match(r"^\s*", s).group(0)
-        suf = _re.search(r"\s*$", s).group(0)
-        core = t.strip()
-        return f"{pre}{core}{suf}"
-    except Exception:
-        return dst
-
-
 # --- JSON parsing helpers -----------------------------------------------------
-
-def _safe_json_loads(text: str) -> dict:
-    """
-    Tenta di parse-are la risposta OpenAI in un dict con chiave 'translations'.
-    Accetta:
-      - oggetto {"translations":[...]}
-      - lista nuda [...]
-      - output con ```json ... ``` o testo extra
-    Ritorna sempre un dict {"translations": list[str]} anche se vuota.
-    """
-    s = (text or "").strip()
-
-    # 1) Prova parse diretto
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict) and isinstance(obj.get("translations"), list):
-            return {"translations": [str(x or "") for x in obj["translations"]]}
-        if isinstance(obj, list):
-            return {"translations": [str(x or "") for x in obj]}
-    except Exception:
-        pass
-
-    # 2) Prova a ripulire code fences / estrarre il core JSON
-    candidate = _strip_code_fences_and_extract_json(s)
-    if candidate:
-        try:
-            obj2 = json.loads(candidate)
-            if isinstance(obj2, dict) and isinstance(obj2.get("translations"), list):
-                return {"translations": [str(x or "") for x in obj2["translations"]]}
-            if isinstance(obj2, list):
-                return {"translations": [str(x or "") for x in obj2]}
-        except Exception:
-            pass
-
-    # 3) Fallback: usa il parser permissivo a lista
-    arr = safe_parse_openai_list(s)
-    if arr:
-        return {"translations": [str(x or "") for x in arr]}
-
-    # 4) Estremo fallback: nessuna traduzione estratta
-    return {"translations": []}
-
-
 def _strip_code_fences_and_extract_json(text: str) -> str | None:
     """
     Pulisce blocchi ```json ...``` e prova a estrarre il JSON principale.
@@ -401,7 +320,7 @@ def detect_lang_fast(text: str) -> tuple[str, float]:
 """
 Compat layer for OpenAI SDKs:
 - Prefer SDK v1 (`from openai import OpenAI`) if available
-- Fallback to legacy v0 (`import openai` and use `openai.ChatCompletion.create`)
+- Fallback to older v0-style SDK (`import openai` and use `openai.ChatCompletion.create`)
 This avoids `'NoneType' object is not callable'` when v1 class is missing.
 """
 try:  # SDK v1
@@ -409,7 +328,7 @@ try:  # SDK v1
     import openai as _openai  # for typing/usage extraction
     _OPENAI_STYLE = "v1"
 except Exception:  # pragma: no cover
-    try:  # Legacy v0
+    try:  # older v0-style SDK
         import openai as _openai  # type: ignore
         _OpenAI = None  # type: ignore
         _OPENAI_STYLE = "v0"
@@ -442,17 +361,26 @@ def _build_system_prompt(
     """
     dont = ", ".join(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
     spec = getattr(SETTINGS, "translator_specialization", "")
+    brand = getattr(SETTINGS, "translator_brand", "")
+    audience = getattr(SETTINGS, "translator_audience", "")
     src_name = getattr(SETTINGS, "source_language_name", "italiano")
     domain_line = (
         f"Sei un traduttore tecnico specializzato in {spec}, conosci i termini specifici del dominio. "
         if spec else "Sei un traduttore tecnico accurato. "
     )
+    brand_line = (
+        f"Lavori sui contenuti di {brand} per un pubblico di {audience}. "
+        if brand or audience else ""
+    )
     base = (
         domain_line
+        + brand_line
         + f"Traduci da {src_name} a {target_locale} il contenuto del campo '{field}' "
         + f"per il tipo '{type_name}'. Non tradurre marchi, unità di misura, sigle e i seguenti termini esatti: {dont}. "
-        + "Mantieni numeri, codici e punteggiatura. Non aggiungere frasi, esempi, brand o informazioni che non sono presenti nel testo originale. "
-        + "Non inventare marchi. Niente markdown o spiegazioni; restituisci solo il testo tradotto."
+        + "Mantieni numeri, codici, compatibilità, modelli, liste e punteggiatura. "
+        + "Traduci in modo fedele: non aggiungere frasi, esempi, keyword, brand o informazioni che non sono presenti nel testo originale. "
+        + "Non inventare marchi, accessori o dotazioni. Non riscrivere liberamente per fare SEO. "
+        + "Niente markdown o spiegazioni; restituisci solo il testo tradotto."
     )
     if field == "meta_title":
         if type_name == "PRODUCT":
@@ -473,6 +401,57 @@ def _hash_text(s: str) -> str:
 
 
 PLACEHOLDER_PREFIX_RE = r"^\[[a-z]{2}(?:-[A-Z]{2})?\]\s"
+
+
+def _html_tag_inventory(html: str) -> dict[str, int]:
+    try:
+        soup = BeautifulSoup(html or "", "html5lib")
+        inv: dict[str, int] = {}
+        for tag in soup.find_all(True):
+            name = (tag.name or "").lower()
+            inv[name] = inv.get(name, 0) + 1
+        return inv
+    except Exception:
+        return {}
+
+
+def _html_tag_sequence(html: str) -> list[str]:
+    try:
+        soup = BeautifulSoup(html or "", "html5lib")
+        return [(tag.name or "").lower() for tag in soup.find_all(True)]
+    except Exception:
+        return []
+
+
+def _html_protected_attr_sequence(html: str) -> list[tuple[str, str, str]]:
+    try:
+        soup = BeautifulSoup(html or "", "html5lib")
+        out: list[tuple[str, str, str]] = []
+        for tag in soup.find_all(True):
+            name = (tag.name or "").lower()
+            for attr_name in ("href", "src"):
+                if tag.has_attr(attr_name):
+                    out.append((name, attr_name, str(tag.get(attr_name) or "")))
+        return out
+    except Exception:
+        return []
+
+
+def _is_html_translation_structure_safe(source_html: str, translated_html: str) -> bool:
+    src = _html_tag_inventory(source_html)
+    dst = _html_tag_inventory(translated_html)
+    if not src:
+        return bool(translated_html)
+    if set(dst.keys()) - set(src.keys()):
+        return False
+    for tag_name, count in src.items():
+        if dst.get(tag_name, 0) != count:
+            return False
+    if _html_tag_sequence(source_html) != _html_tag_sequence(translated_html):
+        return False
+    if _html_protected_attr_sequence(source_html) != _html_protected_attr_sequence(translated_html):
+        return False
+    return True
 
 
 class Translator:
@@ -576,7 +555,7 @@ class Translator:
                 snippet_req=text[: SETTINGS.log_payload_max],
             )
         t0 = time.perf_counter()
-        # SDK v1 vs legacy v0
+        # SDK v1 vs older v0-style SDK
         if hasattr(client, "chat") and hasattr(client.chat, "completions"):
             resp = client.chat.completions.create(
                 model=self.model,
@@ -926,7 +905,7 @@ class Translator:
             pass
         return translated
 
-    def translate_html(
+    def translate_html_document(
         self,
         type_name: str,
         field: str,
@@ -934,261 +913,54 @@ class Translator:
         target_locale: str,
         dnt: DoNotTranslateConfig,
         exclude_similarity_tokens: Sequence[str],
-        *,
-        strict: bool = False,
     ) -> str:
-        """
-        Traduce HTML:
-        - Protegge Liquid ({{ }}, {% %}, {% raw %}...{% endraw %})
-        - Estrae segmenti testuali -> [[T#]]
-        - Cache per segmento
-        - Una call OpenAI per i miss (JSON {"translations":[...]})
-        - Parsing JSON tollerante; non ferma la pipeline
-        - Re-inietta testi e poi Liquid
-        - Similarità/lang: solo log
-        """
         html_in = html or ""
+        if not html_in.strip():
+            return ""
 
-        # Cell-level cache (intero HTML pronto): early-return se presente
         try:
             if not self.ignore_cache:
-                # per la firma usa exclude_similarity_tokens come nel resto della pipeline
-                dnt = dnt  # no-op per chiarezza tipo
                 cell_key = self._cell_key_html(type_name, field, target_locale, html_in, exclude_similarity_tokens)
                 found = self.cache.get_cell(cell_key)
                 if found and isinstance(found.get("value"), str):
                     self.cache_hits += 1
-                    logger.info("cell_cache_hit_html", type_name=type_name, field=field)
+                    logger.info("cell_cache_hit_html_document", type_name=type_name, field=field)
                     return found["value"]
         except Exception:
             pass
 
-        # 0) Protezione Liquid
-        liquid_map: dict[int, str] = {}
-        if detect_has_liquid(html_in):
-            html_prot, liquid_map = protect_liquid(html_in)
-            logger.info("liquid_protected", count=len(liquid_map))
-        else:
-            html_prot = html_in
+        try:
+            self.cache_misses += 1
+        except Exception:
+            pass
 
-        # 1) Estrazione segmenti testuali
-        html_map, segments = extract_text_segments(html_prot)
+        dont = ", ".join(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
+        system = (
+            _build_system_prompt(type_name, field, target_locale, dnt, strict=True)
+            + " Riceverai un documento HTML completo. "
+            + "Traduci solo il testo visibile e mantieni intatta la struttura HTML esistente. "
+            + "Usa esclusivamente i tag già presenti nell'input: non aggiungere nuovi tag, non rimuovere tag esistenti e non cambiare il numero dei tag. "
+            + "Non aggiungere heading nuovi come h1, h2, h3, né paragrafi, liste, tabelle o line break non presenti. "
+            + "Se trovi una lista o una sezione di compatibilità tra modelli/macchine/ricambi, mantienila rigorosamente invariata nella struttura, nell'ordine e nei riferimenti tecnici; non trasformarla in testo discorsivo. "
+            + f"Non tradurre marchi, unità, codici, SKU, modelli e questi termini esatti: {dont}. "
+            + "Restituisci solo HTML valido."
+        )
 
-        # 2) Cache per segmenti
-        cached_out: dict[int, str] = {}
-        todo: list[str] = []
-        idxs: list[int] = []
-        for i, seg in enumerate(segments):
-            text_norm = normalize_text(seg)
-            use_seg_cache = (
-                (not self.ignore_cache)
-                and getattr(SETTINGS, "segment_cache_html", False)
-                and len(text_norm) >= getattr(SETTINGS, "segment_cache_min_chars", 4)
-            )
-            if use_seg_cache:
-                key = self._cache_key(type_name, field, target_locale, text_norm)
-                entry = self.cache.get(key)
-                translated = (entry.get("translated") or "").strip() if entry else ""
-                if translated:
-                    cached_out[i] = translated
-                else:
-                    todo.append(seg)
-                    idxs.append(i)
-            else:
-                # Skip segment-cache for this piece (too short or disabled) → force translate
-                todo.append(seg)
-                idxs.append(i)
+        if self.dry_run:
+            return html_in
 
-        hits = len(cached_out)
-        misses = len(todo)
-        if hits:
-            self.cache_hits += hits
-            logger.info("cache_hit_html", type_name=type_name, field=field, segments=hits)
-        if misses:
-            self.cache_misses += misses
-            logger.info("cache_miss_html", type_name=type_name, field=field, segments=misses)
+        translated, _meta = self._unpack_openai_resp(self._call_openai(system, html_in))
+        out_html = (translated or "").strip()
+        if not out_html:
+            return html_in
+        if not _is_html_translation_structure_safe(html_in, out_html):
+            logger.warning("html_document_validation_failed", field=field, reason="tag_structure_changed")
+            return html_in
 
-        # 3) Traduzione miss: per blocchi (default) o unica batch per segmenti (legacy)
-        fresh_map: dict[int, str] = {}
-        # In strict mode for HTML, force 'segment' to reduce cross-segment hallucinations
-        mode = ("segment" if strict else getattr(SETTINGS, "html_translate_mode", "block")).strip().lower()
-        if misses > 0 and not self.dry_run:
-            dont = list(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
-            if mode == "block":
-                # Costruisci gruppi di indici per blocco (p, li, h1..h6, blockquote, figcaption, td, th, dt, dd)
-                try:
-                    soup2 = BeautifulSoup(html_map or "", "html5lib")
-                    root2 = soup2.body if soup2.body else soup2
-                    # Allow customization of block tags via settings
-                    try:
-                        BLOCK_TAGS = SETTINGS.get_html_block_tags() or {"p","li","h1","h2","h3","h4","h5","h6","blockquote","figcaption","td","th","dt","dd"}
-                    except Exception:
-                        BLOCK_TAGS = {"p","li","h1","h2","h3","h4","h5","h6","blockquote","figcaption","td","th","dt","dd"}
-                    # raccogli gruppi in ordine
-                    groups: list[list[int]] = []
-                    seen = set()
-                    import re as _re
-                    ph_re = _re.compile(r"\[\[T(\d+)\]\]")
-                    for el in root2.find_all(BLOCK_TAGS):
-                        inner = el.decode_contents()
-                        idxs_in = [int(m.group(1)) for m in ph_re.finditer(inner)]
-                        if idxs_in:
-                            groups.append(idxs_in)
-                            for _i in idxs_in:
-                                seen.add(_i)
-                    # aggiungi eventuali indici non coperti da blocchi
-                    all_idxs = list(range(len(segments)))
-                    for i in all_idxs:
-                        if i not in seen:
-                            groups.append([i])
-                except Exception:
-                    groups = [idxs]  # fallback: tutti i miss insieme
-
-                # Per ogni gruppo, chiedi traduzione in ordine (lista), tenendo conto dei cache hit
-                for g in groups:
-                    # Costruisci la lista completa dei testi del gruppo (non solo miss) per dare contesto
-                    values = [segments[i] for i in g]
-                    system = (
-                        _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
-                        + " Considera l'intero elenco come un paragrafo unico; traduci ogni elemento usando il contesto degli altri."
-                        + " Restituisci SOLO un oggetto JSON con chiave 'translations' (lista di stringhe) nello stesso ordine dell'elenco fornito."
-                    )
-                    user_payload = json.dumps(
-                        {"target_locale": target_locale, "field": field, "do_not_translate": dont, "segments": values},
-                        ensure_ascii=False,
-                    )
-                    try:
-                        resp = self._call_openai(system=system, text=user_payload)
-                        resp_text = resp[0] if isinstance(resp, tuple) else resp
-                        obj = _safe_json_loads(resp_text)
-                        arr = obj.get("translations")
-                        if not isinstance(arr, list):
-                            raise ValueError("missing 'translations' list")
-                        # riallinea lunghezze
-                        if len(arr) < len(values):
-                            arr += [""] * (len(values) - len(arr))
-                        elif len(arr) > len(values):
-                            arr = arr[: len(values)]
-                    except Exception as e:
-                        logger.error(
-                            "openai_json_error",
-                            error=str(e),
-                            sample=_snippet_ell(resp_text if 'resp_text' in locals() else "", 500),
-                            field=field,
-                        )
-                        arr = values  # no-op fallback
-                    # Applica a tutte le posizioni del gruppo e aggiorna cache segmenti
-                    for j, out_txt in enumerate(arr):
-                        idx = g[j]
-                        val = str(out_txt) if out_txt is not None else ""
-                        # Length guard in strict mode: evita aggiunte eccessive
-                        if strict:
-                            src_seg = values[j] if j < len(values) else ""
-                            try:
-                                max_len = max(int(len(src_seg) * 1.6), len(src_seg) + 80)
-                                if len(val) > max_len:
-                                    # taglia alla prima frase che rientra nel limite
-                                    cut = val[:max_len]
-                                    for p in [". ", "! ", "? "]:
-                                        k = cut.rfind(p)
-                                        if k > 20:  # evita tagli troppo corti
-                                            cut = cut[: k + 1]
-                                            break
-                                    val = cut
-                            except Exception:
-                                pass
-                        fresh_map[idx] = val
-                        # Optionally update segment-cache for longer segments if enabled
-                        if getattr(SETTINGS, "segment_cache_html", False):
-                            norm_i = normalize_text(segments[idx])
-                            if len(norm_i) >= getattr(SETTINGS, "segment_cache_min_chars", 4):
-                                key = self._cache_key(type_name, field, target_locale, norm_i)
-                                self.cache.set(key, {"translated": val}, model=self.model)
-                logger.info("openai_call_html", type_name=type_name, field=field, segments=misses, mode="block")
-            else:
-                # Legacy: unica batch per tutti i miss
-                payload = {
-                    "target_locale": target_locale,
-                    "field": field,
-                    "do_not_translate": dont,
-                    "segments": todo,
-                }
-                system = (
-                    _build_system_prompt(type_name, field, target_locale, dnt, strict=strict)
-                    + " Restituisci SOLO un oggetto JSON con chiave 'translations' (lista di stringhe) nello stesso ordine di 'segments'."
-                )
-                logger.info("openai_call_html", type_name=type_name, field=field, segments=len(todo), mode="segment")
-                try:
-                    resp = self._call_openai(system=system, text=json.dumps(payload, ensure_ascii=False))
-                    resp_text = resp[0] if isinstance(resp, tuple) else resp  # compat log meta
-                    obj = _safe_json_loads(resp_text)
-                    translations = obj.get("translations")
-                    if not isinstance(translations, list):
-                        raise ValueError("missing 'translations' list")
-                    translated_list = [str(x) if x is not None else "" for x in translations]
-                    # Length guard in strict mode (segment path)
-                    if strict:
-                        safe_list: list[str] = []
-                        for j, val in enumerate(translated_list):
-                            src_seg = todo[j] if j < len(todo) else ""
-                            try:
-                                max_len = max(int(len(src_seg) * 1.6), len(src_seg) + 80)
-                                if len(val) > max_len:
-                                    cut = val[:max_len]
-                                    for p in [". ", "! ", "? "]:
-                                        k = cut.rfind(p)
-                                        if k > 20:
-                                            cut = cut[: k + 1]
-                                            break
-                                    val = cut
-                            except Exception:
-                                pass
-                            safe_list.append(val)
-                        translated_list = safe_list
-                except Exception as e:
-                    logger.error(
-                        "openai_json_error",
-                        error=str(e),
-                        sample=_snippet_ell(resp_text if 'resp_text' in locals() else "", 500),
-                        field=field,
-                    )
-                    translated_list = list(todo)  # fallback no-op
-                for pos, txt in zip(idxs, translated_list, strict=False):
-                    fresh_map[pos] = txt
-                    if getattr(SETTINGS, "segment_cache_html", False):
-                        norm = normalize_text(todo[idxs.index(pos)])
-                        if len(norm) >= getattr(SETTINGS, "segment_cache_min_chars", 4):
-                            key = self._cache_key(
-                                type_name,
-                                field,
-                                target_locale,
-                                norm,
-                            )
-                            self.cache.set(key, {"translated": txt}, model=self.model)
-        # 4) Ricostruzione segmenti completi (aggiusta spazi attorno a *...*/_..._)
-        translated_segments: list[str] = []
-        for i in range(len(segments)):
-            if i in cached_out:
-                val = _preserve_edge_whitespace(segments[i], cached_out[i])
-                translated_segments.append(_fix_inline_markdown_spacing(val))
-            elif i in fresh_map:
-                val = _preserve_edge_whitespace(segments[i], fresh_map[i])
-                translated_segments.append(_fix_inline_markdown_spacing(val))
-            else:
-                translated_segments.append(segments[i])
-
-        # 5) Re-iniezione testi e Liquid
-        out_html = reinject_text(html_map, translated_segments)
-        if liquid_map:
-            out_html = unprotect_liquid(out_html, liquid_map)
-
-        # Nessun log di similarità/lingua
-        # Salva cell-level cache (HTML completo) per futuri hit
         try:
             if not self.ignore_cache:
                 cell_key = self._cell_key_html(type_name, field, target_locale, html_in, exclude_similarity_tokens)
-                meta = {"segments": len(segments)}
-                self.cache.set_cell(cell_key, out_html, self.model, meta=meta)
+                self.cache.set_cell(cell_key, out_html, self.model, meta={"mode": "full_document"})
         except Exception:
             pass
         return out_html
@@ -1210,15 +982,13 @@ class Translator:
         text  = default_content or ""
 
         if field == "body_html":
-            # Usa strict=True per ridurre inserimenti non desiderati (no frasi/brand aggiunti)
-            return self.translate_html(
-                type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens, strict=True
+            return self.translate_html_document(
+                type_name, field, default_content, target_locale, dnt, exclude_similarity_tokens
             )
         
         if detect_has_liquid(text):
-            # Campi con Liquid: usa strict=True
-            return self.translate_html(
-                type_name, field, text, target_locale, dnt, exclude_similarity_tokens, strict=True
+            return self.translate_html_document(
+                type_name, field, text, target_locale, dnt, exclude_similarity_tokens
             )
 
         if field == "handle":
@@ -1306,6 +1076,7 @@ class Translator:
         exclude_similarity_tokens: Sequence[str],
         *,
         batch_size: int = 8,
+        should_translate_leaf: Callable[[tuple, str], bool] | None = None,
     ) -> str:
         """
         Traduce solo i VALORI (leaf string) del JSON, saltando numeri/unità/URL.
@@ -1385,6 +1156,11 @@ class Translator:
 
         for i, seg in enumerate(leaves):
             s = (seg or "").strip()
+            path = paths[i]
+            if should_translate_leaf and not should_translate_leaf(path, s):
+                cached_out[i] = s
+                logger.info("json_segment_skipped", reason="policy_skip")
+                continue
             if (
                 not s
                 or is_technical_value(s)

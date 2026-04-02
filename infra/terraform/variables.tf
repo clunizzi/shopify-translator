@@ -14,6 +14,18 @@ variable "receiver_zip" {
   type        = string
 }
 
+variable "receiver_s3_bucket" {
+  description = "S3 bucket name containing receiver.zip (optional)"
+  type        = string
+  default     = ""
+}
+
+variable "receiver_s3_key" {
+  description = "S3 object key for receiver.zip (optional)"
+  type        = string
+  default     = ""
+}
+
 variable "worker_zip" {
   description = "Path to worker lambda zip (leave null when using worker_s3_bucket/key)"
   type        = string
@@ -33,13 +45,6 @@ variable "worker_s3_key" {
   default     = ""
 }
 
-variable "shopify_webhook_secret" {
-  description = "Shopify webhook shared secret (optional; prefer ARN)"
-  type        = string
-  sensitive   = true
-  default     = ""
-}
-
 # When using Secrets Manager, pass ARNs below (recommended). If set, Terraform will
 # not inject plaintext values and Lambdas will fetch secrets at runtime.
 variable "openai_api_key_secret_arn" {
@@ -54,6 +59,12 @@ variable "shopify_admin_token_secret_arn" {
   default     = ""
 }
 
+variable "neon_database_url_secret_arn" {
+  description = "Secrets Manager ARN for Neon PostgreSQL connection string"
+  type        = string
+  default     = ""
+}
+
 variable "shopify_webhook_secret_arn" {
   description = "Secrets Manager ARN for webhook secret"
   type        = string
@@ -63,13 +74,6 @@ variable "shopify_webhook_secret_arn" {
 variable "shop_domain" {
   description = "Shop domain, e.g. myshop.myshopify.com"
   type        = string
-}
-
-variable "shopify_admin_token" {
-  description = "Admin access token (optional; prefer ARN)"
-  type        = string
-  sensitive   = true
-  default     = ""
 }
 
 variable "source_locale" {
@@ -86,12 +90,6 @@ variable "target_locales" {
 
 variable "mf_include" {
   description = "Comma list of namespace.key to include"
-  type        = string
-  default     = ""
-}
-
-variable "mf_json_paths" {
-  description = "Comma list of JSON path rules"
   type        = string
   default     = ""
 }
@@ -120,8 +118,14 @@ variable "dry_run" {
   default     = "false"
 }
 
-variable "fill_missing_translations" {
-  description = "Backfill missing locale translations on update"
+variable "disable_sync" {
+  description = "Temporarily disable receiver/worker processing"
+  type        = string
+  default     = "false"
+}
+
+variable "log_verbose_sync" {
+  description = "Emit verbose Shopify payload debug logs from worker"
   type        = string
   default     = "false"
 }

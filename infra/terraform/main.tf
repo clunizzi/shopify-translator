@@ -99,14 +99,15 @@ resource "aws_lambda_function" "receiver" {
   role          = aws_iam_role.receiver.arn
   handler       = "src/aws_lambda/receiver.handler"
   runtime       = "python3.12"
-  filename      = var.receiver_zip
-  source_code_hash = filebase64sha256(var.receiver_zip)
+  filename         = (var.receiver_s3_bucket == "" && var.receiver_s3_key == "") ? var.receiver_zip : null
+  s3_bucket        = var.receiver_s3_bucket != "" ? var.receiver_s3_bucket : null
+  s3_key           = var.receiver_s3_key    != "" ? var.receiver_s3_key    : null
+  source_code_hash = (var.receiver_s3_bucket == "" && var.receiver_s3_key == "") ? filebase64sha256(var.receiver_zip) : null
   environment {
     variables = {
       SQS_URL                    = aws_sqs_queue.products.id
       SHOPIFY_WEBHOOK_SECRET_ARN = var.shopify_webhook_secret_arn
-      # Optional fallback for testing only (avoid using in prod):
-      # SHOPIFY_WEBHOOK_SECRET   = var.shopify_webhook_secret
+      DISABLE_SYNC               = var.disable_sync
     }
   }
 }
@@ -157,7 +158,8 @@ resource "aws_iam_role_policy" "worker" {
         Action   = ["secretsmanager:GetSecretValue"],
         Resource = compact([
           var.openai_api_key_secret_arn,
-          var.shopify_admin_token_secret_arn
+          var.shopify_admin_token_secret_arn,
+          var.neon_database_url_secret_arn
         ])
       },
       {
@@ -193,16 +195,17 @@ resource "aws_lambda_function" "worker" {
       SOURCE_LOCALE    = var.source_locale
       TARGET_LOCALES   = var.target_locales
       MF_INCLUDE       = var.mf_include
-      MF_JSON_PATHS    = var.mf_json_paths
       SHOP_DOMAIN      = var.shop_domain
       # Secrets Manager ARNs for runtime retrieval
       OPENAI_API_KEY_SECRET_ARN      = var.openai_api_key_secret_arn
       SHOPIFY_ADMIN_TOKEN_SECRET_ARN = var.shopify_admin_token_secret_arn
+      NEON_DATABASE_URL_SECRET_ARN   = var.neon_database_url_secret_arn
       REQUEST_TIMEOUT  = var.request_timeout
       RETRIES          = var.retries
       DEBOUNCE_SECONDS = var.debounce_seconds
       DRY_RUN          = var.dry_run
-      FILL_MISSING_TRANSLATIONS = var.fill_missing_translations
+      DISABLE_SYNC     = var.disable_sync
+      LOG_VERBOSE_SYNC = var.log_verbose_sync
       # Prompt specialization (optional)
       TRANSLATOR_SPECIALIZATION = var.translator_specialization
       SOURCE_LANGUAGE_NAME      = var.source_language_name

@@ -15,9 +15,14 @@ class TranslationCache:
         - Default path comes from env TRANSLATION_CACHE_PATH or 'state/cache.sqlite'.
         - If the filesystem is read-only (e.g., AWS Lambda), falls back to '/tmp/cache.sqlite'.
         """
-        desired = Path(
-            db_path if db_path is not None else os.getenv("TRANSLATION_CACHE_PATH", "state/cache.sqlite")
-        )
+        raw_path = db_path if db_path is not None else os.getenv("TRANSLATION_CACHE_PATH", "state/cache.sqlite")
+        if str(raw_path).strip() == ":memory:":
+            self.path = raw_path
+            self.conn = sqlite3.connect(":memory:")
+            self._init()
+            return
+
+        desired = Path(raw_path)
         self.path = desired
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

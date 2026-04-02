@@ -1,7 +1,7 @@
 [project]
 name = "shopify-translator"
 version = "0.1.1"
-description = "Pipeline modulare per tradurre contenuti Shopify da CSV con OpenAI"
+description = "Traduzione Shopify field-by-field con OpenAI, Neon e sync AWS"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Your Org" }]
@@ -19,7 +19,8 @@ dependencies = [
   "pandas>=2.2.2",
   "structlog>=24.1.0",
   "openai>=1.40.0",
-  "PyYAML>=6.0.2"
+  "PyYAML>=6.0.2",
+  "psycopg[binary]>=3.2.1"
 ]
 
 [project.optional-dependencies]
