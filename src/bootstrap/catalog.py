@@ -11,6 +11,7 @@ from src.config.dnt_loader import load_do_not_translate
 from src.config.field_policies import DEFAULT_HANDLE_POLICY, should_translate_product_key
 from src.config.metafield_policies import make_metafield_leaf_filter, should_translate_metafield
 from src.config.settings import SETTINGS
+from src.rules.option_value import should_skip_option_name, should_skip_option_value_name
 from src.shopify.graphql import (
     get_product_all_metafields,
     get_product_metafields_by_keys,
@@ -133,6 +134,12 @@ def build_pdp_document(
             if not value.strip():
                 continue
             kind = "option_name" if resource_id.startswith("gid://shopify/ProductOption/") else "option_value"
+            if kind == "option_name":
+                skip, _ = should_skip_option_name(value)
+            else:
+                skip, _ = should_skip_option_value_name(value, [])
+            if skip:
+                continue
             entry_key = f"{kind}::{resource_id}"
             document["options"][entry_key] = {
                 "resource_id": resource_id,

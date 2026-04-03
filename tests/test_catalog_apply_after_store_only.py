@@ -243,3 +243,24 @@ def test_build_pdp_document_includes_option_names_and_values():
     assert document["options"]["option_value::gid://shopify/ProductOptionValue/10"]["value"] == "Rosso"
     assert "option.option_name::gid://shopify/ProductOption/1" in section_hashes
     assert "option.option_value::gid://shopify/ProductOptionValue/10" in section_hashes
+
+
+def test_build_pdp_document_skips_default_title_and_title_option():
+    document, section_hashes = catalog.build_pdp_document(
+        shop_domain="agri-eden.myshopify.com",
+        product_gid="gid://shopify/Product/123",
+        metafields=[],
+        live_map={
+            "gid://shopify/ProductOption/1": [{"key": "name", "value": "Title", "digest": "d1", "locale": "it"}],
+            "gid://shopify/ProductOptionValue/10": [{"key": "name", "value": "Default Title", "digest": "d2", "locale": "it"}],
+            "gid://shopify/ProductOptionValue/11": [{"key": "name", "value": "Rosso", "digest": "d3", "locale": "it"}],
+        },
+        source_locale="it",
+        is_create=False,
+        existing_product=True,
+    )
+
+    assert "option_name::gid://shopify/ProductOption/1" not in document["options"]
+    assert "option_value::gid://shopify/ProductOptionValue/10" not in document["options"]
+    assert document["options"]["option_value::gid://shopify/ProductOptionValue/11"]["value"] == "Rosso"
+    assert "option.option_value::gid://shopify/ProductOptionValue/10" not in section_hashes
