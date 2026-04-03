@@ -214,3 +214,31 @@ async def get_product_all_metafields(product_gid: str, allowed_types: list[str] 
         if not cursor:
             break
     return out
+
+
+async def get_product_option_resources(product_gid: str) -> list[dict[str, str]]:
+    q = (
+        "query ProductOptions($pid: ID!) {"
+        "  product(id: $pid) {"
+        "    options {"
+        "      id"
+        "      name"
+        "      optionValues { id name }"
+        "    }"
+        "  }"
+        "}"
+    )
+    data = await _post_graphql(q, {"pid": product_gid})
+    options = (((data.get("data") or {}).get("product") or {}).get("options")) or []
+    out: list[dict[str, str]] = []
+    for option in options:
+        option_id = str(option.get("id") or "")
+        option_name = str(option.get("name") or "")
+        if option_id and option_name:
+            out.append({"resource_id": option_id, "kind": "option_name"})
+        for value in option.get("optionValues") or []:
+            value_id = str(value.get("id") or "")
+            value_name = str(value.get("name") or "")
+            if value_id and value_name:
+                out.append({"resource_id": value_id, "kind": "option_value"})
+    return out

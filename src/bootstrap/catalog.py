@@ -14,6 +14,7 @@ from src.config.settings import SETTINGS
 from src.shopify.graphql import (
     get_product_all_metafields,
     get_product_metafields_by_keys,
+    get_product_option_resources,
     get_resource_translations,
     get_translatable_by_ids,
     make_product_gid,
@@ -48,6 +49,10 @@ def _section_name_metafield(full_key: str) -> str:
     return f"metafield.{full_key}"
 
 
+def _section_name_option(entry_key: str) -> str:
+    return f"option.{entry_key}"
+
+
 async def fetch_product_source_bundle(
     product_numeric_id: str | int,
     mf_include: list[tuple[str, str]] | None = None,
@@ -58,7 +63,12 @@ async def fetch_product_source_bundle(
         metafields = await get_product_metafields_by_keys(product_gid, mf_include)
     else:
         metafields = await get_product_all_metafields(product_gid, allowed_types=AUTO_TYPES)
-    resource_ids = [product_gid, *[m["id"] for m in metafields if m.get("id")]]
+    option_resources = await get_product_option_resources(product_gid)
+    resource_ids = [
+        product_gid,
+        *[m["id"] for m in metafields if m.get("id")],
+        *[o["resource_id"] for o in option_resources if o.get("resource_id")],
+    ]
     live_map = await get_translatable_by_ids(resource_ids)
     translations_by_locale: dict[str, dict[str, str]] = {}
     for locale in (target_locales or []):
@@ -86,8 +96,10 @@ def build_pdp_document(
         "source_locale": source_locale,
         "product": {},
         "metafields": {},
+        "options": {},
     }
     section_hashes: dict[str, str] = {}
+    option_resource_ids = {entry.get("id") for entry in live_map.get(product_gid, []) if entry.get("id")}
 
     for resource_id, entries in live_map.items():
         if resource_id == product_gid:
@@ -111,6 +123,27 @@ def build_pdp_document(
                     "locale": entry.get("locale") or source_locale,
                 }
                 section_hashes[section_name] = make_source_hash(value)
+            continue
+
+        if resource_id.startswith("gid://shopify/ProductOption") or resource_id.startswith("gid://shopify/ProductOptionValue"):
+            live_entry = next((x for x in entries if (x.get("key") or "") == "name"), None)
+            if not live_entry:
+                continue
+            value = live_entry.get("value") or ""
+            if not value.strip():
+                continue
+            kind = "option_name" if resource_id.startswith("gid://shopify/ProductOption/") else "option_value"
+            entry_key = f"{kind}::{resource_id}"
+            document["options"][entry_key] = {
+                "resource_id": resource_id,
+                "key": "name",
+                "entry_kind": kind,
+                "content_kind": "plain",
+                "value": value,
+                "digest": live_entry.get("digest"),
+                "locale": live_entry.get("locale") or source_locale,
+            }
+            section_hashes[_section_name_option(entry_key)] = make_source_hash(value)
             continue
 
         meta = meta_by_id.get(resource_id) or {}
@@ -272,6 +305,33 @@ def _translate_json_metafield(
     )
 
 
+def _translate_option_entry(
+    store: NeonTranslationStore,
+    translator: Translator,
+    entry: dict[str, Any],
+    *,
+    target_locale: str,
+    source_locale: str,
+    dnt,
+    exclude_tokens: list[str],
+) -> tuple[str, str]:
+    category = entry["entry_kind"]
+    field = "option_name" if category == "option_name" else "option_value_name"
+    translated_value, source_kind = _translate_dictionary_backed_plain(
+        store,
+        translator,
+        entry["value"],
+        category=category,
+        memory_key=f"option.{category}",
+        source_locale=source_locale,
+        target_locale=target_locale,
+        existing_translation=None,
+        dnt=dnt,
+        exclude_tokens=exclude_tokens,
+    )
+    return translated_value, source_kind
+
+
 def translate_pdp_document(
     *,
     store: NeonTranslationStore,
@@ -294,6 +354,7 @@ def translate_pdp_document(
         "target_locale": target_locale,
         "product": {},
         "metafields": {},
+        "options": {},
     }
     translated_hashes: dict[str, str] = {}
     payloads: list[dict] = []
@@ -436,6 +497,95 @@ def translate_pdp_document(
                 "translatableContentDigest": entry.get("digest") or "",
             }
         )
+
+    for entry_key, entry in source_document.get("options", {}).items():
+        section_name = _section_name_option(entry_key)
+        if section_name not in changed_sections:
+            continue
+        translated_value, source_kind = _translate_option_entry(
+            store,
+            translator,
+            entry,
+            target_locale=target_locale,
+            source_locale=source_locale,
+            dnt=dnt,
+            exclude_tokens=exclude_tokens,
+        )
+        translated_document["options"][entry_key] = translated_value
+        translated_hashes[section_name] = make_source_hash(entry["value"])
+        section_sources[section_name] = source_kind
+        payloads.append(
+            {
+                "resource_id": entry["resource_id"],
+                "key": entry["key"],
+                "locale": target_locale,
+                "value": translated_value,
+                "translatableContentDigest": entry.get("digest") or "",
+            }
+        )
+
+    return translated_document, translated_hashes, payloads, section_sources
+
+
+def build_pdp_payloads_from_stored_translation(
+    *,
+    source_document: dict[str, Any],
+    stored_document: dict[str, Any],
+    target_locale: str,
+    changed_sections: set[str],
+) -> tuple[dict[str, Any], dict[str, str], list[dict], dict[str, str]] | None:
+    translated_document: dict[str, Any] = {
+        "product_gid": source_document["product_gid"],
+        "shop_domain": source_document["shop_domain"],
+        "source_locale": source_document["source_locale"],
+        "target_locale": target_locale,
+        "product": {},
+        "metafields": {},
+        "options": {},
+    }
+    translated_hashes: dict[str, str] = {}
+    payloads: list[dict] = []
+    section_sources: dict[str, str] = {}
+    stored_product = dict((stored_document or {}).get("product") or {})
+    stored_metafields = dict((stored_document or {}).get("metafields") or {})
+    stored_options = dict((stored_document or {}).get("options") or {})
+
+    for section_name in changed_sections:
+        if section_name.startswith("product."):
+            key = section_name.split(".", 1)[1]
+            source_entry = source_document["product"].get(key)
+            if not source_entry or key not in stored_product:
+                return None
+            translated_value = str(stored_product[key])
+            translated_document["product"][key] = translated_value
+        elif section_name.startswith("metafield."):
+            key = section_name.split(".", 1)[1]
+            source_entry = source_document["metafields"].get(key)
+            if not source_entry or key not in stored_metafields:
+                return None
+            translated_value = str(stored_metafields[key])
+            translated_document["metafields"][key] = translated_value
+        elif section_name.startswith("option."):
+            key = section_name.split(".", 1)[1]
+            source_entry = source_document["options"].get(key)
+            if not source_entry or key not in stored_options:
+                return None
+            translated_value = str(stored_options[key])
+            translated_document["options"][key] = translated_value
+        else:
+            return None
+
+        translated_hashes[section_name] = make_source_hash(source_entry["value"])
+        payloads.append(
+            {
+                "resource_id": source_entry["resource_id"],
+                "key": source_entry["key"],
+                "locale": target_locale,
+                "value": translated_value,
+                "translatableContentDigest": source_entry.get("digest") or "",
+            }
+        )
+        section_sources[section_name] = "stored_translation_state"
 
     return translated_document, translated_hashes, payloads, section_sources
 
@@ -613,16 +763,32 @@ async def process_product_bundle(
                 if previous_translation.section_hashes.get(section_name) != source_hash:
                     locale_changed_sections.add(section_name)
 
-        translated_document, translated_hashes, payloads, section_sources = translate_pdp_document(
-            store=store,
-            source_document=source_document,
-            changed_sections=locale_changed_sections,
-            target_locale=target_locale,
-            source_locale=source_locale,
-            translator=translator,
-            existing_product=effective_existing,
-            existing_shopify_translations=existing_translations.get(target_locale, {}),
-        )
+        reused = None
+        if (
+            previous_translation is not None
+            and previous_translation.status != "synced"
+            and previous_translation.section_hashes == section_hashes
+        ):
+            reused = build_pdp_payloads_from_stored_translation(
+                source_document=source_document,
+                stored_document=previous_translation.document or {},
+                target_locale=target_locale,
+                changed_sections=locale_changed_sections,
+            )
+
+        if reused is not None:
+            translated_document, translated_hashes, payloads, section_sources = reused
+        else:
+            translated_document, translated_hashes, payloads, section_sources = translate_pdp_document(
+                store=store,
+                source_document=source_document,
+                changed_sections=locale_changed_sections,
+                target_locale=target_locale,
+                source_locale=source_locale,
+                translator=translator,
+                existing_product=effective_existing,
+                existing_shopify_translations=existing_translations.get(target_locale, {}),
+            )
 
         for section_name in locale_changed_sections:
             if section_name.startswith("product."):
@@ -630,9 +796,13 @@ async def process_product_bundle(
                 source_value = source_document["product"][key]["value"]
                 translated_value = translated_document["product"].get(key, "")
             else:
-                full_key = section_name.split(".", 1)[1]
-                source_value = source_document["metafields"][full_key]["value"]
-                translated_value = translated_document["metafields"].get(full_key, "")
+                suffix = section_name.split(".", 1)[1]
+                if section_name.startswith("metafield."):
+                    source_value = source_document["metafields"][suffix]["value"]
+                    translated_value = translated_document["metafields"].get(suffix, "")
+                else:
+                    source_value = source_document["options"][suffix]["value"]
+                    translated_value = translated_document["options"].get(suffix, "")
             store.upsert_translation_memory(
                 source_hash=make_source_hash(source_value),
                 field_key=section_name,

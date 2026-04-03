@@ -73,6 +73,7 @@ class PDPTranslationRecord:
 
 @dataclass(frozen=True)
 class PDPTranslationState:
+    document: dict[str, Any] | None
     section_hashes: dict[str, str]
     status: str
     metadata: dict[str, Any]
@@ -366,7 +367,7 @@ class NeonTranslationStore:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT section_hashes, status, metadata
+                SELECT document, section_hashes, status, metadata
                 FROM pdp_translation_state
                 WHERE shop_domain = %s
                   AND product_gid = %s
@@ -377,10 +378,12 @@ class NeonTranslationStore:
             row = cur.fetchone()
             if not row:
                 return None
-            section_hashes = {str(k): str(v) for k, v in dict(row[0] or {}).items()}
-            status = str(row[1] or "")
-            metadata = dict(row[2] or {})
+            document = dict(row[0] or {})
+            section_hashes = {str(k): str(v) for k, v in dict(row[1] or {}).items()}
+            status = str(row[2] or "")
+            metadata = dict(row[3] or {})
             return PDPTranslationState(
+                document=document,
                 section_hashes=section_hashes,
                 status=status,
                 metadata=metadata,
