@@ -104,11 +104,19 @@ def should_skip_option_value_name(default_content: str, units: Sequence[str]) ->
     """
     Skip per PRODUCT_OPTION_VALUE (Field=name):
     - "Default Title" (o varianti)
+    - numeri + unità senza spazi (es. 1L, 200ml)
     - solo numeri/unità/taglie/codici/separatori
     """
     s = (default_content or "").strip().lower()
     if s in OPTION_VALUE_DEFAULT_TITLE_KEYWORDS:
         return True, "value_default_title"
+    units_set = {u.lower() for u in units}
+    if units_set:
+        for u in units_set:
+            if not u:
+                continue
+            if re.fullmatch(rf"\d+(?:[.,]\d+)?(?:/\d+)?\s*{re.escape(u)}", s):
+                return True, "numbers_with_unit"
     only, reason = is_only_numbers_units_codes(default_content, units)
     if only:
         return True, reason

@@ -4,8 +4,9 @@ SHELL := /bin/bash
 
 build-receiver:
 	@mkdir -p build
+	@rm -f build/receiver.zip
 	# Pack with directory structure preserved (module path: src/aws_lambda/receiver.py)
-	@zip -r build/receiver.zip src/aws_lambda/receiver.py >/dev/null
+	@zip -r build/receiver.zip src/__init__.py src/aws_lambda/__init__.py src/aws_lambda/receiver.py >/dev/null
 	@echo "Built build/receiver.zip"
 
 clean-worker:
@@ -25,6 +26,7 @@ build-worker: clean-worker
 # Usage: make build-worker-docker [PY=3.11]
 build-worker-docker:
 	@PY=$${PY:-3.11}; \
+	NET=$${DOCKER_NETWORK:-host}; \
 	IMG=public.ecr.aws/sam/build-python$$PY; \
 	echo "Using image $$IMG"; \
-	docker run --rm -v "$$PWD":/var/task -w /var/task $$IMG bash -lc "set -euo pipefail; rm -rf build/worker; mkdir -p build/worker; command -v rsync >/dev/null 2>&1 || (yum -y install rsync >/dev/null 2>&1); rsync -a src/ build/worker/src/; python -m pip install --upgrade pip >/dev/null; python -m pip install --no-cache-dir -r requirements_lambda.txt -t build/worker >/dev/null; cd build/worker && zip -r ../worker.zip . >/dev/null; echo 'Built build/worker.zip (Docker)'"
+	docker run --rm --network $$NET -v "$$PWD":/var/task -w /var/task $$IMG bash -lc "set -euo pipefail; rm -rf build/worker; mkdir -p build/worker; command -v rsync >/dev/null 2>&1 || (yum -y install rsync >/dev/null 2>&1); rsync -a src/ build/worker/src/; python -m pip install --upgrade pip >/dev/null; python -m pip install --no-cache-dir -r requirements_lambda.txt -t build/worker >/dev/null; cd build/worker && zip -r ../worker.zip . >/dev/null; echo 'Built build/worker.zip (Docker)'"

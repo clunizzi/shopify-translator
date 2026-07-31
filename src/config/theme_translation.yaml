@@ -1,0 +1,52 @@
+allowed_resource_types:
+  - ONLINE_STORE_THEME_JSON_TEMPLATE
+  - ONLINE_STORE_THEME_SECTION_GROUP
+  - ONLINE_STORE_THEME_LOCALE_CONTENT
+
+# Locale resources also contain Shopify-managed checkout/account strings.
+# List only namespaces owned by your theme or store.
+allowed_locale_key_prefixes:
+  - customloc.
+
+allowed_key_fragments:
+  - announcement
+  - button_label
+  - button_name
+  - caption
+  - description
+  - heading
+  - link_label
+  - link_name
+  - subheading
+  - text
+  - title
+
+blocked_key_fragments:
+  - alignment
+  - autoplay
+  - block_order
+  - collection_handle
+  - color
+  - column
+  - desktop
+  - icon
+  - layout
+  - logo_svg
+  - margin
+  - mobile
+  - opacity
+  - overlay
+  - padding
+  - product_handle
+  - speed
+  - svg
+  - url
+  - width
+
+blocked_value_patterns:
+  - '^\s*$'
+  - '^\s*\{\{.*\}\}\s*$'
+  - '^\s*\{%.*%\}\s*$'
+  - '^\s*<svg[\s>].*</svg>\s*$'
+  - '^\s*https?://'
+  - '^\s*[\[{].*[\]}]\s*$'

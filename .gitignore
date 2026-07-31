@@ -2,13 +2,20 @@
 .env
 .env.*
 .env.local
+.dev.vars
+!.env.example
+!**/.dev.vars.example
 
 # --- Project data & outputs ---
 logs/
 state/
+!src/state/
+!src/state/*.py
 out/
 arn.yaml
 data/
+.codex
+.wrangler/
 
 # --- SQLite / local DB / logs ---
 *.sqlite
@@ -30,8 +37,14 @@ env/
 # --- Build / packaging artifacts ---
 build/
 dist/
+cloudflare-admin/node_modules/
+cloudflare-admin/.wrangler/
+cloudflare-admin/wrangler.production.jsonc
 .eggs/
 *.egg-info/
+
+# --- Store-specific policy overlays ---
+src/config/*.local.yaml
 
 # --- Terraform ---
 infra/terraform/.terraform/
@@ -39,6 +52,19 @@ infra/terraform/.terraform.*
 infra/terraform/terraform.tfstate
 infra/terraform/terraform.tfstate.*
 infra/terraform/.terraform.lock.hcl
+infra/terraform/terraform.tfvars
+*.tfplan
+
+# --- Local Shopify audits / migration exports ---
+comandini
+metafields
+theme_translatable.json
+multi_scren*.jpg
+id_to_trad.csv
+id_to_trad copy.csv
+incomplete.csv
+titolo_mancante.csv
+to_apply.csv
 
 # --- Test & coverage ---
 .pytest_cache/

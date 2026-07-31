@@ -11,3 +11,4 @@ anyio
 sniffio
 typing_extensions
 pydantic>=2
+psycopg[binary]>=3.1

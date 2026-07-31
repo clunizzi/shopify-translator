@@ -1,0 +1,89 @@
+blocked_leaf_names:
+  - date
+  - filename
+  - file_name
+  - format
+  - image
+  - image_url
+  - language
+  - product_handle
+  - product_id
+  - shopify_file_id
+  - shopify_file_url
+  - size
+  - source_url
+  - url
+  - variant_id
+
+blocked_keys:
+  - shopify--discovery--product_recommendation.related_products_display
+
+policies:
+  custom.accessori:
+    allowed_leaf_names:
+      - title
+  custom.accessories:
+    allowed_leaf_names:
+      - title
+  custom.manuals:
+    allowed_leaf_names:
+      - label
+  custom.collapsible_rows:
+    allowed_leaf_names:
+      - altTexts
+      - alt_text
+      - disclaimer
+      - title
+      - description
+  custom.product_characteristics:
+    allowed_leaf_names:
+      - items
+      - text
+  custom.technical_datas:
+    allowed_leaf_names:
+      - label
+      - notes
+      - value
+  custom.technical_data:
+    allowed_leaf_names:
+      - label
+      - notes
+      - value
+  custom.dimensioni:
+    allowed_leaf_names:
+      - descrizione
+      - larghezza
+      - note
+      - tipo_ruota
+  custom.tabellacaratteristicheprincipali:
+    allowed_leaf_names:
+      - valore
+  custom.motori:
+    allowed_leaf_names:
+      - alimentazione
+      - avviamento
+      - raffreddamento
+      - raffredamento
+      - filtro
+  custom.specifiche_tecniche:
+    allowed_leaf_names:
+      - nome
+      - valore
+  custom.peso:
+    allowed_leaf_names:
+      - descrizione
+      - note
+  custom.velocita:
+    allowed_leaf_names:
+      - descrizione
+      - titolo
+      - nome_versione
+  custom.contenuti_avanzati:
+    allowed_leaf_names:
+      - titolo
+      - punti_elenco
+      - alt_text
+  custom.focus:
+    allowed_leaf_names:
+      - titolo
+      - testo

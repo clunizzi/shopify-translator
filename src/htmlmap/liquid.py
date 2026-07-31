@@ -7,6 +7,7 @@ RAW_BLOCK = r"\{\%-?\s*raw\s*\-?\%\}.*?\{\%-?\s*endraw\s*\-?\%\}"
 OUTPUT = r"\{\{\-?.*?\-?\}\}"
 TAG = r"\{\%-?.*?\-?\%\}"
 
+
 def detect_has_liquid(s: str) -> bool:
     """Rileva rapidamente la presenza di Liquid."""
     if not s or "{" not in s:
@@ -16,6 +17,7 @@ def detect_has_liquid(s: str) -> bool:
         or re.search(OUTPUT, s, flags=re.DOTALL) is not None
         or re.search(TAG, s, flags=re.DOTALL) is not None
     )
+
 
 def protect_liquid(html: str) -> tuple[str, dict[int, str]]:
     """
@@ -32,12 +34,14 @@ def protect_liquid(html: str) -> tuple[str, dict[int, str]]:
             mapping[counter] = m.group(0)
             counter += 1
             return ph
+
         return _repl
 
     out = re.sub(RAW_BLOCK, make_repl(), html, flags=re.DOTALL)
     out = re.sub(OUTPUT, make_repl(), out, flags=re.DOTALL)
     out = re.sub(TAG, make_repl(), out, flags=re.DOTALL)
     return out, mapping
+
 
 def unprotect_liquid(html: str, mapping: dict[int, str]) -> str:
     """Reinieziona [[L#]] → Liquid originale."""

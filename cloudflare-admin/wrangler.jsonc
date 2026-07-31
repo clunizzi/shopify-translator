@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "shopify-translation-control",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-05-03",
+  "compatibility_flags": ["nodejs_compat"],
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["**/*.html", "**/*.css", "**/*.txt"],
+      "fallthrough": true
+    }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "SHOP_DOMAIN": "example-store.myshopify.com",
+    "SOURCE_LOCALE": "en",
+    "APPROVED_THEME_ID": "",
+    "TARGET_LOCALES": "fr,de",
+    "AWS_REGION": "eu-central-1",
+    "AWS_THEME_FUNCTION_NAME": "",
+    "AWS_CREDENTIAL_CREATED_AT": "",
+    "CATALOG_POLL_SCHEDULE": "Disabled",
+    "SCHEDULED_SYNC_ENABLED": "false",
+    "THEME_REALTIME_SYNC_ENABLED": "false",
+    "DEPLOYMENT_LOCKED": "true"
+  }
+}

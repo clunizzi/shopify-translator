@@ -4,44 +4,137 @@ import asyncio
 import json
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import boto3
 
-from src.snapshot.sqlite_snapshot import SnapshotStore
+from src.logging_setup import configure_logging
 
 
-import boto3
+@dataclass(frozen=True)
+class WorkerConfig:
+    ddb_table: str
+    dedup_table: str
+    source_locale: str
+    target_locales: list[str]
+    mf_include: list[tuple[str, str]]
+    debounce_seconds: int
+    dry_run: bool
+    shop_domain: str
+    openai_api_key_secret_arn: str
+    shopify_admin_token_secret_arn: str
+    neon_database_url_secret_arn: str
+    disable_sync: bool
+    log_verbose_sync: bool
+    seo_sync_enabled: bool = False
+    theme_tracking_enabled: bool = False
+    theme_realtime_sync_enabled: bool = False
+    approved_theme_id: str = ""
+    sqs_url: str = ""
 
-dynamodb = boto3.resource("dynamodb")
-secrets = boto3.client("secretsmanager")
-ddb_snap = dynamodb.Table(os.environ["DDB_TABLE"])  # product_snapshots
-ddb_dedup = dynamodb.Table(os.environ["DEDUP_TABLE"])  # webhook_dedup
 
-SOURCE_LOCALE = os.environ.get("SOURCE_LOCALE", "en")
-TARGET_LOCALES = [s.strip() for s in os.environ.get("TARGET_LOCALES", "").split(",") if s.strip()]
-MF_INCLUDE = [tuple(s.strip().split(".", 1)) for s in os.environ.get("MF_INCLUDE", "").split(",") if "." in s]
-MF_JSON_PATHS = [s.strip() for s in os.environ.get("MF_JSON_PATHS", "").split(",") if s.strip()]
-DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "20"))
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in {"1", "true", "yes", "y"}
-FILL_MISSING = os.environ.get("FILL_MISSING_TRANSLATIONS", "false").lower() in {"1", "true", "yes", "y"}
-
-# Secrets Manager ARNs (optional but recommended)
-OPENAI_API_KEY_SECRET_ARN = os.environ.get("OPENAI_API_KEY_SECRET_ARN")
-SHOPIFY_ADMIN_TOKEN_SECRET_ARN = os.environ.get("SHOPIFY_ADMIN_TOKEN_SECRET_ARN")
-
+_DYNAMODB = None
+_SECRETS = None
+_SQS = None
 _CACHED_SECRETS: dict[str, str] = {}
 
 
-def _get_secret(arn: str | None) -> str:
+def _config() -> WorkerConfig:
+    return WorkerConfig(
+        ddb_table=os.environ["DDB_TABLE"],
+        dedup_table=os.environ["DEDUP_TABLE"],
+        source_locale=os.environ.get("SOURCE_LOCALE", "en"),
+        target_locales=[
+            s.strip() for s in os.environ.get("TARGET_LOCALES", "").split(",") if s.strip()
+        ],
+        mf_include=[
+            tuple(s.strip().split(".", 1))
+            for s in os.environ.get("MF_INCLUDE", "").split(",")
+            if "." in s
+        ],
+        debounce_seconds=int(os.environ.get("DEBOUNCE_SECONDS", "60")),
+        dry_run=os.environ.get("DRY_RUN", "false").lower() in {"1", "true", "yes", "y"},
+        shop_domain=os.environ.get("SHOP_DOMAIN", ""),
+        openai_api_key_secret_arn=os.environ.get("OPENAI_API_KEY_SECRET_ARN", ""),
+        shopify_admin_token_secret_arn=os.environ.get("SHOPIFY_ADMIN_TOKEN_SECRET_ARN", ""),
+        neon_database_url_secret_arn=os.environ.get("NEON_DATABASE_URL_SECRET_ARN", ""),
+        disable_sync=os.environ.get("DISABLE_SYNC", "false").lower() in {"1", "true", "yes", "y"},
+        log_verbose_sync=os.environ.get("LOG_VERBOSE_SYNC", "false").lower()
+        in {"1", "true", "yes", "y"},
+        seo_sync_enabled=os.environ.get("SEO_SYNC_ENABLED", "false").lower()
+        in {"1", "true", "yes", "y"},
+        theme_tracking_enabled=os.environ.get("THEME_TRACKING_ENABLED", "false").lower()
+        in {"1", "true", "yes", "y"},
+        theme_realtime_sync_enabled=os.environ.get(
+            "THEME_REALTIME_SYNC_ENABLED",
+            "false",
+        ).lower()
+        in {"1", "true", "yes", "y"},
+        approved_theme_id=(
+            os.environ.get("APPROVED_THEME_ID", "") or os.environ.get("THEME_ID", "")
+        ).strip(),
+        sqs_url=os.environ.get("SQS_URL", ""),
+    )
+
+
+def _dynamodb():
+    global _DYNAMODB
+    if _DYNAMODB is None:
+        _DYNAMODB = boto3.resource("dynamodb")
+    return _DYNAMODB
+
+
+def _secrets():
+    global _SECRETS
+    if _SECRETS is None:
+        _SECRETS = boto3.client("secretsmanager")
+    return _SECRETS
+
+
+def _sqs():
+    global _SQS
+    if _SQS is None:
+        _SQS = boto3.client("sqs")
+    return _SQS
+
+
+def _snap_table(cfg: WorkerConfig):
+    return _dynamodb().Table(cfg.ddb_table)
+
+
+def _dedup_table(cfg: WorkerConfig):
+    return _dynamodb().Table(cfg.dedup_table)
+
+
+def _get_secret(arn: str) -> str:
     if not arn:
         return ""
     if arn in _CACHED_SECRETS:
         return _CACHED_SECRETS[arn]
-    resp = secrets.get_secret_value(SecretId=arn)
+    resp = _secrets().get_secret_value(SecretId=arn)
     val = resp.get("SecretString") or ""
     _CACHED_SECRETS[arn] = val
     return val
+
+
+def _coerce_secret_value(raw: str, *, prefer_keys: list[str] | None = None) -> str:
+    if not raw:
+        return raw
+    txt = raw.strip()
+    if not (txt.startswith("{") and txt.endswith("}")):
+        return raw
+    try:
+        data = json.loads(txt)
+    except Exception:
+        return raw
+    if isinstance(data, dict):
+        keys = prefer_keys or []
+        for key in keys:
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return raw
 
 
 def _gid(product_numeric_id: str | int) -> str:
@@ -59,151 +152,379 @@ def _now_epoch() -> int:
     return int(time.time())
 
 
-async def _prefill_sqlite_snapshot_from_ddb(shop: str, product_gid: str, db_path: str, mf_include: list[tuple[str, str]]):
-    """Hydrate local SQLite snapshot with any existing DDB digest maps for product + included metafields."""
-    store = SnapshotStore(db_path=db_path)
-    # Product digests
-    try:
-        resp = ddb_snap.get_item(Key={"pk": _pk(shop, product_gid), "sk": f"digest#{SOURCE_LOCALE}"})
-        item = resp.get("Item") or {}
-        digest_map = item.get("digest_map") or {}
-        if digest_map:
-            store.set_digest_map(product_gid, {str(k): str(v) for k, v in digest_map.items()})
-    except Exception as e:
-        print(json.dumps({"prefill_error": str(e)}))
-
-    # Metafields: if include is empty, we skip prefill specific IDs (we don't list all here to keep calls low)
-    # Prefill will be refreshed on next runs once digests are known.
-    if mf_include:
-        from src.shopify.graphql import get_product_metafields_by_keys  # lazy import
-        mf_nodes = await get_product_metafields_by_keys(product_gid, mf_include)
-    else:
-        mf_nodes = []
-    for n in mf_nodes:
-        rid = n.get("id")
-        if not rid:
-            continue
-        try:
-            resp = ddb_snap.get_item(Key={"pk": _pk(shop, rid), "sk": f"digest#{SOURCE_LOCALE}"})
-            item = resp.get("Item") or {}
-            digest_map = item.get("digest_map") or {}
-            if digest_map:
-                store.set_digest_map(rid, {str(k): str(v) for k, v in digest_map.items()})
-        except Exception as e:
-            print(json.dumps({"prefill_error": str(e), "rid": rid}))
-    store.close()
+def _message_id(record: dict[str, Any]) -> str:
+    return str(record.get("messageId") or record.get("messageID") or "")
 
 
-def _flush_sqlite_snapshot_to_ddb(shop: str, product_gid: str, db_path: str):
-    """Persist local SQLite snapshot digest maps to DynamoDB for product and any resources present."""
-    store = SnapshotStore(db_path=db_path)
-    # For product
-    prod_map = store.get_digest_map(product_gid)
-    if prod_map:
-        ddb_snap.put_item(
-            Item={
-                "pk": _pk(shop, product_gid),
-                "sk": f"digest#{SOURCE_LOCALE}",
-                "digest_map": prod_map,
-                "updated_at": _now_epoch(),
-            }
+def _resolve_product_id(body: dict[str, Any]) -> str:
+    return str(body.get("id") or (body.get("product") or {}).get("id") or "")
+
+
+def _apply_runtime_secrets(cfg: WorkerConfig) -> None:
+    if cfg.openai_api_key_secret_arn:
+        os.environ["OPENAI_API_KEY"] = _get_secret(cfg.openai_api_key_secret_arn)
+    if cfg.shopify_admin_token_secret_arn:
+        os.environ["SHOPIFY_ADMIN_TOKEN"] = _get_secret(cfg.shopify_admin_token_secret_arn)
+    if cfg.neon_database_url_secret_arn:
+        raw = _get_secret(cfg.neon_database_url_secret_arn)
+        os.environ["NEON_DATABASE_URL"] = _coerce_secret_value(
+            raw, prefer_keys=["connection_uri", "database_url", "DATABASE_URL", "url", "uri"]
         )
-    # We don't know all metafield rids stored; quick heuristic: query all rows is not supported.
-    # In practice, we re-fetch included metafields and flush those.
-    # Note: This function is called after process_product; IDs remain the same.
-    store.close()
+    os.environ["TRANSLATION_CACHE_PATH"] = ":memory:"
+    os.environ["LOG_VERBOSE_SYNC"] = "true" if cfg.log_verbose_sync else "false"
 
 
-async def _process_one(record):
+def _build_log_event(*, product_id: str, topic: str, summary: dict[str, Any]) -> dict[str, Any]:
+    item = ((summary.get("items") or [{}])[0]) if isinstance(summary, dict) else {}
+    locales = item.get("locales") or {}
+    seo_summary = summary.get("seo") or {}
+    seo_item = ((seo_summary.get("items") or [{}])[0]) if isinstance(seo_summary, dict) else {}
+    return {
+        "ok": True,
+        "event": "translation_sync",
+        "product_id": int(product_id),
+        "product_title": item.get("product_title") or "",
+        "topic": topic,
+        "status": item.get("status") or "unknown",
+        "skip_reason": item.get("skip_reason") or "",
+        "changed_sections": item.get("changed_sections") or [],
+        "target_locales": sorted(list(locales.keys())),
+        "translated_sections": {
+            locale: data.get("translated_sections") or [] for locale, data in locales.items()
+        },
+        "section_sources": {
+            locale: data.get("section_sources") or {} for locale, data in locales.items()
+        },
+        "seo_sync_enabled": bool(seo_summary.get("enabled")),
+        "seo_status": seo_item.get("status") or "disabled",
+        "seo_locales": {
+            locale: {
+                "status": data.get("status") or "",
+                "planned_fields": data.get("planned_fields") or [],
+                "registered_fields": data.get("registered_fields") or [],
+            }
+            for locale, data in (seo_item.get("locales") or {}).items()
+        },
+    }
+
+
+def _build_verbose_log_event(summary: dict[str, Any]) -> dict[str, Any] | None:
+    item = ((summary.get("items") or [{}])[0]) if isinstance(summary, dict) else {}
+    locales = item.get("locales") or {}
+    payloads = {
+        locale: data.get("shopify_payloads")
+        for locale, data in locales.items()
+        if data.get("shopify_payloads")
+    }
+    if not payloads:
+        return None
+    return {
+        "event": "translation_sync_debug",
+        "product_id": item.get("product_id"),
+        "product_title": item.get("product_title") or "",
+        "shopify_payloads": payloads,
+    }
+
+
+def _event_already_processed(cfg: WorkerConfig, event_id: str) -> bool:
+    if not event_id:
+        return False
+    dedup = _dedup_table(cfg)
+    item = dedup.get_item(Key={"event_id": event_id}).get("Item") or {}
+    return item.get("status") == "processed"
+
+
+def _mark_event_processed(cfg: WorkerConfig, event_id: str) -> None:
+    if not event_id:
+        return
+    _dedup_table(cfg).put_item(
+        Item={
+            "event_id": event_id,
+            "status": "processed",
+            "ttl": _now_epoch() + 3 * 24 * 3600,
+        },
+    )
+
+
+def _acquire_debounce(cfg: WorkerConfig, *, shop: str, product_gid: str) -> bool:
+    snap = _snap_table(cfg)
+    now = _now_epoch()
+    try:
+        snap.update_item(
+            Key={"pk": _pk(shop, product_gid), "sk": f"source#{cfg.source_locale}"},
+            UpdateExpression="SET debounce_until = :until, updated_at = :now",
+            ConditionExpression="attribute_not_exists(debounce_until) OR debounce_until < :now",
+            ExpressionAttributeValues={
+                ":until": now + cfg.debounce_seconds,
+                ":now": now,
+            },
+        )
+        return True
+    except snap.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+
+
+def _defer_debounced_record(cfg: WorkerConfig, record: dict[str, Any]) -> None:
+    receipt_handle = str(record.get("receiptHandle") or "")
+    if not cfg.sqs_url or not receipt_handle:
+        return
+    try:
+        _sqs().change_message_visibility(
+            QueueUrl=cfg.sqs_url,
+            ReceiptHandle=receipt_handle,
+            VisibilityTimeout=max(1, cfg.debounce_seconds),
+        )
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "warning": "debounce_visibility_change_failed",
+                    "message_id": _message_id(record),
+                    "error": str(exc),
+                }
+            )
+        )
+
+
+async def _run_backend(
+    *,
+    cfg: WorkerConfig,
+    product_id: str,
+    is_create: bool,
+    shop: str,
+) -> dict[str, Any]:
+    from src.bootstrap.incremental import sync_products_incremental
+
+    summary = await sync_products_incremental(
+        product_ids=[int(product_id)],
+        target_locales=cfg.target_locales,
+        mf_include=cfg.mf_include or None,
+        source_locale=cfg.source_locale,
+        apply_translations=not cfg.dry_run,
+        dry_run=cfg.dry_run,
+        is_create=is_create,
+        content_changes_only=not is_create,
+        sync_seo=cfg.seo_sync_enabled,
+    )
+    if is_create and not cfg.dry_run:
+        handle_summary = await sync_products_incremental(
+            product_ids=[int(product_id)],
+            target_locales=cfg.target_locales,
+            mf_include=cfg.mf_include or None,
+            source_locale=cfg.source_locale,
+            apply_translations=True,
+            dry_run=False,
+            is_create=False,
+            handle_only=True,
+        )
+        summary["registered"] = int(summary.get("registered", 0)) + int(
+            handle_summary.get("registered", 0)
+        )
+        summary["failed_products"] = int(summary.get("failed_products", 0)) + int(
+            handle_summary.get("failed_products", 0)
+        )
+        summary["failed_product_ids"] = list(summary.get("failed_product_ids", [])) + list(
+            handle_summary.get("failed_product_ids", [])
+        )
+        summary["items"] = list(summary.get("items", [])) + list(handle_summary.get("items", []))
+    return summary
+
+
+async def _run_theme_realtime_sync(
+    *,
+    cfg: WorkerConfig,
+) -> dict[str, Any]:
+    from src.bootstrap.theme import THEME_RESOURCE_TYPES, bootstrap_theme
+
+    return await bootstrap_theme(
+        theme_id=cfg.approved_theme_id,
+        target_locales=cfg.target_locales,
+        source_locale=cfg.source_locale,
+        apply_translations=not cfg.dry_run,
+        dry_run=cfg.dry_run,
+        resource_types=list(THEME_RESOURCE_TYPES),
+    )
+
+
+async def _process_one(record: dict[str, Any], cfg: WorkerConfig) -> tuple[bool, str | None]:
+    msg_id = _message_id(record)
     attrs = record.get("messageAttributes") or {}
     topic = (attrs.get("Topic") or {}).get("stringValue", "")
-    shop = (attrs.get("Shop") or {}).get("stringValue", os.environ.get("SHOP_DOMAIN", ""))
+    shop = (attrs.get("Shop") or {}).get("stringValue", cfg.shop_domain)
     event_id = (attrs.get("EventId") or {}).get("stringValue", "")
+    topic_lower = topic.lower()
 
-    # Dedup by EventId
-    if event_id:
-        try:
-            ddb_dedup.put_item(
-                Item={"event_id": event_id, "ttl": _now_epoch() + 3 * 24 * 3600},
-                ConditionExpression="attribute_not_exists(event_id)",
+    try:
+        body = json.loads(record.get("body") or "{}")
+    except Exception as e:
+        print(json.dumps({"ok": False, "message_id": msg_id, "error": f"invalid_json:{e}"}))
+        return False, msg_id
+
+    if topic_lower in {"themes/update", "themes/publish"}:
+        if not cfg.theme_tracking_enabled and not cfg.theme_realtime_sync_enabled:
+            print(json.dumps({"ok": True, "skip": "theme_tracking_disabled", "message_id": msg_id}))
+            return True, None
+        if _event_already_processed(cfg, event_id):
+            print(
+                json.dumps(
+                    {"ok": True, "skip": "dedup", "event_id": event_id, "message_id": msg_id}
+                )
             )
-        except ddb_dedup.meta.client.exceptions.ConditionalCheckFailedException:
-            print(json.dumps({"skip": "dedup", "event_id": event_id}))
-            return
+            return True, None
+        theme_gid = f"gid://shopify/OnlineStoreTheme/{cfg.approved_theme_id or 'main'}"
+        if not _acquire_debounce(cfg, shop=shop, product_gid=theme_gid):
+            _defer_debounced_record(cfg, record)
+            print(json.dumps({"ok": False, "retry": "theme_debounce", "message_id": msg_id}))
+            return False, msg_id
+        try:
+            _apply_runtime_secrets(cfg)
+            from src.bootstrap.theme_tracking import track_main_theme_read_only
 
-    body = json.loads(record.get("body") or "{}")
-    product_id = str(body.get("id") or (body.get("product") or {}).get("id") or "")
+            summary = await track_main_theme_read_only(
+                approved_theme_id=cfg.approved_theme_id,
+                topic=topic_lower,
+                event_id=event_id or None,
+                source_locale=cfg.source_locale,
+            )
+            realtime_summary: dict[str, Any] | None = None
+            main_matches = str(summary.get("actual_theme_id") or "") == str(
+                summary.get("approved_theme_id") or ""
+            )
+            if cfg.theme_realtime_sync_enabled and main_matches:
+                realtime_summary = await _run_theme_realtime_sync(cfg=cfg)
+                failed_items = [
+                    item
+                    for item in (realtime_summary.get("items") or [])
+                    if isinstance(item, dict) and item.get("status") == "failed"
+                ]
+                if failed_items:
+                    raise RuntimeError("Theme realtime sync produced failed resources")
+            _mark_event_processed(cfg, event_id)
+            print(
+                json.dumps(
+                    {
+                        "event": (
+                            "theme_realtime_sync"
+                            if realtime_summary is not None
+                            else "theme_tracking"
+                        ),
+                        "message_id": msg_id,
+                        **summary,
+                        "realtime_sync": (
+                            {
+                                "resources": realtime_summary.get("resources", 0),
+                                "changed_resources": realtime_summary.get(
+                                    "changed_resources",
+                                    0,
+                                ),
+                                "changed_sections": realtime_summary.get(
+                                    "changed_sections",
+                                    0,
+                                ),
+                                "registered": realtime_summary.get(
+                                    "registered",
+                                    0,
+                                ),
+                                "target_locales": realtime_summary.get(
+                                    "target_locales",
+                                    [],
+                                ),
+                            }
+                            if realtime_summary is not None
+                            else None
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return True, None
+        except Exception as e:
+            print(
+                json.dumps(
+                    {"ok": False, "event": "theme_tracking", "message_id": msg_id, "error": str(e)}
+                )
+            )
+            return False, msg_id
+
+    product_id = _resolve_product_id(body)
     if not product_id:
-        print(json.dumps({"skip": "no_product_id"}))
-        return
+        print(json.dumps({"ok": True, "skip": "no_product_id", "message_id": msg_id}))
+        return True, None
 
     gid = _gid(product_id)
-    pk = _pk(shop, gid)
+    is_create = topic_lower == "products/create"
 
-    # Debounce/coalescing window
-    try:
-        resp = ddb_snap.get_item(Key={"pk": pk, "sk": f"source#{SOURCE_LOCALE}"})
-        item = resp.get("Item") or {}
-        now = _now_epoch()
-        if item.get("debounce_until") and now < int(item["debounce_until"]):
-            print(json.dumps({"skip": "debounce", "product_id": product_id}))
-            return
-        ddb_snap.update_item(
-            Key={"pk": pk, "sk": f"source#{SOURCE_LOCALE}"},
-            UpdateExpression="SET debounce_until=:t",
-            ExpressionAttributeValues={":t": now + DEBOUNCE_SECONDS},
+    if _event_already_processed(cfg, event_id):
+        print(json.dumps({"ok": True, "skip": "dedup", "event_id": event_id, "message_id": msg_id}))
+        return True, None
+
+    if not _acquire_debounce(cfg, shop=shop, product_gid=gid):
+        _defer_debounced_record(cfg, record)
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "retry": "debounce",
+                    "product_id": product_id,
+                    "message_id": msg_id,
+                }
+            )
         )
-    except Exception as e:
-        print(json.dumps({"debounce_error": str(e)}))
+        return False, msg_id
 
-    # Prefill local snapshot from DynamoDB to avoid full-translate on first pass
-    db_path = "/tmp/cache.sqlite"
-    await _prefill_sqlite_snapshot_from_ddb(shop, gid, db_path, MF_INCLUDE)
-
-    is_create = (topic.lower() == "products/create")
     try:
-        # Resolve secrets and expose as env so SETTINGS picks them up
-        if OPENAI_API_KEY_SECRET_ARN:
-            # Soft-check OpenAI SDK presence (supports v1 and legacy v0)
-            try:
-                import openai as _openai  # type: ignore
-                v1 = hasattr(_openai, "OpenAI")
-                v0 = hasattr(_openai, "ChatCompletion")
-                ver = getattr(_openai, "__version__", getattr(_openai, "version", "unknown"))
-                print(json.dumps({"openai_import_ok": True, "version": ver, "v1": v1, "v0": v0}))
-            except Exception as e:
-                print(json.dumps({"openai_import_ok": False, "error": str(e)}))
-            os.environ["OPENAI_API_KEY"] = _get_secret(OPENAI_API_KEY_SECRET_ARN)
-        if SHOPIFY_ADMIN_TOKEN_SECRET_ARN:
-            os.environ["SHOPIFY_ADMIN_TOKEN"] = _get_secret(SHOPIFY_ADMIN_TOKEN_SECRET_ARN)
-        # Ensure cache path points to writable storage in Lambda
-        os.environ.setdefault("TRANSLATION_CACHE_PATH", "/tmp/cache.sqlite")
-
-        # Import here so SETTINGS captures env just set
-        from src.shopify.sync import process_product  # type: ignore
-        summary = await process_product(
-            product_numeric_id=product_id,
-            target_locales=TARGET_LOCALES,
-            mf_include=MF_INCLUDE,
-            mf_json_paths=MF_JSON_PATHS,
-            source_locale=SOURCE_LOCALE,
-            dry_run=DRY_RUN,
+        _apply_runtime_secrets(cfg)
+        summary = await _run_backend(
+            cfg=cfg,
+            product_id=product_id,
             is_create=is_create,
-            fill_missing_translations=FILL_MISSING,
+            shop=shop,
         )
-        # After successful processing, flush latest digests back to DynamoDB
-        _flush_sqlite_snapshot_to_ddb(shop, gid, db_path)
-        print(json.dumps({"ok": True, "product_id": product_id, "summary": summary}, ensure_ascii=False))
+        _mark_event_processed(cfg, event_id)
+        event = _build_log_event(product_id=product_id, topic=topic, summary=summary)
+        event["message_id"] = msg_id
+        print(json.dumps(event, ensure_ascii=False))
+        if cfg.log_verbose_sync:
+            verbose = _build_verbose_log_event(summary)
+            if verbose:
+                verbose["message_id"] = msg_id
+                print(json.dumps(verbose, ensure_ascii=False))
+        return True, None
     except Exception as e:
-        print(json.dumps({"ok": False, "product_id": product_id, "error": str(e)}))
+        print(
+            json.dumps(
+                {"ok": False, "product_id": product_id, "message_id": msg_id, "error": str(e)}
+            )
+        )
+        return False, msg_id
 
 
 def handler(event, context):
-    # Allow runtime disable via env
-    if os.environ.get("DISABLE_SYNC", "false").lower() in {"1", "true", "yes", "y"}:
-        print(json.dumps({"ok": True, "skip": "disabled", "component": "worker", "records": len(event.get("Records", []))}))
-        return {"statusCode": 200}
+    configure_logging()
+    cfg = _config()
+    records = event.get("Records", [])
+    if cfg.disable_sync:
+        failures = [
+            {"itemIdentifier": message_id}
+            for record in records
+            if (message_id := _message_id(record))
+        ]
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "retry": "sync_paused",
+                    "component": "worker",
+                    "records": len(records),
+                }
+            )
+        )
+        return {"statusCode": 200, "batchItemFailures": failures}
+
     loop = asyncio.get_event_loop()
-    tasks = [_process_one(r) for r in event.get("Records", [])]
-    loop.run_until_complete(asyncio.gather(*tasks))
-    return {"statusCode": 200}
+    results = loop.run_until_complete(asyncio.gather(*[_process_one(r, cfg) for r in records]))
+    failures = [
+        {"itemIdentifier": failure_id} for ok, failure_id in results if not ok and failure_id
+    ]
+    return {"statusCode": 200, "batchItemFailures": failures}
