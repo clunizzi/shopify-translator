@@ -1,169 +1,122 @@
 # Shopify Translator
 
-A production-oriented translation engine for Shopify catalogs and themes. It
-combines Shopify Admin GraphQL, OpenAI, Neon/PostgreSQL, AWS Lambda/SQS and an
-optional Cloudflare Workers control panel.
+### Keep every Shopify translation in sync. Automatically.
 
-The project is designed around one rule: **translate only content that has
-actually changed**. Inventory-only `products/update` events are filtered before
-OpenAI or Shopify writes, remote translations are audited before registration,
-and theme writes are blocked when the approved theme is no longer the live
-MAIN theme.
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Shopify Admin API](https://img.shields.io/badge/Shopify-Admin_API-7AB55C?logo=shopify&logoColor=white)](https://shopify.dev/docs/api/admin-graphql)
+[![AWS](https://img.shields.io/badge/AWS-Lambda_%2B_SQS-FF9900?logo=amazonwebservices&logoColor=white)](https://aws.amazon.com/)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 
-## What it covers
+Shopify Translator is a cloud translation engine for stores that need more
+than a one-off export/import. It watches Shopify, detects meaningful content
+changes, translates only what is actually outdated, and keeps every locale
+aligned over time.
 
-- Products, variants, options and selected metafields.
-- Custom SEO title and description fields.
-- Missing localized handles without rewriting existing URLs.
-- JSON templates, section groups and configured locale-file namespaces.
-- Store policies and other explicitly enabled global resources.
-- Translation memory, dictionary entries, source digests and sync state in
-  Neon/PostgreSQL.
-- Near-real-time product and theme updates through Shopify webhooks.
-- Scheduled reconciliation as a safety net for missed or delayed events.
-- An Access-protected Cloudflare dashboard for audits, previews and controlled
-  manual corrections.
+Products, SEO, URLs and theme content stay current — without wasting API calls
+every time an order changes inventory.
 
-## Safety model
+## Why it is different
 
-- Shopify writes require explicit flags and production configuration.
-- The example Terraform configuration starts with `disable_sync = "true"`.
-- Theme writes require an approved theme ID matching Shopify's current MAIN
-  theme.
-- Webhook HMAC validation, SQS retries, dead-letter queues, deduplication and
-  debounce controls are built in.
-- Existing current translations are preserved; only missing or outdated fields
-  are registered.
-- Liquid, HTML structure, JSON shape and protected terminology are validated
-  before a translation is accepted.
-- Secrets belong in local environment files, AWS Secrets Manager and
-  Cloudflare Worker secrets. They are never required in tracked configuration.
+- **Near real-time sync** — Shopify webhooks trigger focused translation jobs.
+- **Change-aware** — inventory-only updates stop before OpenAI or Shopify
+  writes.
+- **Complete storefront coverage** — products, variants, options, selected
+  metafields, SEO, handles and theme content.
+- **Safe on live stores** — retries, deduplication, debounce, dry-runs and a
+  strict MAIN-theme guard.
+- **Built to operate** — Neon-backed state, scheduled reconciliation and an
+  optional Cloudflare dashboard for audits and manual corrections.
 
-## Architecture
+## How it works
 
 ```text
 Shopify webhooks
-      |
-      v
-AWS Lambda receiver --HMAC--> SQS --> Lambda worker
-                                      |     |     |
-                                      |     |     +--> Shopify Admin GraphQL
-                                      |     +--------> OpenAI
-                                      +--------------> Neon/PostgreSQL
+      │
+      ▼
+Lambda receiver ──HMAC──▶ SQS ──▶ Translation worker
+                                      ├── OpenAI
+                                      ├── Shopify Admin GraphQL
+                                      └── Neon / PostgreSQL
 
-EventBridge --> catalog/theme pollers --> the same sync engine
-
-Cloudflare Access --> Workers dashboard --> Neon + least-privilege AWS invoke
+EventBridge ──▶ reconciliation pollers
+Cloudflare Access ──▶ operations dashboard
 ```
 
-## Repository layout
+The worker compares Shopify's live source digests, remote translations and its
+stored state. If nothing relevant changed, it does nothing. If content is
+missing or outdated, it translates and registers only those fields.
 
-- `src/translate/` — translation engine, validation and cache.
-- `src/bootstrap/` — catalog, SEO, handles, theme and reconciliation flows.
-- `src/shopify/` — Shopify Admin GraphQL client.
-- `src/state/` — Neon/PostgreSQL persistence.
-- `src/aws_lambda/` — webhook receiver, worker and scheduled pollers.
-- `infra/terraform/` — AWS infrastructure and safe example variables.
-- `cloudflare-admin/` — optional operations dashboard.
-- `src/config/` — configurable field, metafield, theme and terminology policy.
-- `tests/` — unit and contract coverage for the critical sync paths.
+## What it translates
 
-## Requirements
+| Area | Coverage |
+| --- | --- |
+| Catalog | Products, descriptions, product types, variants and options |
+| Custom data | Allowlisted textual metafield leaves, including structured JSON |
+| SEO | Meta titles and descriptions, with conservative rollout controls |
+| URLs | Missing localized handles, without replacing existing URLs |
+| Theme | JSON templates, section groups and configured locale namespaces |
+| Global resources | Store policies and explicitly enabled Shopify resources |
 
-- Python 3.11+
-- Shopify Admin API credentials with the scopes required by the resources you
-  enable, including `read_themes` for theme tracking.
-- OpenAI API credentials.
-- Neon/PostgreSQL.
-- AWS credentials for cloud deployment.
-- Node.js and npm for the optional Cloudflare dashboard.
-- Docker is recommended for Lambda-compatible Python builds.
+Liquid, HTML, JSON structure, protected terms, product codes and units are
+validated before a translation is accepted.
 
-## Local setup
+## Quick start
 
 ```bash
+git clone https://github.com/clunizzi/shopify-translator.git
+cd shopify-translator
+
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+
 cp .env.example .env
+shopify-translator --help
 ```
 
-Fill only the local `.env`. The example intentionally contains no credentials.
-Important variables include:
+Add your Shopify, OpenAI and Neon credentials only to `.env`. The tracked
+example contains no secrets.
 
-- `SHOPIFY_STORE_DOMAIN`, `SHOPIFY_ADMIN_TOKEN`
-- `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_FALLBACK_MODEL`
-- `NEON_DATABASE_URL`
-- `SOURCE_LOCALE`, `TARGET_LOCALES`
-- `TRANSLATOR_SPECIALIZATION`, `TRANSLATOR_BRAND`, `TRANSLATOR_AUDIENCE`
-- `DO_NOT_TRANSLATE_YAML`, `METAFIELD_TRANSLATION_POLICY_PATH`,
-  `THEME_TRANSLATION_POLICY_PATH`
-
-Store-specific policy overlays can be placed in ignored `*.local.yaml` files.
-This keeps public defaults generic while still packaging local policies into a
-Lambda build.
-
-## Common commands
+Start with read-only checks:
 
 ```bash
-# Catalog bootstrap and incremental sync
-shopify-translator bootstrap --apply-translations
-shopify-translator sync --apply-translations --dry-run
-
-# SEO audit and controlled rollout
 shopify-translator seo-audit --target-locales fr,de
-shopify-translator seo-sync --target-locales fr,de --dry-run
-shopify-translator seo-sync --target-locales fr,de \
-  --apply-translations --max-products 100 --continue-on-error
-
-# Localized handles
 shopify-translator handles-audit --target-locales fr,de
-shopify-translator handles-complete --target-locales fr,de --dry-run
-
-# Read-only theme tracking; replace the example with the approved MAIN ID
 shopify-translator theme-track --approved-theme-id 123456789012
-
-# Validate model behavior without Shopify or Neon writes
-shopify-translator model-canary --models gpt-5.6-terra,gpt-5.6-sol
+shopify-translator sync --apply-translations --dry-run
 ```
 
-Always review a dry-run before enabling writes against a live store.
+Review the output before enabling writes against a live store.
 
-## AWS deployment
+## Cloud deployment
 
-1. Build the Lambda packages:
+The included Terraform stack provisions the AWS receiver, worker, queues,
+dead-letter queue, DynamoDB coordination tables and scheduled pollers.
 
-   ```bash
-   make build-receiver
-   make build-worker-docker PY=3.12
-   ```
+```bash
+make build-receiver
+make build-worker-docker PY=3.12
 
-2. Copy the safe example and fill the ignored local file:
+cp infra/terraform/terraform.tfvars.example \
+   infra/terraform/terraform.tfvars
 
-   ```bash
-   cp infra/terraform/terraform.tfvars.example \
-      infra/terraform/terraform.tfvars
-   ```
+terraform -chdir=infra/terraform init
+terraform -chdir=infra/terraform plan
+```
 
-3. Keep `disable_sync = "true"`, provision the infrastructure and review the
-   outputs:
+Public defaults are deliberately locked: `disable_sync = "true"`, scheduled
+sync is off and no theme ID is approved. Configure Secrets Manager, run the
+audits and unlock each write path intentionally.
 
-   ```bash
-   terraform -chdir=infra/terraform init
-   terraform -chdir=infra/terraform plan
-   terraform -chdir=infra/terraform apply
-   ```
+## Operations dashboard
 
-4. Register `products/create`, `products/update`, `themes/update` and
-   `themes/publish` webhooks against the receiver URL.
-5. Run audits and canaries, set the approved MAIN theme ID, then deliberately
-   enable the required sync paths.
+`cloudflare-admin/` contains an optional Cloudflare Workers control panel for:
 
-Large worker packages can be uploaded to S3 with
-`scripts/deploy-worker.sh`. The script creates a Terraform plan and applies it
-only when `DEPLOY_APPLY=1` is provided.
-
-## Cloudflare dashboard
+- translation coverage and system health;
+- product and theme inspection;
+- localized storefront previews;
+- controlled manual corrections;
+- theme audits, canaries and sync jobs.
 
 ```bash
 cd cloudflare-admin
@@ -172,31 +125,22 @@ npm install
 npm run dev
 ```
 
-The tracked Wrangler config is intentionally locked and contains only example
-values. For deployment, use a local ignored config and Cloudflare secrets for:
+The dashboard is designed to run behind Cloudflare Access and uses a
+least-privilege AWS identity.
 
-- `NEON_DATABASE_URL`
-- `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+## Store-specific configuration
 
-The IAM identity used by the dashboard should only be allowed to invoke the
-configured operations Lambda. Put the dashboard behind Cloudflare Access
-before unlocking it.
+The public policies are conservative and generic. Customize them without
+polluting the repository:
 
-## Configuration policies
+- `do_not_translate.local.yaml` for brands, units and terminology;
+- `metafield_translation.local.yaml` for translatable custom-data leaves;
+- `theme_translation.local.yaml` for store-owned locale namespaces.
 
-The default configuration is deliberately conservative:
+Files matching `src/config/*.local.yaml` are ignored by Git but included in
+local Lambda builds.
 
-- `do_not_translate.yaml` contains generic units, tokens and a minimal glossary.
-- `metafield_translation.yaml` allowlists textual leaves and blocks IDs, URLs,
-  filenames and other structural values.
-- `theme_translation.yaml` allowlists textual theme fields. Locale resources
-  are translated only for explicitly listed, store-owned key prefixes because
-  Shopify exposes platform checkout/account strings through the same resource.
-
-Review and customize these policies for each store before enabling writes.
-
-## Tests
+## Quality and safety
 
 ```bash
 pytest
@@ -207,10 +151,21 @@ cd cloudflare-admin
 npm run check
 ```
 
-## Operational runbooks
+The sync path is covered by tests for translation failures, Shopify GraphQL
+errors, stale digests, retries, reconciliation, theme mismatches and
+inventory-driven webhook noise.
 
-- `docs/cloudflare-neon-cutover.md`
-- `docs/cloudflare-aws-key-rotation.md`
+## Documentation
+
+- [Cloudflare and Neon cutover](docs/cloudflare-neon-cutover.md)
+- [AWS credential rotation](docs/cloudflare-aws-key-rotation.md)
+- [Cloudflare dashboard setup](cloudflare-admin/README.md)
+
+## Important
+
+This is an advanced Shopify integration, not a one-click App Store install.
+Use dry-runs, canaries and least-privilege credentials before enabling live
+writes.
 
 ## License
 
