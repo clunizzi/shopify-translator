@@ -54,4 +54,3 @@ def test_bootstrap_products_continues_after_single_failure(monkeypatch):
     assert processed == [1, 3]
     assert result["failed_products"] == 1
     assert result["failed_product_ids"] == [2]
-

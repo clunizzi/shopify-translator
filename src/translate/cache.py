@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
-import errno
 import os
+import sqlite3
 from pathlib import Path
 
 from src.state.neon import sanitize_json_value, sanitize_text
@@ -14,10 +13,13 @@ class TranslationCache:
     def __init__(self, db_path: str | Path | None = None) -> None:
         """
         SQLite-backed cache with safe default path.
-        - Default path comes from env TRANSLATION_CACHE_PATH or 'state/cache.sqlite'.
-        - If the filesystem is read-only (e.g., AWS Lambda), falls back to '/tmp/cache.sqlite'.
+        - Default path comes from env TRANSLATION_CACHE_PATH or ':memory:'.
+        - The default is in-memory so local stale cache does not persist across runs.
+        - If a filesystem path is explicitly requested but unavailable, falls back to ':memory:'.
         """
-        raw_path = db_path if db_path is not None else os.getenv("TRANSLATION_CACHE_PATH", "state/cache.sqlite")
+        raw_path = (
+            db_path if db_path is not None else os.getenv("TRANSLATION_CACHE_PATH", ":memory:")
+        )
         if str(raw_path).strip() == ":memory:":
             self.path = raw_path
             self.conn = sqlite3.connect(":memory:")
@@ -29,12 +31,9 @@ class TranslationCache:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.conn = sqlite3.connect(self.path)
-        except Exception as e:
-            # Read-only FS or invalid path: fallback to /tmp
-            fallback = Path("/tmp/cache.sqlite")
-            fallback.parent.mkdir(parents=True, exist_ok=True)
-            self.path = fallback
-            self.conn = sqlite3.connect(self.path)
+        except Exception:
+            self.path = ":memory:"
+            self.conn = sqlite3.connect(":memory:")
         self._init()
 
     def _init(self) -> None:
@@ -87,7 +86,11 @@ class TranslationCache:
     def set(self, key: str, value: dict, model: str) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO translations (key, value, model) VALUES (?, ?, ?)",
-            (sanitize_text(key), json.dumps(sanitize_json_value(value), ensure_ascii=False), sanitize_text(model)),
+            (
+                sanitize_text(key),
+                json.dumps(sanitize_json_value(value), ensure_ascii=False),
+                sanitize_text(model),
+            ),
         )
         self.conn.commit()
 

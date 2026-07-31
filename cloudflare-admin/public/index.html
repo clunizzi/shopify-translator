@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self'; img-src 'self' data: https://cdn.shopify.com; object-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    />
+    <title>Shopify Translation Control</title>
+    <link rel="stylesheet" href="/styles.css?v=20260730.5" />
+    <script src="/app.js?v=20260730.5" type="module"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Vai al contenuto</a>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Shopify Translation Control">
+        <span class="brand-mark" aria-hidden="true">SRT</span>
+        <span>
+          <strong>Translation Control</strong>
+          <small id="shop-domain">Connessione in corso</small>
+        </span>
+      </a>
+      <nav class="app-nav" aria-label="Navigazione principale">
+        <a class="is-active" href="#content-title">Contenuti</a>
+        <a href="#theme-control">Tema e sync</a>
+        <a href="#system-overview">Sistema</a>
+      </nav>
+      <div class="topbar-actions">
+        <span class="environment-label">Produzione</span>
+        <button class="button button-secondary" id="refresh" type="button">Aggiorna</button>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="command-header" aria-labelledby="page-title">
+        <div class="command-copy">
+          <p class="section-kicker">Shopify / translation operations</p>
+          <h1 id="page-title">Lavora sulle traduzioni.</h1>
+          <p>
+            Cerca un contenuto, confronta le lingue e correggi soltanto ciò che serve.
+          </p>
+        </div>
+        <dl class="safety-facts">
+          <div>
+            <dt>Tema autorizzato</dt>
+            <dd id="theme-id">In verifica</dd>
+          </div>
+          <div>
+            <dt>Sync tema pianificato</dt>
+            <dd id="scheduled-sync">In verifica</dd>
+          </div>
+          <div>
+            <dt>Sync tema realtime</dt>
+            <dd id="realtime-sync">In verifica</dd>
+          </div>
+          <div>
+            <dt>Catalog poller</dt>
+            <dd id="catalog-schedule">In verifica</dd>
+          </div>
+        </dl>
+      </section>
+
+      <div class="notice is-loading" id="notice" role="status" aria-live="polite">
+        <span class="notice-title">Caricamento stato</span>
+        <span class="notice-copy">Sto leggendo il quadro operativo.</span>
+      </div>
+
+      <details class="diagnostics" id="system-overview">
+        <summary>
+          <span>
+            <strong>Stato del sistema</strong>
+            <small>Copertura catalogo, memoria e database</small>
+          </span>
+          <span class="diagnostics-summary" id="diagnostics-summary">Apri dettagli</span>
+        </summary>
+        <div class="diagnostics-body">
+          <section class="system-state" aria-labelledby="system-state-title">
+            <div class="state-copy">
+              <span class="state-symbol" id="system-symbol" aria-hidden="true">...</span>
+              <div>
+                <h2 id="system-state-title">Verifica in corso</h2>
+                <p id="system-state-copy">Controllo copertura, attività e protezioni.</p>
+              </div>
+            </div>
+            <p class="generated-at">Aggiornato <span id="generated-at">in attesa</span></p>
+          </section>
+
+          <section class="metric-grid" aria-label="Metriche principali">
+            <article>
+              <h2>Prodotti sorgente</h2>
+              <p class="metric-value" id="product-sources">-</p>
+              <p class="metric-detail" id="product-updated">Nessun dato</p>
+            </article>
+            <article>
+              <h2>Memoria traduzioni</h2>
+              <p class="metric-value" id="translation-memory">-</p>
+              <p class="metric-detail">Segmenti riutilizzabili</p>
+            </article>
+            <article>
+              <h2>Dizionario</h2>
+              <p class="metric-value" id="dictionary-entries">-</p>
+              <p class="metric-detail">Termini controllati</p>
+            </article>
+            <article>
+              <h2>Database Neon</h2>
+              <p class="metric-value" id="database-size">-</p>
+              <p class="metric-detail">Spazio PostgreSQL totale</p>
+            </article>
+          </section>
+
+          <section class="workspace catalog-workspace" aria-labelledby="catalog-title">
+            <div class="workspace-heading">
+              <div>
+                <h2 id="catalog-title">Copertura Shopify verificata</h2>
+                <p>Confronto tra i contenuti attesi e le traduzioni realmente correnti su Shopify.</p>
+              </div>
+              <span class="workspace-meta" id="catalog-summary">In calcolo</span>
+            </div>
+            <div class="locale-list" id="locale-list" aria-live="polite"></div>
+            <div class="context-note" id="catalog-note">
+              La riconciliazione legge Shopify senza modificare le traduzioni.
+            </div>
+          </section>
+        </div>
+      </details>
+
+      <section class="workspace content-workspace" aria-labelledby="content-title">
+        <div class="workspace-heading content-heading">
+          <div>
+            <p class="section-kicker">Workspace</p>
+            <h2 id="content-title">Esplora e correggi</h2>
+            <p>
+              Valori live da Shopify. Ogni salvataggio modifica un solo campo e una sola lingua.
+            </p>
+          </div>
+          <span class="live-indicator"><i aria-hidden="true"></i> Shopify live</span>
+        </div>
+
+        <div class="content-tabs" role="tablist" aria-label="Tipo di contenuto">
+          <button
+            class="content-tab is-active"
+            id="product-tab"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="product-panel"
+          >
+            Prodotti
+          </button>
+          <button
+            class="content-tab"
+            id="theme-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="theme-panel"
+          >
+            Tema live
+          </button>
+        </div>
+
+        <div class="content-panel" id="product-panel" role="tabpanel" aria-labelledby="product-tab">
+          <form class="content-search" id="product-search-form">
+            <label for="product-query">Prodotto</label>
+            <div>
+              <input
+                id="product-query"
+                type="search"
+                autocomplete="off"
+                enterkeyhint="search"
+                placeholder="Titolo, handle, ID o URL Shopify Admin"
+              />
+              <button class="button button-primary" id="product-search-submit" type="submit">
+                Cerca prodotto
+              </button>
+            </div>
+            <small class="search-hint">
+              Puoi incollare direttamente l’ID numerico o l’URL del prodotto.
+            </small>
+          </form>
+          <p class="content-feedback" id="product-feedback" role="status"></p>
+          <div class="content-browser">
+            <aside class="content-results" id="product-results" aria-label="Prodotti trovati">
+              <div class="empty-state empty-state-composed">
+                <strong>Nessun prodotto aperto</strong>
+                <span>La ricerca interroga Shopify in tempo reale.</span>
+              </div>
+            </aside>
+            <div class="content-detail" id="product-detail">
+              <div class="empty-state empty-state-composed">
+                <strong>Seleziona un prodotto</strong>
+                <span>Qui vedrai italiano, tedesco e francese affiancati.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div
+          class="content-panel"
+          id="theme-panel"
+          role="tabpanel"
+          aria-labelledby="theme-tab"
+          hidden
+        >
+          <div class="theme-browser-head">
+            <div>
+              <strong>Risorse traducibili del tema MAIN</strong>
+              <span>Nessun file Liquid o JSON viene modificato.</span>
+            </div>
+            <button class="button button-secondary" id="load-theme-resources" type="button">
+              Carica risorse
+            </button>
+          </div>
+          <label class="theme-filter" for="theme-query">
+            Filtra risorse
+            <input
+              id="theme-query"
+              type="search"
+              autocomplete="off"
+              placeholder="Es. product, header, template"
+            />
+          </label>
+          <p class="content-feedback" id="theme-feedback" role="status"></p>
+          <div class="content-browser">
+            <aside class="content-results" id="theme-results" aria-label="Risorse tema">
+              <p class="empty-state">Carica le risorse del tema live per iniziare.</p>
+            </aside>
+            <div class="content-detail" id="theme-detail">
+              <p class="empty-state">
+                Apri una risorsa per confrontare e correggere i testi.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="operations-grid" id="theme-control" aria-label="Controllo tema">
+        <article class="workspace audit-workspace">
+          <div class="workspace-heading">
+            <div>
+              <h2>Verifica tema live</h2>
+              <p>L’audit legge Shopify direttamente e non usa OpenAI.</p>
+            </div>
+            <span class="risk-label risk-safe">Solo lettura</span>
+          </div>
+          <div class="audit-snapshot" id="theme-audit">
+            <p class="empty-state">Nessun audit registrato dalla console.</p>
+          </div>
+        </article>
+
+        <article class="workspace action-workspace">
+          <div class="workspace-heading">
+            <div>
+              <h2>Azioni sul tema</h2>
+              <p>Una sola operazione alla volta. Il tema MAIN viene ricontrollato in AWS.</p>
+            </div>
+            <span class="workspace-meta" id="actions-state">Verifica collegamento</span>
+          </div>
+          <div class="action-list">
+            <div class="action-row">
+              <div>
+                <strong>Audit completo</strong>
+                <span>Conta campi correnti, mancanti e obsoleti.</span>
+              </div>
+              <button class="button button-secondary" data-action="theme_audit" type="button">
+                Avvia audit
+              </button>
+            </div>
+            <div class="action-row">
+              <div>
+                <strong>Canary</strong>
+                <span>Registra al massimo una traduzione da sistemare.</span>
+              </div>
+              <button class="button button-secondary" data-action="theme_canary" type="button">
+                Avvia canary
+              </button>
+            </div>
+            <div class="action-row action-row-critical">
+              <div>
+                <strong>Sincronizza tema</strong>
+                <span>Traduce solo campi mancanti o obsoleti sul tema autorizzato.</span>
+              </div>
+              <button class="button button-primary" data-action="theme_sync" type="button">
+                Sincronizza
+              </button>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <details class="diagnostics history-diagnostics">
+        <summary>
+          <span>
+            <strong>Storico e costi</strong>
+            <small>Job, attività recenti e guardrail</small>
+          </span>
+          <span class="diagnostics-summary">Apri dettagli</span>
+        </summary>
+        <div class="diagnostics-body">
+      <section class="workspace jobs-workspace" aria-labelledby="jobs-title">
+        <div class="workspace-heading">
+          <div>
+            <h2 id="jobs-title">Operazioni</h2>
+            <p>Storico degli ultimi job avviati dalla console.</p>
+          </div>
+          <span class="workspace-meta" id="jobs-active">Nessun job attivo</span>
+        </div>
+        <div class="job-list" id="job-list">
+          <p class="empty-state">Nessuna operazione registrata.</p>
+        </div>
+      </section>
+
+      <section class="activity-grid" aria-label="Attività recente">
+        <article class="workspace">
+          <div class="workspace-heading">
+            <div>
+              <h2>Prodotti recenti</h2>
+              <p>Ultimi stati elaborati dal motore realtime.</p>
+            </div>
+          </div>
+          <div class="recent-list" id="recent-list"></div>
+        </article>
+
+        <article class="workspace">
+          <div class="workspace-heading">
+            <div>
+              <h2>Modifiche tema rilevate</h2>
+              <p>Webhook e snapshot in sola lettura.</p>
+            </div>
+          </div>
+          <div class="event-list" id="theme-events"></div>
+        </article>
+      </section>
+
+      <section class="cost-rail" aria-label="Guardrail costi">
+        <div>
+          <strong>Guardrail costi attivo</strong>
+          <p>Nessun polling tema. I job partono solo su richiesta. Lo storico viene eliminato dopo 30 giorni.</p>
+        </div>
+        <dl>
+          <div>
+            <dt>Modello</dt>
+            <dd>GPT-5.6 Terra</dd>
+          </div>
+          <div>
+            <dt>Lingue</dt>
+            <dd id="target-locales">DE, FR</dd>
+          </div>
+          <div>
+            <dt>Chiave AWS</dt>
+            <dd id="credential-age">In verifica</dd>
+          </div>
+        </dl>
+      </section>
+        </div>
+      </details>
+    </main>
+
+    <footer>
+      <p>Shopify Translation Control</p>
+      <p id="actor">Utente non verificato</p>
+    </footer>
+
+    <dialog id="operation-dialog" aria-labelledby="dialog-title">
+      <form method="dialog" id="operation-form">
+        <div class="dialog-head">
+          <span class="risk-label" id="dialog-risk">Operazione</span>
+          <h2 id="dialog-title">Conferma operazione</h2>
+          <p id="dialog-copy"></p>
+        </div>
+        <div class="dialog-safety">
+          <strong>Protezione attiva</strong>
+          <p id="dialog-safety-copy"></p>
+        </div>
+        <label class="confirmation-field" id="confirmation-field">
+          <span>Scrivi <strong id="confirmation-phrase"></strong></span>
+          <input
+            id="confirmation-input"
+            name="confirmation"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <p class="dialog-error" id="dialog-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="button button-secondary" value="cancel" type="button" id="dialog-cancel">
+            Annulla
+          </button>
+          <button class="button button-primary" value="confirm" type="submit" id="dialog-confirm">
+            Conferma
+          </button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

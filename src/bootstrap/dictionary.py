@@ -31,7 +31,7 @@ def resolve_dictionary_first(
     source = (source_value or "").strip()
     if not source:
         return None
-    if existing_translation:
+    if existing_translation and existing_translation.strip():
         store.upsert_dictionary_translation(
             category=category,
             source_locale=source_locale,
@@ -40,7 +40,9 @@ def resolve_dictionary_first(
             translated_value=existing_translation,
             metadata={"origin": "shopify_existing_translation"},
         )
-        return DictionaryResolution(translated_value=existing_translation, source="dictionary:shopify_existing")
+        return DictionaryResolution(
+            translated_value=existing_translation, source="dictionary:shopify_existing"
+        )
 
     known = store.get_dictionary_translation(
         category=category,
@@ -48,7 +50,7 @@ def resolve_dictionary_first(
         target_locale=target_locale,
         source_value=source,
     )
-    if known:
+    if known and known.strip():
         return DictionaryResolution(translated_value=known, source="dictionary:neon")
     return None
 
@@ -70,6 +72,6 @@ def resolve_memory_second(
         source_locale=source_locale,
         target_locale=target_locale,
     )
-    if cached is None:
+    if cached is None or not cached.strip():
         return None
     return DictionaryResolution(translated_value=cached, source="memory")

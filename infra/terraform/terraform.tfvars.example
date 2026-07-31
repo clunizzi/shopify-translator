@@ -14,7 +14,8 @@ worker_zip   = "../../build/worker.zip"
 #worker_s3_key    = "worker/worker-20250101T120000.zip"
 
 # Shopify
-shop_domain = "your-shop.myshopify.com"
+shop_domain         = "your-shop.myshopify.com"
+shopify_api_version = "2026-07"
 
 # Secrets Manager ARNs (consigliato)
 openai_api_key_secret_arn      = "arn:aws:secretsmanager:eu-central-1:111111111111:secret:openai_api_key-xxxx"
@@ -25,11 +26,36 @@ shopify_webhook_secret_arn     = "arn:aws:secretsmanager:eu-central-1:1111111111
 source_locale   = "en"
 target_locales  = "fr,de"
 mf_include      = "" # es. "meta.namespace1.key1,meta.ns2.key2"
+theme_resource_types = "" # es. "ONLINE_STORE_THEME_JSON_TEMPLATE,ONLINE_STORE_THEME_SECTION_GROUP"
+global_resource_types = "" # es. "SHOP_POLICY,SHOP"
+global_resource_poll_enabled = "false"
+theme_id             = "" # ID MAIN approvato; il sync si blocca se Shopify MAIN cambia
+theme_tracking_enabled = "false" # checksum/digest via webhook, sempre read-only su Shopify
+theme_realtime_sync_enabled = "false" # sync differenziale su themes/update; abilita solo dopo il canary
+theme_poll_enabled   = "true"  # mantiene la regola; scheduled_sync_enabled ne controlla lo stato
+scheduled_sync_enabled = "false" # abilita davvero il poller; richiede approvazione live
+theme_poll_schedule  = "cron(0 3 1 * ? *)"
+catalog_poll_enabled = "false" # rete di sicurezza prodotti; attivare dopo dry-run
+catalog_poll_schedule = "rate(15 minutes)"
 
 # Worker runtime
 request_timeout      = 30
 retries              = 3
-debounce_seconds     = 20
+debounce_seconds     = 60
 dry_run              = "false"
-disable_sync         = "false"
+disable_sync         = "true" # fail-safe: abilitare il sync solo dopo un rollout verificato
 log_verbose_sync     = "false"
+seo_sync_enabled     = "false" # attivare solo dopo audit e backfill SEO controllato
+openai_model          = "gpt-5.6-terra"
+openai_fallback_model = "gpt-5.6-sol"
+worker_maximum_concurrency = 5
+
+# Prompt and policy customization. Keep store-specific overlays in ignored
+# `*.local.yaml` files; they are still included in Lambda builds.
+translator_specialization = "e-commerce product catalog"
+translator_brand          = ""
+translator_audience       = "online shoppers who expect accurate product information"
+source_language_name      = "English"
+do_not_translate_yaml     = "src/config/do_not_translate.yaml"
+metafield_translation_policy_path = "src/config/metafield_translation.yaml"
+theme_translation_policy_path     = "src/config/theme_translation.yaml"

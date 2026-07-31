@@ -3,7 +3,6 @@ from __future__ import annotations
 from src.config.settings import SETTINGS
 from src.config.theme_policy_loader import ThemeTranslationPolicy, load_theme_translation_policy
 
-
 _POLICY_CACHE: ThemeTranslationPolicy | None = None
 
 
@@ -28,8 +27,19 @@ def should_translate_theme_entry(*, resource_type: str, key: str, value: str) ->
     key_path = key_l.split(":", 1)[0]
     leaf_key = key_path.rsplit(".", 1)[-1]
 
-    allowed = any(fragment in leaf_key for fragment in policy.allowed_key_fragments) or any(
-        fragment in key_l for fragment in policy.allowed_key_fragments
+    # Shopify exposes theme-owned locale strings together with thousands of
+    # platform-managed checkout/account strings. Only explicitly configured
+    # store-owned namespaces are translated automatically.
+    is_custom_locale = rt == "ONLINE_STORE_THEME_LOCALE_CONTENT" and any(
+        key_path.startswith(prefix) for prefix in policy.allowed_locale_key_prefixes
+    )
+    if rt == "ONLINE_STORE_THEME_LOCALE_CONTENT" and not is_custom_locale:
+        return False
+
+    allowed = (
+        is_custom_locale
+        or any(fragment in leaf_key for fragment in policy.allowed_key_fragments)
+        or any(fragment in key_l for fragment in policy.allowed_key_fragments)
     )
     if policy.allowed_key_fragments and not allowed:
         return False

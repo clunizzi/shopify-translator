@@ -5,7 +5,6 @@ from collections.abc import Callable
 from src.config.metafield_policy_loader import MetafieldPolicy, load_metafield_policy
 from src.config.settings import SETTINGS
 
-
 BLOCKED_NAMESPACE_PREFIXES = (
     "mm-google",
     "google",
@@ -54,6 +53,8 @@ def should_translate_metafield_leaf(
         return False
 
     full_key = f"{(namespace or '').strip()}.{(key or '').strip()}"
+    if full_key in policy.blocked_keys:
+        return False
     allowed = policy.allowed_leafs_by_key.get(full_key)
     if allowed is not None:
         return leaf_name in allowed
@@ -74,5 +75,8 @@ def make_metafield_leaf_filter(namespace: str, key: str) -> Callable[[tuple, str
 def should_translate_metafield(namespace: str, key: str) -> bool:
     ns = (namespace or "").strip().lower()
     if any(ns.startswith(prefix) for prefix in BLOCKED_NAMESPACE_PREFIXES):
+        return False
+    full_key = f"{(namespace or '').strip()}.{(key or '').strip()}"
+    if full_key in get_metafield_policy().blocked_keys:
         return False
     return bool((namespace or "").strip() and (key or "").strip())

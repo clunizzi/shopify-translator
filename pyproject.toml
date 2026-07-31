@@ -54,7 +54,10 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-ignore = []
+ignore = ["E501"] # Black may preserve long strings and URLs.
+
+[tool.ruff.lint.per-file-ignores]
+"src/cli.py" = ["B008"] # Typer declares options in function defaults by design.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

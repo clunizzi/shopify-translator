@@ -1,205 +1,218 @@
-# Shopify Translator (ITA)
+# Shopify Translator
 
-Strumento Python per tradurre i contenuti Shopify (prodotti, HTML Liquid, metafield JSON, SEO) in modo ripetibile, con bootstrap da product ID e sincronizzazione continua via webhook AWS.
+A production-oriented translation engine for Shopify catalogs and themes. It
+combines Shopify Admin GraphQL, OpenAI, Neon/PostgreSQL, AWS Lambda/SQS and an
+optional Cloudflare Workers control panel.
 
-## Perché usarlo
-- Sincronizzazione live con Shopify tramite Receiver + Worker AWS (SQS, Lambda, DynamoDB, Neon/PostgreSQL) con debounce, dedup e stato PDP centralizzato.
-- Traduzioni OpenAI ottimizzate per e‑commerce tecnico: protezione Liquid/HTML, gestione metafield JSON, prompt specializzati.
-- Stato cloud centralizzato su Neon/PostgreSQL con translation memory e dictionary.
-- Telemetria semplice (token, cache hit/miss, tempo OpenAI) e logging JSONL.
+The project is designed around one rule: **translate only content that has
+actually changed**. Inventory-only `products/update` events are filtered before
+OpenAI or Shopify writes, remote translations are audited before registration,
+and theme writes are blocked when the approved theme is no longer the live
+MAIN theme.
 
-## Struttura principale
-- `src/cli.py` – Typer CLI (`shopify-translator`) con comandi `bootstrap`, `sync`, `sync-webhook`, `neon-reset` e utilità cache.
-- `src/translate/` – motore di traduzione, cache SQLite, regole DNT.
-- `src/shopify/` – GraphQL client e utility Shopify.
-- `src/aws_lambda/` – funzioni `receiver` (webhook → SQS) e `worker` (SQS → Shopify/OpenAI).
-- `infra/terraform/` – infrastruttura AWS (SQS, Lambda, DynamoDB) + esempi tfvars.
-- `state/`, `logs/` – file locali di supporto e log JSONL.
+## What it covers
 
-## Prerequisiti
-- Python 3.11+
-- `pip`, `make` (per packaging) e opzionalmente Docker (build Lambda compatibili).
-- Account AWS con permessi per SQS, Lambda, DynamoDB, Secrets Manager (per la sync cloud).
-- Token Shopify Admin e API Key OpenAI (staging: variabili locali; produzione: Secrets Manager).
+- Products, variants, options and selected metafields.
+- Custom SEO title and description fields.
+- Missing localized handles without rewriting existing URLs.
+- JSON templates, section groups and configured locale-file namespaces.
+- Store policies and other explicitly enabled global resources.
+- Translation memory, dictionary entries, source digests and sync state in
+  Neon/PostgreSQL.
+- Near-real-time product and theme updates through Shopify webhooks.
+- Scheduled reconciliation as a safety net for missed or delayed events.
+- An Access-protected Cloudflare dashboard for audits, previews and controlled
+  manual corrections.
 
-## Setup rapido locale
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env  # compila chiavi OpenAI/Shopify se servono
-```
-Variabili principali (`.env`):
-- `OPENAI_API_KEY`, `OPENAI_MODEL`
-- `TARGET_LOCALE` (default fr-FR)
-- `TRANSLATOR_SPECIALIZATION`, `SOURCE_LANGUAGE_NAME`
-- opzionali: `DO_NOT_TRANSLATE_YAML`, `LOG_PAYLOADS`, `TRANSLATION_CACHE_PATH`
+## Safety model
 
-## Bootstrap catalogo da product IDs
-Per il bootstrap field-by-field del catalogo:
-```bash
-shopify-translator bootstrap-products --apply-translations
-```
-Per default legge gli ID da `state/bootstrap_product_ids.txt` oppure accetta `--ids-file`.
-Il bootstrap usa Shopify come sorgente live, salva stato e translation memory su Neon/PostgreSQL e non tocca gli handle dei prodotti esistenti.
-Alias breve:
-```bash
-shopify-translator bootstrap --apply-translations
-```
+- Shopify writes require explicit flags and production configuration.
+- The example Terraform configuration starts with `disable_sync = "true"`.
+- Theme writes require an approved theme ID matching Shopify's current MAIN
+  theme.
+- Webhook HMAC validation, SQS retries, dead-letter queues, deduplication and
+  debounce controls are built in.
+- Existing current translations are preserved; only missing or outdated fields
+  are registered.
+- Liquid, HTML structure, JSON shape and protected terminology are validated
+  before a translation is accepted.
+- Secrets belong in local environment files, AWS Secrets Manager and
+  Cloudflare Worker secrets. They are never required in tracked configuration.
 
-## Sync incrementale da Neon
-Per riallineare prodotti già presenti usando il confronto campo-per-campo sullo stato PDP salvato in Neon:
-```bash
-shopify-translator sync --store-only
-```
+## Architecture
 
-## Reset schema Neon
-Per ripartire pulito con il nuovo backend document-based:
-```bash
-shopify-translator neon-reset --yes
+```text
+Shopify webhooks
+      |
+      v
+AWS Lambda receiver --HMAC--> SQS --> Lambda worker
+                                      |     |     |
+                                      |     |     +--> Shopify Admin GraphQL
+                                      |     +--------> OpenAI
+                                      +--------------> Neon/PostgreSQL
+
+EventBridge --> catalog/theme pollers --> the same sync engine
+
+Cloudflare Access --> Workers dashboard --> Neon + least-privilege AWS invoke
 ```
 
-## Sync automatica (AWS)
-1. Prepara `infra/terraform/terraform.tfvars` partendo dall’esempio e imposta:
-   - `project`, `aws_region`, `shop_domain`, `source_locale`, `target_locales`
-   - ARNs Secrets Manager: `openai_api_key_secret_arn`, `shopify_admin_token_secret_arn`, `shopify_webhook_secret_arn`
-   - Opzioni worker: `mf_include`, `debounce_seconds`, `dry_run`, `disable_sync`, `log_verbose_sync`
-2. Builda i pacchetti Lambda:
-   ```bash
-   make build-receiver
-   make build-worker-docker PY=3.12  # oppure PY=3.11
-   ```
-   Sequenza completa (build + upload S3 + apply): vedi `comandini`.
-3. Deploya con Terraform:
-   ```bash
-   terraform -chdir=infra/terraform init
-   terraform -chdir=infra/terraform apply
-   ```
-4. Registra in Shopify i webhook `products/create` e `products/update` puntando alla Function URL del receiver.
-5. Worker env principali: `SOURCE_LOCALE`, `TARGET_LOCALES`, `MF_INCLUDE`, `DEBOUNCE_SECONDS`, `DRY_RUN`, `DISABLE_SYNC`, `LOG_VERBOSE_SYNC`, `OPENAI_API_KEY_SECRET_ARN`, `SHOPIFY_ADMIN_TOKEN_SECRET_ARN`, `NEON_DATABASE_URL_SECRET_ARN`. Receiver richiede `SQS_URL`, `DISABLE_SYNC` e il segreto HMAC (`SHOPIFY_WEBHOOK_SECRET[_ARN]`).
-6. Il worker cloud usa Neon/PostgreSQL come fonte di verità per stato PDP, translation memory e dictionary. DynamoDB resta per dedup/debounce eventi (`product_snapshots`, `webhook_dedup`).
+## Repository layout
 
-## Telemetria & logging
-- Ogni run produce un JSON di riepilogo (`--stats` o log Lambda) con `openai_calls`, token, `cache_hit/miss` e righe tradotte.
-- Log strutturati JSONL in `logs/` o CloudWatch; utili con `jq`.
-- `shopify-translator cache purge --vacuum` pulisce la cache locale.
-
-## Test & qualità
-```bash
-pytest
-ruff check src tests
-black --check src tests
-```
-La cartella `tests/` copre worker/receiver AWS, policy di traduzione, validatori HTML/JSON e dictionary resolution.
-
-## Troubleshooting
-- Cache corrotta? cancella `state/cache.sqlite`.
-- Errore OpenAI in Lambda: guarda i log `openai_import_ok` nel worker.
-- Se il pacchetto Lambda supera 70 MB, carica `build/worker.zip` su S3 e passa `worker_s3_bucket/worker_s3_key` a Terraform.
-- Pausa veloce della sync: imposta `DISABLE_SYNC=true` (env) su receiver/worker oppure usa `shopify-translator sync-webhook --disable`.
-
-## Licenza
-Rimuovi dati sensibili prima di condividere il repository. Imposta qui il testo di licenza desiderato.
-
-
-# Shopify Translator (ENG)
-
-Python tool to translate Shopify content (products, Liquid HTML, metafield JSON, SEO) in a consistent and repeatable way, with product-ID bootstrap and continuous sync via AWS webhooks.
-
-## Why use it
-
-* **Live sync** with Shopify using Receiver + Worker on AWS (SQS, Lambda, DynamoDB, Neon/PostgreSQL) with debounce, deduplication, and centralized PDP state.
-* **OpenAI translations** optimized for technical e-commerce: protects Liquid/HTML, handles JSON metafields, and uses specialized prompts.
-* **Centralized state on Neon/PostgreSQL** with translation memory and dictionary.
-* **Lightweight telemetry** (token usage, cache hit/miss, OpenAI time) and JSONL logging.
-
-## Main structure
-
-* `src/cli.py` – Typer CLI (`shopify-translator`) with commands `bootstrap`, `sync`, `sync-webhook`, `neon-reset` and cache utilities.
-* `src/translate/` – translation engine, SQLite cache, Do-Not-Translate rules.
-* `src/shopify/` – GraphQL client and Shopify utilities.
-* `src/aws_lambda/` – `receiver` (webhook → SQS) and `worker` (SQS → Shopify/OpenAI).
-* `infra/terraform/` – AWS infrastructure (SQS, Lambda, DynamoDB) + tfvars examples.
-* `state/`, `logs/` – local support files and JSONL logs.
+- `src/translate/` — translation engine, validation and cache.
+- `src/bootstrap/` — catalog, SEO, handles, theme and reconciliation flows.
+- `src/shopify/` — Shopify Admin GraphQL client.
+- `src/state/` — Neon/PostgreSQL persistence.
+- `src/aws_lambda/` — webhook receiver, worker and scheduled pollers.
+- `infra/terraform/` — AWS infrastructure and safe example variables.
+- `cloudflare-admin/` — optional operations dashboard.
+- `src/config/` — configurable field, metafield, theme and terminology policy.
+- `tests/` — unit and contract coverage for the critical sync paths.
 
 ## Requirements
 
-* Python 3.11+
-* `pip`, `make` (for packaging), optionally Docker (for Lambda builds).
-* AWS account with SQS, Lambda, DynamoDB, Secrets Manager (for cloud sync).
-* Shopify Admin token + OpenAI API key (local dev via `.env`, production via Secrets Manager).
+- Python 3.11+
+- Shopify Admin API credentials with the scopes required by the resources you
+  enable, including `read_themes` for theme tracking.
+- OpenAI API credentials.
+- Neon/PostgreSQL.
+- AWS credentials for cloud deployment.
+- Node.js and npm for the optional Cloudflare dashboard.
+- Docker is recommended for Lambda-compatible Python builds.
 
-## Quick local setup
+## Local setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env  # fill in OpenAI/Shopify keys if needed
+cp .env.example .env
 ```
 
-Main `.env` variables:
+Fill only the local `.env`. The example intentionally contains no credentials.
+Important variables include:
 
-* `OPENAI_API_KEY`, `OPENAI_MODEL`
-* `TARGET_LOCALE` (default fr-FR)
-* `TRANSLATOR_SPECIALIZATION`, `SOURCE_LANGUAGE_NAME`
-* optional: `DO_NOT_TRANSLATE_YAML`, `LOG_PAYLOADS`, `TRANSLATION_CACHE_PATH`
+- `SHOPIFY_STORE_DOMAIN`, `SHOPIFY_ADMIN_TOKEN`
+- `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_FALLBACK_MODEL`
+- `NEON_DATABASE_URL`
+- `SOURCE_LOCALE`, `TARGET_LOCALES`
+- `TRANSLATOR_SPECIALIZATION`, `TRANSLATOR_BRAND`, `TRANSLATOR_AUDIENCE`
+- `DO_NOT_TRANSLATE_YAML`, `METAFIELD_TRANSLATION_POLICY_PATH`,
+  `THEME_TRANSLATION_POLICY_PATH`
 
-## Catalog bootstrap from product IDs
+Store-specific policy overlays can be placed in ignored `*.local.yaml` files.
+This keeps public defaults generic while still packaging local policies into a
+Lambda build.
+
+## Common commands
 
 ```bash
+# Catalog bootstrap and incremental sync
 shopify-translator bootstrap --apply-translations
+shopify-translator sync --apply-translations --dry-run
+
+# SEO audit and controlled rollout
+shopify-translator seo-audit --target-locales fr,de
+shopify-translator seo-sync --target-locales fr,de --dry-run
+shopify-translator seo-sync --target-locales fr,de \
+  --apply-translations --max-products 100 --continue-on-error
+
+# Localized handles
+shopify-translator handles-audit --target-locales fr,de
+shopify-translator handles-complete --target-locales fr,de --dry-run
+
+# Read-only theme tracking; replace the example with the approved MAIN ID
+shopify-translator theme-track --approved-theme-id 123456789012
+
+# Validate model behavior without Shopify or Neon writes
+shopify-translator model-canary --models gpt-5.6-terra,gpt-5.6-sol
 ```
 
-By default it reads IDs from `state/bootstrap_product_ids.txt` or accepts `--ids-file`.
+Always review a dry-run before enabling writes against a live store.
 
-## Automatic sync (AWS)
+## AWS deployment
 
-1. Prepare `infra/terraform/terraform.tfvars` from the example and set:
-
-   * `project`, `aws_region`, `shop_domain`, `source_locale`, `target_locales`
-   * Secrets Manager ARNs: `openai_api_key_secret_arn`, `shopify_admin_token_secret_arn`, `shopify_webhook_secret_arn`
-   * Worker options: `mf_include`, `debounce_seconds`, `dry_run`, `disable_sync`, `log_verbose_sync`
-2. Build Lambda packages:
+1. Build the Lambda packages:
 
    ```bash
    make build-receiver
    make build-worker-docker PY=3.12
    ```
-   Full build + S3 upload + apply sequence: see `comandini`.
-3. Deploy with Terraform:
+
+2. Copy the safe example and fill the ignored local file:
+
+   ```bash
+   cp infra/terraform/terraform.tfvars.example \
+      infra/terraform/terraform.tfvars
+   ```
+
+3. Keep `disable_sync = "true"`, provision the infrastructure and review the
+   outputs:
 
    ```bash
    terraform -chdir=infra/terraform init
+   terraform -chdir=infra/terraform plan
    terraform -chdir=infra/terraform apply
    ```
-4. Register Shopify webhooks (`products/create`, `products/update`) pointing to the Receiver Function URL.
-5. Worker env vars: `SOURCE_LOCALE`, `TARGET_LOCALES`, `MF_INCLUDE`, `DEBOUNCE_SECONDS`, `DRY_RUN`, `DISABLE_SYNC`, `LOG_VERBOSE_SYNC`, `OPENAI_API_KEY_SECRET_ARN`, `SHOPIFY_ADMIN_TOKEN_SECRET_ARN`, `NEON_DATABASE_URL_SECRET_ARN`.
-   Receiver requires `SQS_URL` and HMAC secret (`SHOPIFY_WEBHOOK_SECRET[_ARN]`).
-6. The cloud worker uses Neon/PostgreSQL as the source of truth for PDP state, translation memory, and dictionary. DynamoDB remains only for debounce/dedup (`product_snapshots`, `webhook_dedup`).
 
-## Telemetry & logging
+4. Register `products/create`, `products/update`, `themes/update` and
+   `themes/publish` webhooks against the receiver URL.
+5. Run audits and canaries, set the approved MAIN theme ID, then deliberately
+   enable the required sync paths.
 
-* Each run outputs a JSON summary (`--stats` or Lambda log) with `openai_calls`, tokens, `cache_hit/miss`, translated rows.
-* Structured JSONL logs in `logs/` or CloudWatch; easy to parse with `jq`.
-* `shopify-translator cache purge --vacuum` cleans the local cache.
+Large worker packages can be uploaded to S3 with
+`scripts/deploy-worker.sh`. The script creates a Terraform plan and applies it
+only when `DEPLOY_APPLY=1` is provided.
 
-## Tests & quality
+## Cloudflare dashboard
+
+```bash
+cd cloudflare-admin
+cp .dev.vars.example .dev.vars
+npm install
+npm run dev
+```
+
+The tracked Wrangler config is intentionally locked and contains only example
+values. For deployment, use a local ignored config and Cloudflare secrets for:
+
+- `NEON_DATABASE_URL`
+- `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+
+The IAM identity used by the dashboard should only be allowed to invoke the
+configured operations Lambda. Put the dashboard behind Cloudflare Access
+before unlocking it.
+
+## Configuration policies
+
+The default configuration is deliberately conservative:
+
+- `do_not_translate.yaml` contains generic units, tokens and a minimal glossary.
+- `metafield_translation.yaml` allowlists textual leaves and blocks IDs, URLs,
+  filenames and other structural values.
+- `theme_translation.yaml` allowlists textual theme fields. Locale resources
+  are translated only for explicitly listed, store-owned key prefixes because
+  Shopify exposes platform checkout/account strings through the same resource.
+
+Review and customize these policies for each store before enabling writes.
+
+## Tests
 
 ```bash
 pytest
 ruff check src tests
 black --check src tests
+
+cd cloudflare-admin
+npm run check
 ```
 
-`tests/` covers AWS worker/receiver, translation policies, HTML/JSON validators, and dictionary resolution.
+## Operational runbooks
 
-## Troubleshooting
-
-* Corrupted cache? Delete `state/cache.sqlite`.
-* OpenAI import error in Lambda? Check `openai_import_ok` in worker logs.
-* Lambda package >70MB? Upload `build/worker.zip` to S3 and set `worker_s3_bucket/worker_s3_key` in Terraform.
-* Quick pause for sync: set `DISABLE_SYNC=true` (env) on receiver/worker or use `shopify-translator sync-webhook --disable`.
+- `docs/cloudflare-neon-cutover.md`
+- `docs/cloudflare-aws-key-rotation.md`
 
 ## License
-Remove sensitive data before sharing the repository. Add your license text here.
+
+No open-source license has been selected yet. Until one is added, standard
+copyright rules apply.

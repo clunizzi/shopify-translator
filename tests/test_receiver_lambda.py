@@ -59,3 +59,67 @@ def test_receiver_returns_500_on_enqueue_failure(monkeypatch):
     res = receiver.handler(event, None)
 
     assert res["statusCode"] == 500
+
+
+def test_receiver_still_enqueues_while_sync_is_paused(monkeypatch):
+    monkeypatch.setenv("SQS_URL", "https://example.com/q")
+    monkeypatch.setenv("SHOPIFY_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("DISABLE_SYNC", "true")
+    monkeypatch.setattr(receiver, "_CACHED_SECRET", None)
+    sent = []
+
+    class _FakeSQS:
+        def send_message(self, **kwargs):
+            sent.append(kwargs)
+            return {"MessageId": "m-paused"}
+
+    monkeypatch.setattr(receiver, "_SQS", _FakeSQS())
+
+    body = b'{"id":202}'
+    event = {
+        "headers": {
+            "X-Shopify-Topic": "products/update",
+            "X-Shopify-Shop-Domain": "example.myshopify.com",
+            "X-Shopify-Event-Id": "evt-paused",
+            "X-Shopify-Hmac-Sha256": _shopify_hmac("secret", body),
+        },
+        "body": body.decode(),
+        "isBase64Encoded": False,
+    }
+
+    res = receiver.handler(event, None)
+
+    assert res["statusCode"] == 200
+    assert len(sent) == 1
+    assert sent[0]["MessageBody"] == body.decode()
+
+
+def test_receiver_delays_theme_webhooks_for_shopify_consistency(monkeypatch):
+    monkeypatch.setenv("SQS_URL", "https://example.com/q")
+    monkeypatch.setenv("SHOPIFY_WEBHOOK_SECRET", "secret")
+    monkeypatch.delenv("DISABLE_SYNC", raising=False)
+    monkeypatch.setattr(receiver, "_CACHED_SECRET", None)
+    sent = []
+
+    class _FakeSQS:
+        def send_message(self, **kwargs):
+            sent.append(kwargs)
+            return {"MessageId": "theme-message"}
+
+    monkeypatch.setattr(receiver, "_SQS", _FakeSQS())
+    body = b'{"id":123456789012}'
+    event = {
+        "headers": {
+            "X-Shopify-Topic": "themes/update",
+            "X-Shopify-Shop-Domain": "example.myshopify.com",
+            "X-Shopify-Event-Id": "theme-event",
+            "X-Shopify-Hmac-Sha256": _shopify_hmac("secret", body),
+        },
+        "body": body.decode(),
+        "isBase64Encoded": False,
+    }
+
+    result = receiver.handler(event, None)
+
+    assert result["statusCode"] == 200
+    assert sent[0]["DelaySeconds"] == 10

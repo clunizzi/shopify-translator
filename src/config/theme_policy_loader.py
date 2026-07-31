@@ -10,6 +10,7 @@ import yaml
 @dataclass(frozen=True)
 class ThemeTranslationPolicy:
     allowed_resource_types: frozenset[str]
+    allowed_locale_key_prefixes: tuple[str, ...]
     allowed_key_fragments: tuple[str, ...]
     blocked_key_fragments: tuple[str, ...]
     blocked_value_patterns: tuple[re.Pattern[str], ...]
@@ -27,11 +28,20 @@ def load_theme_translation_policy(path: str | Path) -> ThemeTranslationPolicy:
         allowed_resource_types=frozenset(
             str(x).strip() for x in (data.get("allowed_resource_types") or []) if str(x).strip()
         ),
+        allowed_locale_key_prefixes=tuple(
+            str(x).strip().lower()
+            for x in (data.get("allowed_locale_key_prefixes") or [])
+            if str(x).strip()
+        ),
         allowed_key_fragments=tuple(
-            str(x).strip().lower() for x in (data.get("allowed_key_fragments") or []) if str(x).strip()
+            str(x).strip().lower()
+            for x in (data.get("allowed_key_fragments") or [])
+            if str(x).strip()
         ),
         blocked_key_fragments=tuple(
-            str(x).strip().lower() for x in (data.get("blocked_key_fragments") or []) if str(x).strip()
+            str(x).strip().lower()
+            for x in (data.get("blocked_key_fragments") or [])
+            if str(x).strip()
         ),
         blocked_value_patterns=tuple(
             re.compile(str(x), re.IGNORECASE | re.DOTALL)

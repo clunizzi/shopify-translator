@@ -9,8 +9,6 @@ from dataclasses import dataclass
 
 import boto3
 
-from src.logging_setup import configure_logging
-
 
 @dataclass(frozen=True)
 class ReceiverConfig:
@@ -77,11 +75,7 @@ def _decode_body(event: dict) -> bytes:
 
 
 def handler(event, context):
-    configure_logging()
     cfg = _config()
-    if cfg.disable_sync:
-        print(json.dumps({"ok": True, "skip": "disabled", "component": "receiver"}))
-        return {"statusCode": 200, "body": "OK"}
 
     try:
         headers = {(k or "").lower(): v for k, v in (event.get("headers") or {}).items()}
@@ -96,17 +90,27 @@ def handler(event, context):
 
     try:
         if not _valid_hmac(cfg, raw_body, hmac_header):
-            print(json.dumps({
-                "ok": False,
-                "reason": "invalid_hmac",
-                "topic": topic,
-                "shop": shop,
-                "event_id": event_id,
-                "body_len": len(raw_body or b""),
-            }))
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "reason": "invalid_hmac",
+                        "topic": topic,
+                        "shop": shop,
+                        "event_id": event_id,
+                        "body_len": len(raw_body or b""),
+                    }
+                )
+            )
             return {"statusCode": 401, "body": "Invalid HMAC"}
 
-        delay = 8 if topic.lower() == "products/create" else 0
+        topic_lower = topic.lower()
+        if topic_lower == "products/create":
+            delay = 8
+        elif topic_lower in {"themes/update", "themes/publish"}:
+            delay = 10
+        else:
+            delay = 0
         resp = _sqs().send_message(
             QueueUrl=cfg.sqs_url,
             MessageBody=raw_body.decode("utf-8"),
@@ -117,23 +121,32 @@ def handler(event, context):
                 "EventId": {"DataType": "String", "StringValue": event_id or ""},
             },
         )
-        print(json.dumps({
-            "ok": True,
-            "enqueued": True,
-            "message_id": (resp or {}).get("MessageId"),
-            "topic": topic,
-            "shop": shop,
-            "event_id": event_id,
-            "delay": delay,
-        }))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "enqueued": True,
+                    "message_id": (resp or {}).get("MessageId"),
+                    "topic": topic,
+                    "shop": shop,
+                    "event_id": event_id,
+                    "delay": delay,
+                    "sync_paused": cfg.disable_sync,
+                }
+            )
+        )
         return {"statusCode": 200, "body": "OK"}
     except Exception as e:
-        print(json.dumps({
-            "ok": False,
-            "reason": "enqueue_failed",
-            "topic": topic,
-            "shop": shop,
-            "event_id": event_id,
-            "error": str(e),
-        }))
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "reason": "enqueue_failed",
+                    "topic": topic,
+                    "shop": shop,
+                    "event_id": event_id,
+                    "error": str(e),
+                }
+            )
+        )
         return {"statusCode": 500, "body": "Internal Server Error"}

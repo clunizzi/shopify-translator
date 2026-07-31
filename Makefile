@@ -4,8 +4,9 @@ SHELL := /bin/bash
 
 build-receiver:
 	@mkdir -p build
+	@rm -f build/receiver.zip
 	# Pack with directory structure preserved (module path: src/aws_lambda/receiver.py)
-	@zip -r build/receiver.zip src/aws_lambda/receiver.py >/dev/null
+	@zip -r build/receiver.zip src/__init__.py src/aws_lambda/__init__.py src/aws_lambda/receiver.py >/dev/null
 	@echo "Built build/receiver.zip"
 
 clean-worker:

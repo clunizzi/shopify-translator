@@ -1,0 +1,1588 @@
+const numberFormat = new Intl.NumberFormat("it-IT");
+const percentFormat = new Intl.NumberFormat("it-IT", { maximumFractionDigits: 1 });
+const dateFormat = new Intl.DateTimeFormat("it-IT", {
+  dateStyle: "short",
+  timeStyle: "short",
+});
+
+const ACTIONS = {
+  theme_audit: {
+    title: "Audit completo",
+    copy: "Legge sorgenti e traduzioni direttamente da Shopify. Non modifica il tema e non usa OpenAI.",
+    risk: "Solo lettura",
+    confirmLabel: "Avvia audit",
+    phrase: "",
+  },
+  theme_canary: {
+    title: "Canary sul tema live",
+    copy: "Registra al massimo un campo mancante o obsoleto, poi si ferma.",
+    risk: "Una scrittura",
+    confirmLabel: "Avvia canary",
+    phrase: "CANARY",
+  },
+  theme_sync: {
+    title: "Sincronizza il tema live",
+    copy: "Registra solo traduzioni mancanti o obsolete. I file del tema non vengono scritti.",
+    risk: "Scrittura live",
+    confirmLabel: "Sincronizza",
+    phrase: "SYNC",
+  },
+};
+
+const byId = (id) => document.getElementById(id);
+let currentPayload = null;
+let selectedAction = null;
+let refreshTimer = null;
+
+function asDate(value) {
+  if (!value) return "mai";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "dato non valido" : dateFormat.format(date);
+}
+
+function asBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const units = ["B", "KB", "MB", "GB"];
+  const exponent = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  );
+  const amount = bytes / 1024 ** exponent;
+  return `${amount.toLocaleString("it-IT", { maximumFractionDigits: 1 })} ${units[exponent]}`;
+}
+
+function productNumber(gid) {
+  return String(gid || "").split("/").at(-1) || "sconosciuto";
+}
+
+function makeElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function setNotice(kind, title, copy) {
+  const notice = byId("notice");
+  notice.className = `notice is-${kind}`;
+  notice.querySelector(".notice-title").textContent = title;
+  notice.querySelector(".notice-copy").textContent = copy;
+}
+
+function groupProductTranslations(rows) {
+  const grouped = new Map();
+  for (const row of rows || []) {
+    const locale = String(row.locale || "unknown").toLowerCase();
+    const current = grouped.get(locale) || {
+      statuses: {},
+      statusUpdatedAt: {},
+      updatedAt: null,
+    };
+    current.statuses[row.status] =
+      Number(current.statuses[row.status] || 0) + Number(row.count || 0);
+    current.statusUpdatedAt[row.status] = row.updated_at;
+    if (!current.updatedAt || String(row.updated_at || "") > current.updatedAt) {
+      current.updatedAt = row.updated_at;
+    }
+    grouped.set(locale, current);
+  }
+  return grouped;
+}
+
+function renderSystemState(data) {
+  const groups = groupProductTranslations(data.product_translations);
+  const failures = Array.from(groups.values()).reduce(
+    (total, group) => total + Number(group.statuses.failed || 0),
+    0,
+  );
+  const incomplete = Array.from(groups.values()).reduce(
+    (total, group) =>
+      total +
+      Number(group.statuses.pending || 0) +
+      Number(group.statuses.translated || 0) +
+      Number(group.statuses.partial || 0),
+    0,
+  );
+  const activeJob = (data.jobs || []).find((job) =>
+    ["queued", "running"].includes(job.status),
+  );
+  const title = byId("system-state-title");
+  const copy = byId("system-state-copy");
+  const symbol = byId("system-symbol");
+  const state = byId("system-symbol").closest(".system-state");
+
+  if (activeJob) {
+    state.className = "system-state state-running";
+    symbol.textContent = "RUN";
+    title.textContent = "Operazione in corso";
+    copy.textContent = `${actionLabel(activeJob.action)} avviato ${asDate(activeJob.created_at)}.`;
+  } else if (failures > 0) {
+    state.className = "system-state state-attention";
+    symbol.textContent = "!";
+    title.textContent = "Riconciliazione da completare";
+    copy.textContent = `${numberFormat.format(failures)} stati non sono ancora stati verificati correttamente su Shopify.`;
+  } else if (incomplete > 0) {
+    state.className = "system-state state-attention";
+    symbol.textContent = "!";
+    title.textContent = "Catalogo verificato, traduzioni incomplete";
+    copy.textContent = `${numberFormat.format(incomplete)} stati hanno almeno un contenuto mancante o obsoleto su Shopify.`;
+  } else {
+    state.className = "system-state state-healthy";
+    symbol.textContent = "OK";
+    title.textContent = "Sistema operativo";
+    copy.textContent = "Nessun errore persistito e nessuna operazione bloccata.";
+  }
+}
+
+function renderLocales(rows, productSources) {
+  const target = byId("locale-list");
+  const grouped = groupProductTranslations(rows);
+
+  if (!grouped.size) {
+    target.replaceChildren(
+      makeElement("p", "empty-state", "Nessuna traduzione prodotto registrata."),
+    );
+    return;
+  }
+
+  let totalSynced = 0;
+  let totalFailed = 0;
+  let totalIncomplete = 0;
+  const localeRows = Array.from(grouped.entries()).map(([locale, data]) => {
+    const synced = Number(data.statuses.synced || 0);
+    const failed = Number(data.statuses.failed || 0);
+    const pending =
+      Number(data.statuses.pending || 0) +
+      Number(data.statuses.translated || 0) +
+      Number(data.statuses.partial || 0);
+    totalSynced += synced;
+    totalFailed += failed;
+    totalIncomplete += pending;
+    const coverage = productSources > 0 ? (synced / productSources) * 100 : 0;
+
+    const article = makeElement("article", "locale-row");
+    const localeCode = makeElement("span", "locale-code", locale.toUpperCase());
+    const detail = makeElement("div", "locale-detail");
+    detail.append(
+      makeElement(
+        "strong",
+        "",
+        `${numberFormat.format(synced)} completi su Shopify`,
+      ),
+      makeElement(
+        "span",
+        "",
+        `${percentFormat.format(coverage)}% verificato completo. Aggiornato ${asDate(data.updatedAt)}`,
+      ),
+    );
+    const counters = makeElement("dl", "locale-counters");
+    const syncedCounter = makeElement("div", "counter-ok");
+    syncedCounter.append(
+      makeElement("dt", "", "OK"),
+      makeElement("dd", "", numberFormat.format(synced)),
+    );
+    const failedCounter = makeElement(
+      "div",
+      failed > 0 ? "counter-error" : "counter-muted",
+    );
+    failedCounter.append(
+      makeElement("dt", "", "Errore audit"),
+      makeElement("dd", "", numberFormat.format(failed)),
+    );
+    counters.append(syncedCounter, failedCounter);
+    if (pending > 0) {
+      const pendingCounter = makeElement("div", "counter-warning");
+      pendingCounter.append(
+        makeElement("dt", "", "Da completare"),
+        makeElement("dd", "", numberFormat.format(pending)),
+      );
+      counters.append(pendingCounter);
+    }
+    article.append(localeCode, detail, counters);
+    return article;
+  });
+
+  target.replaceChildren(...localeRows);
+  byId("catalog-summary").textContent =
+    `${numberFormat.format(totalSynced)} completi, ${numberFormat.format(totalIncomplete)} da completare, ${numberFormat.format(totalFailed)} errori audit`;
+  byId("catalog-note").textContent =
+    totalFailed > 0
+      ? "Gli errori audit non misurano traduzioni mancanti: indicano record che la riconciliazione non è ancora riuscita a verificare."
+      : totalIncomplete > 0
+        ? "“Da completare” significa che Shopify ha almeno un campo mancante, obsoleto o non valido. Nessuna traduzione viene generata durante l’audit."
+        : "Tutti i contenuti registrati risultano presenti e correnti su Shopify.";
+}
+
+function actionLabel(action) {
+  return (
+    {
+      theme_audit: "Audit tema",
+      theme_canary: "Canary tema",
+      theme_sync: "Sync tema",
+    }[action] || action
+  );
+}
+
+function statusLabel(status) {
+  return (
+    {
+      queued: "In coda",
+      running: "In corso",
+      succeeded: "Completato",
+      failed: "Fallito",
+      synced: "Sincronizzato",
+    }[status] || status
+  );
+}
+
+function statusClass(status) {
+  if (status === "failed") return "state-error";
+  if (["queued", "running", "pending", "translated"].includes(status)) {
+    return "state-warning";
+  }
+  return "state-ok";
+}
+
+function latestSuccessfulAudit(jobs) {
+  return (jobs || []).find(
+    (job) => job.action === "theme_audit" && job.status === "succeeded",
+  );
+}
+
+function renderThemeAudit(jobs) {
+  const target = byId("theme-audit");
+  const audit = latestSuccessfulAudit(jobs);
+  if (!audit || !audit.result?.locales) {
+    target.replaceChildren(
+      makeElement(
+        "p",
+        "empty-state",
+        "Avvia un audit per verificare la copertura reale su Shopify.",
+      ),
+    );
+    return;
+  }
+
+  const summary = makeElement("div", "audit-summary");
+  const header = makeElement("div", "audit-header");
+  header.append(
+    makeElement("strong", "", audit.result.theme_name || "Tema live"),
+    makeElement(
+      "span",
+      "",
+      `${numberFormat.format(audit.result.source_fields || 0)} campi, ${numberFormat.format(audit.result.resources || 0)} risorse`,
+    ),
+  );
+  summary.append(header);
+
+  const locales = makeElement("div", "audit-locales");
+  for (const [locale, stats] of Object.entries(audit.result.locales)) {
+    const item = makeElement("article", "audit-locale");
+    item.append(
+      makeElement("strong", "locale-code", locale.toUpperCase()),
+      makeElement("span", "audit-current", `${numberFormat.format(stats.current || 0)} correnti`),
+      makeElement(
+        "span",
+        Number(stats.missing || 0) + Number(stats.outdated || 0) > 0
+          ? "audit-problem"
+          : "audit-clean",
+        `${numberFormat.format(stats.missing || 0)} mancanti, ${numberFormat.format(stats.outdated || 0)} obsoleti`,
+      ),
+    );
+    locales.append(item);
+  }
+  summary.append(locales);
+  summary.append(
+    makeElement("p", "audit-time", `Verificato ${asDate(audit.finished_at)}`),
+  );
+  target.replaceChildren(summary);
+}
+
+function jobResultSummary(job) {
+  if (job.status === "failed") return job.error || "Operazione non completata";
+  if (job.action === "theme_audit" && job.result?.locales) {
+    const issues = Object.values(job.result.locales).reduce(
+      (total, locale) =>
+        total + Number(locale.missing || 0) + Number(locale.outdated || 0),
+      0,
+    );
+    return issues > 0
+      ? `${numberFormat.format(issues)} campi da sistemare`
+      : "Copertura completa";
+  }
+  if (job.status === "succeeded") {
+    return `${numberFormat.format(job.result?.registered || 0)} traduzioni registrate`;
+  }
+  return job.status === "running" ? "Lambda in esecuzione" : "In attesa di AWS";
+}
+
+function renderJobs(jobs, operationsEnabled) {
+  const target = byId("job-list");
+  const active = (jobs || []).filter((job) =>
+    ["queued", "running"].includes(job.status),
+  );
+  byId("jobs-active").textContent = active.length
+    ? `${active.length} job attivo`
+    : "Nessun job attivo";
+
+  document.querySelectorAll("[data-action]").forEach((button) => {
+    button.disabled = active.length > 0 || !operationsEnabled;
+  });
+  byId("actions-state").textContent = operationsEnabled
+    ? active.length
+      ? "Operazione in corso"
+      : "Pronto"
+    : "Collegamento AWS da autorizzare";
+
+  if (!jobs?.length) {
+    target.replaceChildren(
+      makeElement("p", "empty-state", "Nessuna operazione registrata."),
+    );
+    return;
+  }
+
+  target.replaceChildren(
+    ...jobs.map((job) => {
+      const row = makeElement("article", "job-row");
+      const main = makeElement("div", "job-main");
+      main.append(
+        makeElement("strong", "", actionLabel(job.action)),
+        makeElement("span", "", jobResultSummary(job)),
+      );
+      const meta = makeElement("div", "job-meta");
+      meta.append(
+        makeElement(
+          "span",
+          `job-status ${statusClass(job.status)}`,
+          statusLabel(job.status),
+        ),
+        makeElement("time", "", asDate(job.created_at)),
+      );
+      row.append(main, meta);
+      return row;
+    }),
+  );
+}
+
+function renderRecent(rows) {
+  const target = byId("recent-list");
+  if (!rows?.length) {
+    target.replaceChildren(
+      makeElement("p", "empty-state", "Nessuna attività registrata."),
+    );
+    return;
+  }
+
+  target.replaceChildren(
+    ...rows.map((row) => {
+      const item = makeElement("article", "recent-row");
+      const identity = makeElement("div", "recent-identity");
+      identity.append(
+        makeElement("strong", "", `Prodotto #${productNumber(row.product_gid)}`),
+        makeElement("span", "", asDate(row.updated_at)),
+      );
+      const status = makeElement("div", "recent-status");
+      status.append(
+        makeElement("span", "locale-chip", String(row.target_locale || "").toUpperCase()),
+        makeElement(
+          "span",
+          statusClass(row.status),
+          statusLabel(row.status || "unknown"),
+        ),
+      );
+      item.append(identity, status);
+      return item;
+    }),
+  );
+}
+
+function renderThemeEvents(rows) {
+  const target = byId("theme-events");
+  if (!rows?.length) {
+    target.replaceChildren(
+      makeElement("p", "empty-state", "Nessuna modifica tema rilevata."),
+    );
+    return;
+  }
+
+  target.replaceChildren(
+    ...rows.map((row) => {
+      const item = makeElement("article", "event-row");
+      const main = makeElement("div");
+      main.append(
+        makeElement("strong", "", row.theme_name || `Tema ${row.actual_theme_id}`),
+        makeElement(
+          "span",
+          "",
+          row.status === "changed" ? "Modifica registrata" : statusLabel(row.status),
+        ),
+      );
+      item.append(
+        main,
+        makeElement("time", "", asDate(row.created_at)),
+      );
+      return item;
+    }),
+  );
+}
+
+function scheduleRefresh(jobs) {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+  const active = (jobs || []).some((job) =>
+    ["queued", "running"].includes(job.status),
+  );
+  if (active) {
+    refreshTimer = setTimeout(() => loadOverview({ quiet: true }), 15000);
+  }
+}
+
+function renderOverview(payload) {
+  currentPayload = payload;
+  const { data, config } = payload;
+  byId("shop-domain").textContent = config.shop_domain;
+  byId("theme-id").textContent = config.approved_theme_id;
+  byId("scheduled-sync").textContent = config.scheduled_sync_enabled
+    ? "ATTIVO"
+    : "SPENTO";
+  byId("scheduled-sync").className = config.scheduled_sync_enabled
+    ? "state-warning"
+    : "state-ok";
+  byId("realtime-sync").textContent = config.theme_realtime_sync_enabled
+    ? "ATTIVO"
+    : "SPENTO";
+  byId("realtime-sync").className = config.theme_realtime_sync_enabled
+    ? "state-ok"
+    : "state-warning";
+  byId("catalog-schedule").textContent = config.catalog_poll_schedule;
+  byId("generated-at").textContent = asDate(payload.generated_at);
+  byId("product-sources").textContent = numberFormat.format(data.product_sources);
+  byId("product-updated").textContent = `Aggiornato ${asDate(data.product_source_updated_at)}`;
+  byId("translation-memory").textContent = numberFormat.format(data.translation_memory);
+  byId("dictionary-entries").textContent = numberFormat.format(data.dictionary_entries);
+  byId("database-size").textContent = asBytes(data.database_bytes);
+  byId("actor").textContent = payload.actor;
+  byId("target-locales").textContent = config.target_locales
+    .map((locale) => locale.toUpperCase())
+    .join(", ");
+  const credentialDate = new Date(`${config.aws_credential_created_at}T00:00:00Z`);
+  const credentialDays = Math.max(
+    0,
+    Math.floor((Date.now() - credentialDate.getTime()) / 86400000),
+  );
+  byId("credential-age").textContent = Number.isFinite(credentialDays)
+    ? `${credentialDays} giorni`
+    : "Dato non disponibile";
+
+  renderSystemState(data);
+  renderLocales(data.product_translations, data.product_sources);
+  renderThemeAudit(data.jobs);
+  renderJobs(data.jobs, config.operations_enabled);
+  renderRecent(data.recent_translations);
+  renderThemeEvents(data.recent_theme_events);
+  scheduleRefresh(data.jobs);
+}
+
+async function loadOverview({ quiet = false } = {}) {
+  const button = byId("refresh");
+  button.disabled = true;
+  if (!quiet) {
+    setNotice("loading", "Caricamento stato", "Sto leggendo il quadro operativo.");
+  }
+
+  try {
+    const response = await fetch("/api/overview", {
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload?.error?.message || "Risposta non valida");
+    }
+    renderOverview(payload);
+    setNotice("ready", "Stato aggiornato", "Il quadro operativo è aggiornato.");
+  } catch (error) {
+    setNotice(
+      "error",
+      "Console non disponibile",
+      error instanceof Error ? error.message : "Errore imprevisto.",
+    );
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function openOperationDialog(action) {
+  const spec = ACTIONS[action];
+  if (!spec || !currentPayload) return;
+  selectedAction = action;
+  const themeId = currentPayload.config.approved_theme_id;
+  const phrase = spec.phrase ? `${spec.phrase} ${themeId}` : "";
+  byId("dialog-title").textContent = spec.title;
+  byId("dialog-copy").textContent = spec.copy;
+  byId("dialog-risk").textContent = spec.risk;
+  byId("dialog-risk").className =
+    action === "theme_sync"
+      ? "risk-label risk-critical"
+      : action === "theme_canary"
+        ? "risk-label risk-caution"
+        : "risk-label risk-safe";
+  byId("dialog-safety-copy").textContent =
+    `AWS accetta solo il tema MAIN con ID ${themeId}. Nessun file Liquid o JSON viene scritto.`;
+  byId("confirmation-field").hidden = !phrase;
+  byId("confirmation-phrase").textContent = phrase;
+  byId("confirmation-input").value = "";
+  byId("dialog-confirm").textContent = spec.confirmLabel;
+  byId("dialog-confirm").disabled = false;
+  byId("dialog-error").textContent = "";
+  byId("operation-dialog").showModal();
+  if (phrase) byId("confirmation-input").focus();
+}
+
+async function submitOperation(event) {
+  event.preventDefault();
+  if (!selectedAction) return;
+  const confirmButton = byId("dialog-confirm");
+  const confirmation = byId("confirmation-input").value;
+  confirmButton.disabled = true;
+  byId("dialog-error").textContent = "";
+
+  try {
+    const response = await fetch("/api/jobs/theme", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action: selectedAction,
+        confirmation,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload?.error?.message || "Operazione non accettata");
+    }
+    byId("operation-dialog").close();
+    setNotice(
+      "queued",
+      "Operazione accodata",
+      "AWS la eseguirà in modo asincrono. La pagina si aggiorna automaticamente.",
+    );
+    await loadOverview({ quiet: true });
+  } catch (error) {
+    byId("dialog-error").textContent =
+      error instanceof Error ? error.message : "Errore imprevisto.";
+    confirmButton.disabled = false;
+  }
+}
+
+let themeResources = [];
+let productResults = [];
+let selectedProductId = "";
+let selectedThemeResourceId = "";
+
+async function contentRequest(action, input = {}) {
+  const response = await fetch("/api/content", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action, ...input }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    const error = new Error(
+      payload?.error?.message || "Operazione contenuti non completata.",
+    );
+    error.code = payload?.error?.code || "CONTENT_OPERATION_FAILED";
+    throw error;
+  }
+  return payload;
+}
+
+function setContentFeedback(kind, text, targetId) {
+  const target = byId(targetId);
+  target.className = `content-feedback${kind ? ` is-${kind}` : ""}`;
+  target.textContent = text;
+}
+
+function switchContentTab(tabName) {
+  const productActive = tabName === "product";
+  byId("product-tab").classList.toggle("is-active", productActive);
+  byId("theme-tab").classList.toggle("is-active", !productActive);
+  byId("product-tab").setAttribute("aria-selected", String(productActive));
+  byId("theme-tab").setAttribute("aria-selected", String(!productActive));
+  byId("product-panel").hidden = !productActive;
+  byId("theme-panel").hidden = productActive;
+  if (!productActive && !themeResources.length) loadThemeResources();
+}
+
+function resultButton({ title, detail, active, onClick }) {
+  const button = makeElement(
+    "button",
+    `content-result${active ? " is-active" : ""}`,
+  );
+  button.type = "button";
+  button.append(
+    makeElement("strong", "", title),
+    makeElement("span", "", detail),
+  );
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function renderProductResults(products) {
+  productResults = products || [];
+  const target = byId("product-results");
+  if (!productResults.length) {
+    target.replaceChildren(
+      makeElement("p", "empty-state", "Nessun prodotto trovato."),
+    );
+    return;
+  }
+  target.replaceChildren(
+    ...productResults.map((product) =>
+      resultButton({
+        title: product.title || `Prodotto #${productNumber(product.id)}`,
+        detail: `${product.handle || "senza-handle"} · ${product.status || "stato sconosciuto"}`,
+        active: product.id === selectedProductId,
+        onClick: () => openProduct(product),
+      }),
+    ),
+  );
+}
+
+function groupLabel(group) {
+  return {
+    product: "Prodotto",
+    metafield: "Metafield",
+    option: "Opzione",
+    theme: "Tema",
+  }[group] || group;
+}
+
+function parseJsonValue(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function valueAtPath(root, path) {
+  return path.reduce(
+    (current, part) => (current === null || current === undefined ? undefined : current[part]),
+    root,
+  );
+}
+
+function setValueAtPath(root, path, value) {
+  if (!path.length) return;
+  let current = root;
+  for (const part of path.slice(0, -1)) {
+    current = current[part];
+  }
+  current[path.at(-1)] = value;
+}
+
+function humanizeJsonKey(value) {
+  const labels = {
+    description: "Descrizione",
+    label: "Etichetta",
+    notes: "Nota",
+    title: "Titolo",
+    value: "Valore",
+    items: "Elemento",
+    rows: "Riga",
+    text: "Testo",
+  };
+  const key = String(value || "");
+  return (
+    labels[key] ||
+    key.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase())
+  );
+}
+
+function jsonPathLabel(path) {
+  const parts = [];
+  for (let index = 0; index < path.length; index += 1) {
+    const part = path[index];
+    if (typeof part === "number") {
+      const parent = path[index - 1];
+      parts.push(`${humanizeJsonKey(parent)} ${part + 1}`);
+    } else if (typeof path[index + 1] !== "number") {
+      parts.push(humanizeJsonKey(part));
+    }
+  }
+  return [...new Set(parts)].join(" · ") || "Testo";
+}
+
+function renderStructuredJsonSource(field) {
+  const source = makeElement("div", "source-content structured-source");
+  const sourceJson = parseJsonValue(field.source?.value || "");
+  const paths = field.editable_json_paths || [];
+  if (!sourceJson || !paths.length) {
+    source.textContent = field.source?.value || "";
+    return source;
+  }
+  const meta = makeElement(
+    "div",
+    "structured-meta",
+    `${paths.length} testi traducibili · chiavi e valori tecnici protetti`,
+  );
+  const rows = makeElement("div", "structured-source-rows");
+  for (const path of paths) {
+    const row = makeElement("div", "structured-source-row");
+    row.append(
+      makeElement("span", "", jsonPathLabel(path)),
+      makeElement("strong", "", String(valueAtPath(sourceJson, path) ?? "")),
+    );
+    rows.append(row);
+  }
+  source.append(meta, rows);
+  return source;
+}
+
+function createStructuredJsonEditor(field, translation, hiddenTextarea) {
+  const sourceJson = parseJsonValue(field.source?.value || "");
+  const translatedJson = parseJsonValue(translation.value || "");
+  const paths = field.editable_json_paths || [];
+  if (!sourceJson || !paths.length) return null;
+
+  const draftJson =
+    translatedJson && typeof translatedJson === "object"
+      ? structuredClone(translatedJson)
+      : structuredClone(sourceJson);
+  const root = makeElement("div", "json-leaf-editor");
+  if (!translatedJson) {
+    root.append(
+      makeElement(
+        "p",
+        "json-fallback-note",
+        "Traduzione mancante: la struttura parte dall’italiano. Modifica i testi necessari.",
+      ),
+    );
+  }
+  for (const path of paths) {
+    const row = makeElement("label", "json-leaf-row");
+    const sourceValue = String(valueAtPath(sourceJson, path) ?? "");
+    const translatedValue = String(valueAtPath(draftJson, path) ?? sourceValue);
+    const label = makeElement("span", "json-leaf-label", jsonPathLabel(path));
+    const source = makeElement("small", "json-leaf-source", sourceValue);
+    const control =
+      Math.max(sourceValue.length, translatedValue.length) > 90
+        ? document.createElement("textarea")
+        : document.createElement("input");
+    if (control instanceof HTMLInputElement) control.type = "text";
+    control.className = "json-leaf-input";
+    control.value = translatedValue;
+    control.addEventListener("input", () => {
+      setValueAtPath(draftJson, path, control.value);
+      hiddenTextarea.value = JSON.stringify(draftJson);
+      hiddenTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    row.append(label, source, control);
+    root.append(row);
+  }
+  const raw = document.createElement("details");
+  raw.className = "json-raw";
+  const summary = document.createElement("summary");
+  summary.textContent = "Vedi JSON completo";
+  const pre = document.createElement("pre");
+  const refreshRaw = () => {
+    pre.textContent = JSON.stringify(
+      parseJsonValue(hiddenTextarea.value || "") || draftJson,
+      null,
+      2,
+    );
+  };
+  refreshRaw();
+  hiddenTextarea.addEventListener("input", refreshRaw);
+  raw.append(summary, pre);
+  root.append(raw);
+  hiddenTextarea.hidden = true;
+  return root;
+}
+
+function renderFields(fields, context) {
+  const list = makeElement("div", "field-list");
+  if (!fields?.length) {
+    list.append(
+      makeElement("p", "empty-state", "Nessun campo traducibile trovato."),
+    );
+    return list;
+  }
+
+  for (const field of fields) {
+    const card = makeElement("article", "translation-field");
+    const head = makeElement("div", "translation-field-head");
+    const identity = makeElement("div");
+    identity.append(
+      makeElement("strong", "", `${groupLabel(field.group)} · ${field.resource_label}`),
+      makeElement("span", "", field.key),
+    );
+    head.append(
+      identity,
+      makeElement("span", "workspace-meta", field.content_kind || "plain"),
+    );
+    const source =
+      field.content_kind === "json"
+        ? renderStructuredJsonSource(field)
+        : makeElement("div", "source-content", field.source?.value || "");
+    const locales = makeElement("div", "translation-locales");
+
+    for (const locale of ["de", "fr"]) {
+      const translation = field.translations?.[locale] || {
+        value: "",
+        status: "missing",
+      };
+      const editor = makeElement("div", "translation-editor");
+      const editorHead = makeElement("div", "translation-editor-head");
+      const status = makeElement(
+        "span",
+        `translation-status is-${translation.status}`,
+        translation.status === "current"
+          ? "Corrente"
+          : translation.status === "outdated"
+            ? "Obsoleta"
+            : "Mancante",
+      );
+      editorHead.append(
+        makeElement("strong", "", locale.toUpperCase()),
+        status,
+      );
+      const textarea = document.createElement("textarea");
+      textarea.value = translation.value || "";
+      textarea.setAttribute(
+        "aria-label",
+        `${locale.toUpperCase()} ${field.resource_label} ${field.key}`,
+      );
+      let originalValue = textarea.value;
+      const structuredJsonEditor =
+        field.content_kind === "json"
+          ? createStructuredJsonEditor(field, translation, textarea)
+          : null;
+      let confirmationArmed = false;
+      let confirmationTimer = null;
+      const resetConfirmation = () => {
+        confirmationArmed = false;
+        if (confirmationTimer) {
+          clearTimeout(confirmationTimer);
+          confirmationTimer = null;
+        }
+        editor.classList.remove("is-confirming");
+        save.textContent = "Salva modifica";
+      };
+      textarea.addEventListener("input", () => {
+        translation.draftValue = textarea.value;
+        editor.classList.toggle("is-dirty", textarea.value !== originalValue);
+        editor.classList.remove("is-saved");
+        if (confirmationArmed) resetConfirmation();
+        context.onDraftChange?.();
+      });
+      const save = makeElement(
+        "button",
+        "button button-secondary",
+        "Salva modifica",
+      );
+      save.type = "button";
+      save.addEventListener("click", async () => {
+        const value = textarea.value;
+        if (!value.trim()) {
+          setContentFeedback(
+            "error",
+            "Una traduzione vuota non viene salvata.",
+            context.feedbackId,
+          );
+          textarea.focus();
+          return;
+        }
+        if (value === originalValue) {
+          setContentFeedback(
+            "",
+            "Non ci sono modifiche da salvare.",
+            context.feedbackId,
+          );
+          return;
+        }
+        if (!confirmationArmed) {
+          confirmationArmed = true;
+          editor.classList.add("is-confirming");
+          save.textContent = `Conferma ${locale.toUpperCase()}`;
+          setContentFeedback(
+            "",
+            `Controlla il testo e premi “Conferma ${locale.toUpperCase()}” entro 8 secondi.`,
+            context.feedbackId,
+          );
+          confirmationTimer = setTimeout(resetConfirmation, 8000);
+          return;
+        }
+        const confirmation =
+          context.type === "theme"
+            ? `SAVE ${context.themeId || currentPayload?.config?.approved_theme_id || ""}`
+            : "";
+        resetConfirmation();
+        save.disabled = true;
+        save.textContent = "Salvataggio…";
+        editor.classList.add("is-saving");
+        setContentFeedback("", "Verifica Shopify e salvataggio in corso…", context.feedbackId);
+        try {
+          const action =
+            context.type === "theme"
+              ? "content_theme_save"
+              : "content_product_save";
+          const response = await contentRequest(action, {
+            product_id: context.productId,
+            resource_id: field.resource_id,
+            key: field.key,
+            locale,
+            value,
+            digest: field.source.digest,
+            confirmation,
+          });
+          const saved = response.data?.saved;
+          textarea.value = saved?.value ?? value;
+          originalValue = textarea.value;
+          field.translations[locale] = {
+            value: textarea.value,
+            status: saved?.status || "current",
+            outdated: false,
+          };
+          status.className = "translation-status is-current";
+          status.textContent = "Corrente";
+          editor.classList.remove("is-dirty");
+          editor.classList.add("is-saved");
+          const auditCopy =
+            response.audit_recorded === false
+              ? " Traduzione salvata, ma la registrazione audit va verificata."
+              : "";
+          setContentFeedback(
+            response.audit_recorded === false ? "error" : "success",
+            `${locale.toUpperCase()} salvato su Shopify.${auditCopy}`,
+            context.feedbackId,
+          );
+        } catch (error) {
+          setContentFeedback(
+            "error",
+            error instanceof Error ? error.message : "Salvataggio non riuscito.",
+            context.feedbackId,
+          );
+          if (error?.code === "SOURCE_CHANGED") {
+            textarea.setAttribute("aria-invalid", "true");
+          }
+        } finally {
+          save.disabled = false;
+          save.textContent = "Salva modifica";
+          editor.classList.remove("is-saving");
+        }
+      });
+      editor.append(editorHead);
+      if (structuredJsonEditor) editor.append(structuredJsonEditor);
+      editor.append(textarea, save);
+      locales.append(editor);
+    }
+    card.append(head, source, locales);
+    list.append(card);
+  }
+  return list;
+}
+
+function localizedFieldValue(field, locale) {
+  if (!field) return "";
+  if (locale === "it") return field.source?.value || "";
+  const translation = field.translations?.[locale];
+  return (
+    translation?.draftValue ??
+    translation?.value ??
+    field.source?.value ??
+    ""
+  );
+}
+
+function findProductField(data, predicate) {
+  return (data.fields || []).find(predicate);
+}
+
+function safeHtmlFragment(html) {
+  const template = document.createElement("template");
+  template.innerHTML = String(html || "");
+  const blocked = new Set([
+    "SCRIPT",
+    "STYLE",
+    "IFRAME",
+    "OBJECT",
+    "EMBED",
+    "FORM",
+    "INPUT",
+    "BUTTON",
+    "META",
+    "LINK",
+    "SVG",
+  ]);
+  for (const element of template.content.querySelectorAll("*")) {
+    if (blocked.has(element.tagName)) {
+      element.remove();
+      continue;
+    }
+    for (const attribute of [...element.attributes]) {
+      const name = attribute.name.toLowerCase();
+      if (name.startsWith("on") || !["href", "title"].includes(name)) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+    if (element.tagName === "A") {
+      const href = element.getAttribute("href") || "";
+      if (!/^https?:\/\//i.test(href) && !href.startsWith("/")) {
+        element.removeAttribute("href");
+      }
+      element.setAttribute("target", "_blank");
+      element.setAttribute("rel", "noopener noreferrer");
+    }
+  }
+  return template.content;
+}
+
+function appendRichTextNode(parent, node) {
+  if (!node || typeof node !== "object") return;
+  if (node.type === "text") {
+    let child = document.createTextNode(String(node.value || ""));
+    if (node.bold) {
+      const strong = document.createElement("strong");
+      strong.append(child);
+      child = strong;
+    }
+    if (node.italic) {
+      const em = document.createElement("em");
+      em.append(child);
+      child = em;
+    }
+    parent.append(child);
+    return;
+  }
+  const tags = {
+    root: "div",
+    paragraph: "p",
+    heading: `h${Math.min(6, Math.max(2, Number(node.level || 3)))}`,
+    list: node.listType === "ordered" ? "ol" : "ul",
+    "list-item": "li",
+    link: "a",
+  };
+  const element = document.createElement(tags[node.type] || "div");
+  if (node.type === "link" && /^https?:\/\//i.test(String(node.url || ""))) {
+    element.href = node.url;
+    element.target = "_blank";
+    element.rel = "noopener noreferrer";
+  }
+  for (const child of node.children || []) appendRichTextNode(element, child);
+  parent.append(element);
+}
+
+function renderJsonPreview(label, rawValue) {
+  const value = parseJsonValue(rawValue);
+  if (!value || typeof value !== "object") return null;
+  const section = makeElement("section", "preview-data-section");
+  section.append(makeElement("h4", "", label));
+
+  if (Array.isArray(value.items) && label.includes("product_characteristics")) {
+    const list = makeElement("ul", "preview-check-list");
+    for (const item of value.items) {
+      list.append(makeElement("li", "", String(item || "")));
+    }
+    section.append(list);
+    return section;
+  }
+
+  if (Array.isArray(value.rows) && label.includes("technical_data")) {
+    const table = makeElement("dl", "preview-specs");
+    for (const row of value.rows) {
+      if (!row || typeof row !== "object") continue;
+      const wrapper = document.createElement("div");
+      wrapper.append(
+        makeElement("dt", "", String(row.label || "")),
+        makeElement("dd", "", String(row.value || "")),
+      );
+      table.append(wrapper);
+    }
+    section.append(table);
+    if (Array.isArray(value.notes) && value.notes.length) {
+      const notes = makeElement("ul", "preview-notes");
+      for (const note of value.notes) {
+        notes.append(makeElement("li", "", String(note || "")));
+      }
+      section.append(notes);
+    }
+    return section;
+  }
+
+  if (Array.isArray(value.rows) && label.includes("collapsible_rows")) {
+    const accordions = makeElement("div", "preview-accordions");
+    for (const row of value.rows) {
+      if (!row || typeof row !== "object") continue;
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = String(row.title || "");
+      const body = makeElement("div", "preview-richtext");
+      body.append(safeHtmlFragment(String(row.description || "")));
+      details.append(summary, body);
+      accordions.append(details);
+    }
+    section.append(accordions);
+    return section;
+  }
+
+  if (Array.isArray(value.items)) {
+    const list = makeElement("div", "preview-item-grid");
+    for (const item of value.items) {
+      if (typeof item === "string") {
+        list.append(makeElement("div", "", item));
+      } else if (item && typeof item === "object") {
+        list.append(
+          makeElement(
+            "div",
+            "",
+            String(item.title || item.label || item.name || ""),
+          ),
+        );
+      }
+    }
+    section.append(list);
+    return section;
+  }
+
+  const richText = makeElement("div", "preview-richtext");
+  appendRichTextNode(richText, value);
+  section.append(richText);
+  return section;
+}
+
+function formatPreviewPrice(product, locale) {
+  const amount = Number(product.minimum_price || 0);
+  if (!Number.isFinite(amount) || amount <= 0) return "";
+  const localeTag = { it: "it-IT", de: "de-DE", fr: "fr-FR" }[locale] || "it-IT";
+  try {
+    return new Intl.NumberFormat(localeTag, {
+      style: "currency",
+      currency: product.currency_code || "EUR",
+    }).format(amount);
+  } catch {
+    return `${amount.toFixed(2)} ${product.currency_code || "EUR"}`;
+  }
+}
+
+function buildProductPreview(data, locale, device) {
+  const canvas = makeElement("div", `product-preview-canvas is-${device}`);
+  const chrome = makeElement("div", "preview-browser-chrome");
+  chrome.append(
+    makeElement("span", "", "● ● ●"),
+    makeElement(
+      "span",
+      "",
+      data.preview_urls?.[locale] || data.product?.online_store_url || "example.com",
+    ),
+  );
+  const page = makeElement("div", "preview-storefront");
+  const storeHeader = makeElement("header", "preview-store-header");
+  storeHeader.append(
+    makeElement("strong", "", "Store"),
+    makeElement(
+      "span",
+      "",
+      locale === "de" ? "Suche · Konto · Warenkorb" : locale === "fr"
+        ? "Recherche · Compte · Panier"
+        : "Cerca · Account · Carrello",
+    ),
+  );
+
+  const titleField = findProductField(
+    data,
+    (field) => field.group === "product" && field.key === "title",
+  );
+  const bodyField = findProductField(
+    data,
+    (field) => field.group === "product" && field.key === "body_html",
+  );
+  const productTypeField = findProductField(
+    data,
+    (field) => field.group === "product" && field.key === "product_type",
+  );
+  const hero = makeElement("section", "preview-product-hero");
+  const media = makeElement("div", "preview-product-media");
+  if (data.product?.featured_image_url) {
+    const image = document.createElement("img");
+    image.src = data.product.featured_image_url;
+    image.alt =
+      data.product.featured_image_alt ||
+      localizedFieldValue(titleField, locale) ||
+      data.product.title;
+    image.loading = "lazy";
+    media.append(image);
+  } else {
+    media.append(makeElement("span", "", "Immagine prodotto"));
+  }
+  const info = makeElement("div", "preview-product-info");
+  info.append(
+    makeElement("p", "preview-vendor", data.product?.vendor || "Store"),
+    makeElement(
+      "h2",
+      "",
+      localizedFieldValue(titleField, locale) || data.product?.title || "Prodotto",
+    ),
+  );
+  const productType = localizedFieldValue(productTypeField, locale);
+  if (productType) info.append(makeElement("p", "preview-product-type", productType));
+  const price = formatPreviewPrice(data.product || {}, locale);
+  if (price) info.append(makeElement("p", "preview-price", price));
+  const addToCart = makeElement(
+    "button",
+    "preview-cart-button",
+    locale === "de"
+      ? "In den Warenkorb"
+      : locale === "fr"
+        ? "Ajouter au panier"
+        : "Aggiungi al carrello",
+  );
+  addToCart.type = "button";
+  addToCart.disabled = true;
+  info.append(addToCart);
+  hero.append(media, info);
+  page.append(storeHeader, hero);
+
+  const bodyValue = localizedFieldValue(bodyField, locale);
+  if (bodyValue) {
+    const body = makeElement("section", "preview-description preview-richtext");
+    body.append(safeHtmlFragment(bodyValue));
+    page.append(body);
+  }
+
+  for (const field of data.fields || []) {
+    if (field.group !== "metafield") continue;
+    const value = localizedFieldValue(field, locale);
+    if (!value) continue;
+    if (field.content_kind === "json") {
+      const section = renderJsonPreview(field.resource_label, value);
+      if (section) page.append(section);
+    } else if (field.resource_label === "custom.in_breve") {
+      const section = makeElement("section", "preview-data-section");
+      section.append(makeElement("h4", "", "In breve"));
+      const content = makeElement("div", "preview-richtext");
+      content.append(safeHtmlFragment(value));
+      section.append(content);
+      page.append(section);
+    }
+  }
+  canvas.append(chrome, page);
+  return canvas;
+}
+
+function renderProductDetail(data) {
+  const target = byId("product-detail");
+  const head = makeElement("div", "content-detail-head");
+  const identity = makeElement("div");
+  identity.append(
+    makeElement("h3", "", data.product?.title || "Prodotto"),
+    makeElement(
+      "p",
+      "",
+      `${data.product?.handle || "senza-handle"} · #${productNumber(data.product?.id)}`,
+    ),
+  );
+  head.append(
+    identity,
+    makeElement("span", "workspace-meta", `${data.fields?.length || 0} campi`),
+  );
+  const viewBar = makeElement("div", "product-view-bar");
+  const editorButton = makeElement("button", "view-button is-active", "Editor");
+  const previewButton = makeElement("button", "view-button", "Anteprima PDP");
+  editorButton.type = "button";
+  previewButton.type = "button";
+  viewBar.append(editorButton, previewButton);
+  const editorPanel = makeElement("div", "product-editor-panel");
+  const previewPanel = makeElement("div", "product-preview-panel");
+  previewPanel.hidden = true;
+  let previewLocale = "de";
+  let previewDevice = "desktop";
+  const renderPreview = () => {
+    const toolbar = makeElement("div", "preview-toolbar");
+    const languages = makeElement("div", "preview-segmented");
+    for (const locale of ["it", "de", "fr"]) {
+      const button = makeElement(
+        "button",
+        `preview-toggle${locale === previewLocale ? " is-active" : ""}`,
+        locale.toUpperCase(),
+      );
+      button.type = "button";
+      button.addEventListener("click", () => {
+        previewLocale = locale;
+        renderPreview();
+      });
+      languages.append(button);
+    }
+    const devices = makeElement("div", "preview-segmented");
+    for (const device of ["desktop", "mobile"]) {
+      const button = makeElement(
+        "button",
+        `preview-toggle${device === previewDevice ? " is-active" : ""}`,
+        device === "desktop" ? "Desktop" : "Mobile",
+      );
+      button.type = "button";
+      button.addEventListener("click", () => {
+        previewDevice = device;
+        renderPreview();
+      });
+      devices.append(button);
+    }
+    const actions = makeElement("div", "preview-actions");
+    const liveUrl = data.preview_urls?.[previewLocale];
+    if (liveUrl) {
+      const liveLink = makeElement("a", "button button-secondary", "Apri pagina live");
+      liveLink.href = liveUrl;
+      liveLink.target = "_blank";
+      liveLink.rel = "noopener noreferrer";
+      actions.append(liveLink);
+    }
+    if (data.product?.online_store_preview_url) {
+      const shopifyLink = makeElement(
+        "a",
+        "button button-secondary",
+        "Preview Shopify",
+      );
+      shopifyLink.href = data.product.online_store_preview_url;
+      shopifyLink.target = "_blank";
+      shopifyLink.rel = "noopener noreferrer";
+      actions.append(shopifyLink);
+    }
+    toolbar.append(languages, devices, actions);
+    previewPanel.replaceChildren(
+      toolbar,
+      makeElement(
+        "p",
+        "preview-note",
+        "La bozza interna usa i valori nell’editor. La pagina live mostra l’ultima versione salvata su Shopify.",
+      ),
+      buildProductPreview(data, previewLocale, previewDevice),
+    );
+  };
+  editorPanel.append(
+    renderFields(data.fields, {
+      type: "product",
+      productId: data.product?.id,
+      feedbackId: "product-feedback",
+      onDraftChange: () => {
+        if (!previewPanel.hidden) renderPreview();
+      },
+    }),
+  );
+  editorButton.addEventListener("click", () => {
+    editorPanel.hidden = false;
+    previewPanel.hidden = true;
+    editorButton.classList.add("is-active");
+    previewButton.classList.remove("is-active");
+  });
+  previewButton.addEventListener("click", () => {
+    renderPreview();
+    editorPanel.hidden = true;
+    previewPanel.hidden = false;
+    editorButton.classList.remove("is-active");
+    previewButton.classList.add("is-active");
+  });
+  target.replaceChildren(head, viewBar, editorPanel, previewPanel);
+}
+
+async function openProduct(product) {
+  selectedProductId = product.id;
+  renderProductResults(productResults);
+  setContentFeedback("", "Lettura delle traduzioni live da Shopify…", "product-feedback");
+  byId("product-detail").replaceChildren(
+    makeElement("p", "empty-state", "Caricamento prodotto…"),
+  );
+  try {
+    const response = await contentRequest("content_product_inspect", {
+      product_id: product.id,
+    });
+    renderProductDetail(response.data);
+    setContentFeedback(
+      "success",
+      "Valori letti direttamente da Shopify.",
+      "product-feedback",
+    );
+    renderProductResults(productResults);
+  } catch (error) {
+    byId("product-detail").replaceChildren(
+      makeElement("p", "empty-state", "Impossibile aprire il prodotto."),
+    );
+    setContentFeedback(
+      "error",
+      error instanceof Error ? error.message : "Errore imprevisto.",
+      "product-feedback",
+    );
+  }
+}
+
+async function searchProductCatalog(event) {
+  event.preventDefault();
+  const query = byId("product-query").value.trim();
+  const submit = byId("product-search-submit");
+  const originalLabel = submit.textContent;
+  submit.disabled = true;
+  submit.textContent = "Ricerca…";
+  byId("product-search-form").setAttribute("aria-busy", "true");
+  setContentFeedback("", "Ricerca su Shopify…", "product-feedback");
+  try {
+    const response = await contentRequest("content_product_search", { query });
+    const products = response.data?.products || [];
+    renderProductResults(products);
+    setContentFeedback(
+      "success",
+      `${numberFormat.format(products.length)} prodotti trovati.`,
+      "product-feedback",
+    );
+    if (products.length === 1) {
+      await openProduct(products[0]);
+    }
+  } catch (error) {
+    renderProductResults([]);
+    setContentFeedback(
+      "error",
+      error instanceof Error ? error.message : "Ricerca non riuscita.",
+      "product-feedback",
+    );
+  } finally {
+    submit.disabled = false;
+    submit.textContent = originalLabel;
+    byId("product-search-form").removeAttribute("aria-busy");
+  }
+}
+
+function filteredThemeResources() {
+  const query = byId("theme-query").value.trim().toLocaleLowerCase("it");
+  if (!query) return themeResources;
+  return themeResources.filter((resource) =>
+    `${resource.label} ${resource.resource_type}`
+      .toLocaleLowerCase("it")
+      .includes(query),
+  );
+}
+
+function renderThemeResources() {
+  const target = byId("theme-results");
+  const resources = filteredThemeResources();
+  if (!resources.length) {
+    target.replaceChildren(
+      makeElement("p", "empty-state", "Nessuna risorsa corrispondente."),
+    );
+    return;
+  }
+  target.replaceChildren(
+    ...resources.map((resource) =>
+      resultButton({
+        title: resource.label,
+        detail: `${resource.field_count} campi · ${resource.resource_type
+          .replace("ONLINE_STORE_THEME_", "")
+          .toLowerCase()}`,
+        active: resource.resource_id === selectedThemeResourceId,
+        onClick: () => openThemeResource(resource),
+      }),
+    ),
+  );
+}
+
+async function loadThemeResources() {
+  const button = byId("load-theme-resources");
+  button.disabled = true;
+  setContentFeedback("", "Verifica tema MAIN e risorse traducibili…", "theme-feedback");
+  try {
+    const response = await contentRequest("content_theme_resources");
+    themeResources = response.data?.resources || [];
+    renderThemeResources();
+    setContentFeedback(
+      "success",
+      `${numberFormat.format(themeResources.length)} risorse dal tema ${response.data?.theme?.name || "MAIN"}.`,
+      "theme-feedback",
+    );
+  } catch (error) {
+    setContentFeedback(
+      "error",
+      error instanceof Error ? error.message : "Caricamento tema non riuscito.",
+      "theme-feedback",
+    );
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function openThemeResource(resource) {
+  selectedThemeResourceId = resource.resource_id;
+  renderThemeResources();
+  setContentFeedback("", "Lettura traduzioni live della risorsa…", "theme-feedback");
+  byId("theme-detail").replaceChildren(
+    makeElement("p", "empty-state", "Caricamento risorsa…"),
+  );
+  try {
+    const response = await contentRequest("content_theme_inspect", {
+      resource_id: resource.resource_id,
+    });
+    const data = response.data;
+    const head = makeElement("div", "content-detail-head");
+    const identity = makeElement("div");
+    identity.append(
+      makeElement("h3", "", data.resource?.label || "Risorsa tema"),
+      makeElement("p", "", data.resource?.resource_type || ""),
+    );
+    head.append(
+      identity,
+      makeElement("span", "workspace-meta", `${data.fields?.length || 0} campi`),
+    );
+    byId("theme-detail").replaceChildren(
+      head,
+      renderFields(data.fields, {
+        type: "theme",
+        themeId: data.theme?.id,
+        feedbackId: "theme-feedback",
+      }),
+    );
+    setContentFeedback(
+      "success",
+      "Valori letti direttamente dal tema MAIN autorizzato.",
+      "theme-feedback",
+    );
+  } catch (error) {
+    byId("theme-detail").replaceChildren(
+      makeElement("p", "empty-state", "Impossibile aprire la risorsa."),
+    );
+    setContentFeedback(
+      "error",
+      error instanceof Error ? error.message : "Errore imprevisto.",
+      "theme-feedback",
+    );
+  }
+}
+
+byId("refresh").addEventListener("click", () => loadOverview());
+byId("product-tab").addEventListener("click", () => switchContentTab("product"));
+byId("theme-tab").addEventListener("click", () => switchContentTab("theme"));
+byId("product-search-form").addEventListener("submit", searchProductCatalog);
+byId("load-theme-resources").addEventListener("click", loadThemeResources);
+byId("theme-query").addEventListener("input", renderThemeResources);
+document.querySelectorAll(".diagnostics").forEach((details) => {
+  details.addEventListener("toggle", () => {
+    const label = details.querySelector(".diagnostics-summary");
+    if (label) label.textContent = details.open ? "Chiudi dettagli" : "Apri dettagli";
+  });
+});
+document.querySelectorAll("[data-action]").forEach((button) => {
+  button.addEventListener("click", () => openOperationDialog(button.dataset.action));
+});
+byId("operation-form").addEventListener("submit", submitOperation);
+byId("dialog-cancel").addEventListener("click", () => {
+  byId("operation-dialog").close();
+});
+byId("operation-dialog").addEventListener("close", () => {
+  selectedAction = null;
+  byId("dialog-error").textContent = "";
+});
+
+loadOverview();

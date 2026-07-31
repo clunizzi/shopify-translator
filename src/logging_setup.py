@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
-import json
 from pathlib import Path
 from typing import Any
 
 import structlog
-
 
 _CONFIGURED = False
 
@@ -39,7 +38,9 @@ def _make_jsonl_file_writer(path: Path):
     handle = path.open("a", encoding="utf-8")
 
     def _write_jsonl(logger, method_name, event_dict):
-        handle.write(json.dumps(event_dict, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n")
+        handle.write(
+            json.dumps(event_dict, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n"
+        )
         handle.flush()
         return event_dict
 
@@ -55,6 +56,10 @@ def configure_logging() -> None:
     level = getattr(logging, level_name, logging.INFO)
     json_logs = os.getenv("LOG_JSON", "true").lower() in {"1", "true", "yes", "y"}
     log_file = os.getenv("LOG_FILE", "logs/translator.jsonl").strip()
+    if log_file:
+        is_lambda = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("LAMBDA_TASK_ROOT"))
+        if is_lambda and not os.path.isabs(log_file):
+            log_file = str(Path("/tmp") / log_file)
 
     log_output = sys.stdout
     file_writer = None
@@ -86,4 +91,6 @@ def configure_logging() -> None:
     )
 
     logging.basicConfig(level=level, stream=sys.stdout, force=True)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     _CONFIGURED = True

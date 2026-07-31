@@ -1,6 +1,9 @@
 from src.bootstrap.catalog import build_pdp_document
 from src.config.field_policies import should_translate_product_key
-from src.config.metafield_policies import should_translate_metafield_leaf
+from src.config.metafield_policies import (
+    should_translate_metafield,
+    should_translate_metafield_leaf,
+)
 
 
 def test_existing_product_handle_is_skipped():
@@ -65,6 +68,32 @@ def test_manuals_only_translates_label():
         "manuals",
         ("items", 0, "source_url"),
         "https://example.com/manual.pdf",
+    )
+
+
+def test_product_recommendation_display_flag_is_not_translated():
+    namespace = "shopify--discovery--product_recommendation"
+    key = "related_products_display"
+
+    assert not should_translate_metafield(namespace, key)
+    assert not should_translate_metafield_leaf(namespace, key, ("value",), "true")
+
+
+def test_product_characteristics_does_not_translate_country_filters():
+    assert should_translate_metafield_leaf(
+        "custom", "product_characteristics", ("items", 0), "Taglio potente"
+    )
+    assert should_translate_metafield_leaf(
+        "custom",
+        "product_characteristics",
+        ("items", 0, "text"),
+        "Taglio potente",
+    )
+    assert not should_translate_metafield_leaf(
+        "custom",
+        "product_characteristics",
+        ("items", 0, "only_countries", 0),
+        "DE",
     )
 
 

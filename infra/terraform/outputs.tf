@@ -13,3 +13,16 @@ output "dynamodb_tables" {
   }
 }
 
+output "cloudflare_admin_aws_access_key_id" {
+  value     = aws_iam_access_key.cloudflare_admin_invoker.id
+  sensitive = true
+}
+
+output "cloudflare_admin_aws_secret_access_key" {
+  value     = aws_iam_access_key.cloudflare_admin_invoker.secret
+  sensitive = true
+}
+
+output "theme_poller_function_name" {
+  value = aws_lambda_function.theme_poller.function_name
+}

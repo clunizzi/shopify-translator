@@ -19,7 +19,14 @@ def test_register_translations_maps_top_level_graphql_errors(monkeypatch):
     result = asyncio.run(
         graphql.register_translations(
             "gid://shopify/OnlineStoreThemeJsonTemplate/1",
-            [{"key": "section.home.heading:abc", "locale": "de", "value": "Willkommen", "translatableContentDigest": "d1"}],
+            [
+                {
+                    "key": "section.home.heading:abc",
+                    "locale": "de",
+                    "value": "Willkommen",
+                    "translatableContentDigest": "d1",
+                }
+            ],
         )
     )
 

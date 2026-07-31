@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -45,10 +46,12 @@ class Settings:
     shopify_token: str = os.getenv("SHOPIFY_ADMIN_ACCESS_TOKEN", "") or os.getenv(
         "SHOPIFY_ADMIN_TOKEN", ""
     )
+    shopify_api_version: str = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 
     # OpenAI
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o")
+    openai_fallback_model: str = os.getenv("OPENAI_FALLBACK_MODEL", "")
 
     # General
     target_locale: str = os.getenv("TARGET_LOCALE", "fr-FR")
@@ -89,18 +92,21 @@ class Settings:
     dry_run_default: bool = _get_bool("DRY_RUN", False)
     delay_ms_after_create: int = _get_int("DELAY_MS_AFTER_CREATE", 8000)
     # Optional path to DNT yaml
-    do_not_translate_path: str | None = os.getenv("DO_NOT_TRANSLATE_YAML")
+    do_not_translate_path: str | None = os.getenv(
+        "DO_NOT_TRANSLATE_YAML",
+        str(Path(__file__).with_name("do_not_translate.yaml")),
+    )
 
     # Prompt specialization (domain) and source language label
     # Customize to adapt the translator tone/domain without changing code.
     translator_specialization: str = os.getenv(
         "TRANSLATOR_SPECIALIZATION",
-        "attrezzatura per il giardinaggio e l'agricoltura",
+        "e-commerce product catalog",
     )
-    translator_brand: str = os.getenv("TRANSLATOR_BRAND", "AgriEden")
+    translator_brand: str = os.getenv("TRANSLATOR_BRAND", "")
     translator_audience: str = os.getenv(
         "TRANSLATOR_AUDIENCE",
-        "persone esperte di giardinaggio e agricoltura con aspettative di precisione tecnica",
+        "online shoppers who expect accurate and natural product information",
     )
     metafield_translation_policy_path: str = os.getenv(
         "METAFIELD_TRANSLATION_POLICY_PATH",
@@ -114,7 +120,7 @@ class Settings:
     bootstrap_apply_translations: bool = _get_bool("BOOTSTRAP_APPLY_TRANSLATIONS", False)
     bootstrap_existing_products: bool = _get_bool("BOOTSTRAP_EXISTING_PRODUCTS", True)
     # Human-friendly name of source language for prompts (e.g., "italiano", "inglese")
-    source_language_name: str = os.getenv("SOURCE_LANGUAGE_NAME", "italiano")
+    source_language_name: str = os.getenv("SOURCE_LANGUAGE_NAME", "source language")
     neon_database_url: str = os.getenv("NEON_DATABASE_URL", "")
 
     @property
@@ -142,5 +148,6 @@ class Settings:
             ns, key = p.split(".", 1)
             items.append((ns.strip(), key.strip()))
         return items
+
 
 SETTINGS = Settings()
