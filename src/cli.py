@@ -102,9 +102,7 @@ def cache_purge(
         "--all/--translations-only",
         help="Pulisce sia translations sia tabelle ausiliarie (default: solo translations)",
     ),  # noqa: B008
-    vacuum: bool = typer.Option(
-        False, "--vacuum/--no-vacuum", help="Run VACUUM after purge"
-    ),  # noqa: B008
+    vacuum: bool = typer.Option(False, "--vacuum/--no-vacuum", help="Run VACUUM after purge"),  # noqa: B008
 ):
     """Pulisce la cache locale del traduttore."""
     path = _resolve_cache_path(db_path)
@@ -191,9 +189,7 @@ def theme_translatables_cmd(
         "--resource-type",
         help="TranslatableResourceType del tema (ripetibile)",
     ),  # noqa: B008
-    first: int = typer.Option(
-        50, "--first", min=1, max=250, help="Numero massimo per tipo"
-    ),  # noqa: B008
+    first: int = typer.Option(50, "--first", min=1, max=250, help="Numero massimo per tipo"),  # noqa: B008
     key_filter: str | None = typer.Option(
         None,
         "--key-filter",
@@ -245,9 +241,7 @@ def theme_translatables_cmd(
 
 @app.command("theme-bootstrap")
 def theme_bootstrap_cmd(
-    theme_id: str = typer.Option(
-        ..., "--theme-id", help="ID numerico del tema Shopify"
-    ),  # noqa: B008
+    theme_id: str = typer.Option(..., "--theme-id", help="ID numerico del tema Shopify"),  # noqa: B008
     target_locales: str | None = typer.Option(
         None, "--target-locales", help="Locali target separati da virgola"
     ),  # noqa: B008
@@ -299,9 +293,7 @@ def theme_bootstrap_cmd(
 
 @app.command("theme-audit")
 def theme_audit_cmd(
-    theme_id: str = typer.Option(
-        ..., "--theme-id", help="ID numerico del tema Shopify"
-    ),  # noqa: B008
+    theme_id: str = typer.Option(..., "--theme-id", help="ID numerico del tema Shopify"),  # noqa: B008
     target_locales: str | None = typer.Option(
         None,
         "--target-locales",
@@ -363,6 +355,12 @@ def resources_bootstrap_cmd(
         help="Registra le traduzioni su Shopify oppure salva solo stato/memory su Neon",
     ),  # noqa: B008
     dry_run: bool = typer.Option(False, "--dry-run", help="Dry run"),  # noqa: B008
+    max_translations: int | None = typer.Option(
+        None,
+        "--max-translations",
+        min=1,
+        help="Limita il numero di campi elaborati per un canary o batch controllato",
+    ),  # noqa: B008
 ):
     """Bootstrap di risorse globali Shopify: policy, cookie banner, branding."""
     tl = (
@@ -378,6 +376,7 @@ def resources_bootstrap_cmd(
             dry_run=dry_run,
             resource_types=resource_type or list(DEFAULT_RESOURCE_TYPES),
             resource_ids=resource_id or None,
+            max_translations=max_translations,
         )
     )
     import json as _json
@@ -979,9 +978,7 @@ def model_canary_cmd(
 
 @app.command("neon-reset")
 def neon_reset_cmd(
-    yes: bool = typer.Option(
-        False, "--yes", help="Conferma il reset dello schema Neon"
-    ),  # noqa: B008
+    yes: bool = typer.Option(False, "--yes", help="Conferma il reset dello schema Neon"),  # noqa: B008
 ):
     """Resetta lo schema del nuovo backend Neon/PostgreSQL."""
     if not yes:
@@ -1021,9 +1018,7 @@ def sync_webhook(
     worker_name: str | None = typer.Option(
         None, "--worker-name", help="Override nome Lambda worker"
     ),  # noqa: B008
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Mostra cosa farebbe senza applicare"
-    ),  # noqa: B008
+    dry_run: bool = typer.Option(False, "--dry-run", help="Mostra cosa farebbe senza applicare"),  # noqa: B008
 ):
     """
     Abilita/Disabilita la sync lato Lambda impostando DISABLE_SYNC su receiver/worker.
@@ -1206,20 +1201,14 @@ def theme_poll_cloud(
         "--global-resource-type",
         help="Override resource type globale da processare in cloud (ripetibile)",
     ),  # noqa: B008
-    theme: bool = typer.Option(
-        True, "--theme/--no-theme", help="Esegui anche il polling del tema"
-    ),  # noqa: B008
+    theme: bool = typer.Option(True, "--theme/--no-theme", help="Esegui anche il polling del tema"),  # noqa: B008
     global_resources: bool = typer.Option(
         False,
         "--global-resources/--no-global-resources",
         help="Esegui polling risorse globali; implicito se passi --global-resource-type",
     ),  # noqa: B008
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Invoca il poller in dry run"
-    ),  # noqa: B008
-    sync: bool = typer.Option(
-        False, "--sync/--async", help="Attendi risposta del poller"
-    ),  # noqa: B008
+    dry_run: bool = typer.Option(False, "--dry-run", help="Invoca il poller in dry run"),  # noqa: B008
+    sync: bool = typer.Option(False, "--sync/--async", help="Attendi risposta del poller"),  # noqa: B008
 ):
     """
     Invoca la Lambda di polling tema direttamente in cloud.

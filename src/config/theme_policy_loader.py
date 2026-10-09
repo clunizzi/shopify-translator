@@ -12,7 +12,10 @@ class ThemeTranslationPolicy:
     allowed_resource_types: frozenset[str]
     allowed_locale_key_prefixes: tuple[str, ...]
     allowed_key_fragments: tuple[str, ...]
+    translate_unclassified_text: bool
+    blocked_leaf_names: frozenset[str]
     blocked_key_fragments: tuple[str, ...]
+    blocked_key_path_fragments: tuple[str, ...]
     blocked_value_patterns: tuple[re.Pattern[str], ...]
 
 
@@ -38,9 +41,18 @@ def load_theme_translation_policy(path: str | Path) -> ThemeTranslationPolicy:
             for x in (data.get("allowed_key_fragments") or [])
             if str(x).strip()
         ),
+        translate_unclassified_text=bool(data.get("translate_unclassified_text", False)),
+        blocked_leaf_names=frozenset(
+            str(x).strip().lower() for x in (data.get("blocked_leaf_names") or []) if str(x).strip()
+        ),
         blocked_key_fragments=tuple(
             str(x).strip().lower()
             for x in (data.get("blocked_key_fragments") or [])
+            if str(x).strip()
+        ),
+        blocked_key_path_fragments=tuple(
+            str(x).strip().lower()
+            for x in (data.get("blocked_key_path_fragments") or [])
             if str(x).strip()
         ),
         blocked_value_patterns=tuple(

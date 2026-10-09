@@ -4,9 +4,11 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass, replace
 
 import boto3
+from botocore.exceptions import ClientError
 
 from src.logging_setup import configure_logging
 
@@ -24,12 +26,14 @@ class PollerConfig:
     max_translations: int | None
     log_verbose_sync: bool
     poll_enabled: bool
+    checkpoint_table: str
     openai_api_key_secret_arn: str
     shopify_admin_token_secret_arn: str
     neon_database_url_secret_arn: str
 
 
 _SECRETS = None
+_DYNAMODB = None
 _CACHED_SECRETS: dict[str, str] = {}
 _CONTENT_ACTIONS = {
     "content_product_search",
@@ -46,6 +50,13 @@ def _secrets():
     if _SECRETS is None:
         _SECRETS = boto3.client("secretsmanager")
     return _SECRETS
+
+
+def _dynamodb():
+    global _DYNAMODB
+    if _DYNAMODB is None:
+        _DYNAMODB = boto3.resource("dynamodb")
+    return _DYNAMODB
 
 
 def _get_secret(arn: str) -> str:
@@ -100,6 +111,7 @@ def _config() -> PollerConfig:
         in {"1", "true", "yes", "y"},
         poll_enabled=os.environ.get("THEME_POLL_ENABLED", "true").lower()
         in {"1", "true", "yes", "y"},
+        checkpoint_table=os.environ.get("DDB_TABLE", "").strip(),
         openai_api_key_secret_arn=os.environ.get("OPENAI_API_KEY_SECRET_ARN", ""),
         shopify_admin_token_secret_arn=os.environ.get("SHOPIFY_ADMIN_TOKEN_SECRET_ARN", ""),
         neon_database_url_secret_arn=os.environ.get("NEON_DATABASE_URL_SECRET_ARN", ""),
@@ -218,6 +230,87 @@ def _build_global_resource_summary_event(summary: dict[str, object]) -> dict[str
     }
 
 
+def _checkpoint_key(group: str, cfg: PollerConfig) -> dict[str, str]:
+    suffix = cfg.theme_id if group == "theme" else "global"
+    return {"pk": "CONTROL#translation-poller", "sk": f"{group}#{suffix}"}
+
+
+def _read_fingerprint(cfg: PollerConfig, group: str) -> str:
+    if not cfg.checkpoint_table:
+        return ""
+    item = (
+        _dynamodb()
+        .Table(cfg.checkpoint_table)
+        .get_item(Key=_checkpoint_key(group, cfg), ConsistentRead=True)
+        .get("Item")
+        or {}
+    )
+    return str(item.get("fingerprint") or "")
+
+
+def _write_fingerprint(
+    cfg: PollerConfig,
+    group: str,
+    probe: dict[str, object],
+) -> None:
+    if not cfg.checkpoint_table:
+        return
+    _dynamodb().Table(cfg.checkpoint_table).put_item(
+        Item={
+            **_checkpoint_key(group, cfg),
+            "fingerprint": str(probe.get("fingerprint") or ""),
+            "resources": int(probe.get("resources") or 0),
+            "fields": int(probe.get("fields") or 0),
+            "updated_at": int(time.time()),
+        }
+    )
+
+
+def _acquire_poll_lock(cfg: PollerConfig, *, ttl_seconds: int = 480) -> str | None:
+    if not cfg.checkpoint_table:
+        return "no-checkpoint-lock"
+    now = int(time.time())
+    token = str(uuid.uuid4())
+    try:
+        _dynamodb().Table(cfg.checkpoint_table).put_item(
+            Item={
+                "pk": "CONTROL#translation-poller",
+                "sk": "LOCK",
+                "lock_token": token,
+                "expires_at": now + ttl_seconds,
+                "updated_at": now,
+            },
+            ConditionExpression="attribute_not_exists(expires_at) OR expires_at < :now",
+            ExpressionAttributeValues={":now": now},
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return None
+        raise
+    return token
+
+
+def _release_poll_lock(cfg: PollerConfig, token: str) -> None:
+    if not cfg.checkpoint_table or token == "no-checkpoint-lock":
+        return
+    try:
+        _dynamodb().Table(cfg.checkpoint_table).delete_item(
+            Key={"pk": "CONTROL#translation-poller", "sk": "LOCK"},
+            ConditionExpression="lock_token = :token",
+            ExpressionAttributeValues={":token": token},
+        )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+
+
+def _summary_succeeded(summary: dict[str, object]) -> bool:
+    return not any(
+        isinstance(item, dict) and item.get("status") == "failed"
+        for item in (summary.get("items") or [])
+    )
+
+
 async def _run_theme(cfg: PollerConfig) -> dict[str, object]:
     from src.bootstrap.theme import THEME_RESOURCE_TYPES, bootstrap_theme
 
@@ -238,13 +331,43 @@ async def _run_theme_audit(cfg: PollerConfig) -> dict[str, object]:
         audit_theme_translations,
     )
 
-    return await audit_theme_translations(
+    summary = await audit_theme_translations(
         theme_id=cfg.theme_id,
         target_locales=cfg.target_locales,
         source_locale=cfg.source_locale,
         resource_types=cfg.theme_resource_types or list(THEME_RESOURCE_TYPES),
-        include_items=False,
+        include_items=True,
     )
+    from src.state.neon import NeonTranslationStore, make_source_hash
+
+    store = NeonTranslationStore()
+    try:
+        for locale, locale_summary in (summary.get("locales") or {}).items():
+            if not isinstance(locale_summary, dict):
+                continue
+            memory = store.get_translation_memory_map(
+                source_locale=cfg.source_locale,
+                target_locale=str(locale),
+            )
+            items = locale_summary.pop("items", [])
+            reusable = sum(
+                1
+                for item in items
+                if isinstance(item, dict)
+                and (
+                    make_source_hash(str(item.get("source_value") or "")),
+                    f"{item.get('resource_type')}.{item.get('key')}",
+                )
+                in memory
+            )
+            pending = int(locale_summary.get("missing") or 0) + int(
+                locale_summary.get("outdated") or 0
+            )
+            locale_summary["reusable_from_memory"] = reusable
+            locale_summary["ai_required"] = max(0, pending - reusable)
+    finally:
+        store.close()
+    return summary
 
 
 async def _run_global_resources(cfg: PollerConfig) -> dict[str, object]:
@@ -256,7 +379,127 @@ async def _run_global_resources(cfg: PollerConfig) -> dict[str, object]:
         apply_translations=not cfg.dry_run,
         dry_run=cfg.dry_run,
         resource_types=cfg.global_resource_types or list(DEFAULT_RESOURCE_TYPES),
+        max_translations=cfg.max_translations,
     )
+
+
+async def _probe_theme(cfg: PollerConfig) -> dict[str, object]:
+    from src.bootstrap.theme import THEME_RESOURCE_TYPES, get_theme_resource_fingerprint
+
+    return await get_theme_resource_fingerprint(
+        theme_id=cfg.theme_id,
+        target_locales=cfg.target_locales,
+        source_locale=cfg.source_locale,
+        resource_types=cfg.theme_resource_types or list(THEME_RESOURCE_TYPES),
+    )
+
+
+async def _probe_global_resources(cfg: PollerConfig) -> dict[str, object]:
+    from src.bootstrap.resources import DEFAULT_RESOURCE_TYPES, get_global_resource_fingerprint
+
+    return await get_global_resource_fingerprint(
+        target_locales=cfg.target_locales,
+        resource_types=cfg.global_resource_types or list(DEFAULT_RESOURCE_TYPES),
+    )
+
+
+async def _run_scheduled_poll_unlocked(cfg: PollerConfig) -> dict[str, object]:
+    """Use Shopify-only fingerprints so unchanged polls never wake Neon or OpenAI."""
+    theme_probe = await _probe_theme(cfg) if cfg.run_theme else None
+    global_probe = (
+        await _probe_global_resources(cfg) if cfg.global_resource_poll_enabled else None
+    )
+    theme_changed = bool(
+        theme_probe
+        and (
+            not cfg.checkpoint_table
+            or _read_fingerprint(cfg, "theme") != theme_probe.get("fingerprint")
+        )
+    )
+    global_changed = bool(
+        global_probe
+        and (
+            not cfg.checkpoint_table
+            or _read_fingerprint(cfg, "global") != global_probe.get("fingerprint")
+        )
+    )
+
+    result: dict[str, object] = {
+        "ok": True,
+        "event": "scheduled_translation_poll",
+        "theme": {
+            "status": "changed" if theme_changed else "unchanged",
+            "probe": theme_probe,
+        }
+        if theme_probe
+        else None,
+        "global": {
+            "status": "changed" if global_changed else "unchanged",
+            "probe": global_probe,
+        }
+        if global_probe
+        else None,
+    }
+
+    # Global handles must settle before theme/page links are reconciled.
+    if global_changed:
+        global_summary = await _run_global_resources(cfg)
+        global_event = _build_global_resource_summary_event(global_summary)
+        result["global"] = global_event
+        print(json.dumps(global_event, ensure_ascii=False))
+        if _summary_succeeded(global_summary):
+            fresh_global_probe = await _probe_global_resources(cfg)
+            _write_fingerprint(cfg, "global", fresh_global_probe)
+    elif global_probe:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "event": "global_resource_poll",
+                    "status": "unchanged_fingerprint",
+                    "resources": global_probe.get("resources", 0),
+                    "fields": global_probe.get("fields", 0),
+                }
+            )
+        )
+
+    # A global handle change can alter localized links inside theme fields.
+    if theme_changed or (cfg.run_theme and global_changed):
+        theme_summary = await _run_theme(cfg)
+        theme_event = _build_theme_summary_event(theme_summary, theme_id=cfg.theme_id)
+        result["theme"] = theme_event
+        print(json.dumps(theme_event, ensure_ascii=False))
+        if _summary_succeeded(theme_summary):
+            fresh_theme_probe = await _probe_theme(cfg)
+            _write_fingerprint(cfg, "theme", fresh_theme_probe)
+    elif theme_probe:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "event": "theme_poll",
+                    "theme_id": cfg.theme_id,
+                    "status": "unchanged_fingerprint",
+                    "resources": theme_probe.get("resources", 0),
+                    "fields": theme_probe.get("fields", 0),
+                }
+            )
+        )
+    return result
+
+
+async def _run_scheduled_poll(cfg: PollerConfig) -> dict[str, object]:
+    lock_token = _acquire_poll_lock(cfg)
+    if lock_token is None:
+        return {
+            "ok": True,
+            "event": "scheduled_translation_poll",
+            "status": "skipped_concurrent_run",
+        }
+    try:
+        return await _run_scheduled_poll_unlocked(cfg)
+    finally:
+        _release_poll_lock(cfg, lock_token)
 
 
 def handler(event, context):
@@ -345,10 +588,7 @@ def handler(event, context):
                 print(json.dumps(result))
                 return result
 
-        result: dict[str, object] = {
-            "ok": True,
-            "event": "theme_poll",
-        }
+        result: dict[str, object] = {"ok": True, "event": "theme_poll"}
         if manual and action == "theme_audit":
             summary = asyncio.run(_run_theme_audit(cfg))
             result = {
@@ -358,11 +598,14 @@ def handler(event, context):
                 "actor": actor,
             }
             print(json.dumps(result, ensure_ascii=False))
-        elif cfg.run_theme:
+        elif manual and cfg.run_theme:
             if manual and action == "theme_canary":
                 cfg = replace(cfg, dry_run=False, max_translations=1)
             elif manual and action == "theme_sync":
-                cfg = replace(cfg, dry_run=False, max_translations=None)
+                # Preserve an optional event cap so operators can reconcile a
+                # large live theme in bounded, observable batches. The GUI
+                # omits it and therefore retains the full-sync behaviour.
+                cfg = replace(cfg, dry_run=False)
             summary = asyncio.run(_run_theme(cfg))
             result = {
                 **_build_theme_summary_event(summary, theme_id=cfg.theme_id),
@@ -372,9 +615,8 @@ def handler(event, context):
                 "max_translations": cfg.max_translations,
             }
             print(json.dumps(result, ensure_ascii=False))
-        if cfg.global_resource_poll_enabled and not manual:
-            summary = asyncio.run(_run_global_resources(cfg))
-            result = _build_global_resource_summary_event(summary)
+        elif not manual:
+            result = asyncio.run(_run_scheduled_poll(cfg))
             print(json.dumps(result, ensure_ascii=False))
         if claimed_job and job_store is not None:
             from src.config.settings import SETTINGS

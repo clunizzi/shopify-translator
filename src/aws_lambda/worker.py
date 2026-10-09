@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -252,11 +253,16 @@ def _acquire_debounce(cfg: WorkerConfig, *, shop: str, product_gid: str) -> bool
     try:
         snap.update_item(
             Key={"pk": _pk(shop, product_gid), "sk": f"source#{cfg.source_locale}"},
-            UpdateExpression="SET debounce_until = :until, updated_at = :now",
-            ConditionExpression="attribute_not_exists(debounce_until) OR debounce_until < :now",
+            UpdateExpression=(
+                "SET debounce_until = :until, updated_at = :now, #ttl = :ttl "
+                "REMOVE followup_until, followup_token, followup_updated_at"
+            ),
+            ConditionExpression="attribute_not_exists(debounce_until) OR debounce_until <= :now",
+            ExpressionAttributeNames={"#ttl": "ttl"},
             ExpressionAttributeValues={
                 ":until": now + cfg.debounce_seconds,
                 ":now": now,
+                ":ttl": now + 30 * 24 * 3600,
             },
         )
         return True
@@ -264,27 +270,129 @@ def _acquire_debounce(cfg: WorkerConfig, *, shop: str, product_gid: str) -> bool
         return False
 
 
-def _defer_debounced_record(cfg: WorkerConfig, record: dict[str, Any]) -> None:
-    receipt_handle = str(record.get("receiptHandle") or "")
-    if not cfg.sqs_url or not receipt_handle:
-        return
+def _schedule_debounced_followup(
+    cfg: WorkerConfig,
+    *,
+    shop: str,
+    debounce_gid: str,
+    topic: str,
+    body: dict[str, Any],
+) -> str:
+    """Coalesce a webhook burst into one delayed current-state refresh.
+
+    Returning the original SQS message as a failure consumed the queue's
+    receive budget and eventually moved healthy updates to the DLQ. A compact
+    DynamoDB reservation makes one worker responsible for enqueueing the
+    follow-up; all other messages in the same window can be acknowledged.
+    """
+    if not cfg.sqs_url:
+        return "failed"
+
+    snap = _snap_table(cfg)
+    now = _now_epoch()
+    delay_seconds = min(900, max(1, cfg.debounce_seconds + 2))
+    token = str(uuid.uuid4())
     try:
-        _sqs().change_message_visibility(
+        snap.update_item(
+            Key={"pk": _pk(shop, debounce_gid), "sk": f"source#{cfg.source_locale}"},
+            UpdateExpression=(
+                "SET followup_until = :until, followup_token = :token, "
+                "followup_updated_at = :now, #ttl = :ttl"
+            ),
+            ConditionExpression=("attribute_not_exists(followup_until) OR followup_until <= :now"),
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":until": now + delay_seconds,
+                ":token": token,
+                ":now": now,
+                ":ttl": now + 30 * 24 * 3600,
+            },
+        )
+    except snap.meta.client.exceptions.ConditionalCheckFailedException:
+        return "already_scheduled"
+
+    try:
+        _sqs().send_message(
             QueueUrl=cfg.sqs_url,
-            ReceiptHandle=receipt_handle,
-            VisibilityTimeout=max(1, cfg.debounce_seconds),
+            DelaySeconds=delay_seconds,
+            MessageBody=json.dumps(body, separators=(",", ":")),
+            MessageAttributes={
+                "Topic": {"DataType": "String", "StringValue": topic},
+                "Shop": {"DataType": "String", "StringValue": shop},
+                "EventId": {
+                    "DataType": "String",
+                    "StringValue": f"coalesced:{token}",
+                },
+            },
         )
     except Exception as exc:
+        # Best-effort rollback. If this fails, the reservation expires before
+        # the original SQS message is delivered again, so the update is delayed
+        # but not silently lost.
+        try:
+            snap.update_item(
+                Key={"pk": _pk(shop, debounce_gid), "sk": f"source#{cfg.source_locale}"},
+                UpdateExpression="REMOVE followup_until, followup_token, followup_updated_at",
+                ConditionExpression="followup_token = :token",
+                ExpressionAttributeValues={":token": token},
+            )
+        except Exception:
+            pass
         print(
             json.dumps(
                 {
                     "ok": False,
-                    "warning": "debounce_visibility_change_failed",
-                    "message_id": _message_id(record),
+                    "warning": "debounce_followup_schedule_failed",
                     "error": str(exc),
                 }
             )
         )
+        return "failed"
+    return "scheduled"
+
+
+def _coalesce_debounced_record(
+    cfg: WorkerConfig,
+    *,
+    record: dict[str, Any],
+    shop: str,
+    debounce_gid: str,
+    topic: str,
+    body: dict[str, Any],
+    event_id: str,
+) -> tuple[bool, str | None]:
+    message_id = _message_id(record)
+    result = _schedule_debounced_followup(
+        cfg,
+        shop=shop,
+        debounce_gid=debounce_gid,
+        topic=topic,
+        body=body,
+    )
+    if result == "failed":
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "retry": "debounce_followup_failed",
+                    "message_id": message_id,
+                }
+            )
+        )
+        return False, message_id
+
+    _mark_event_processed(cfg, event_id)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "skip": "debounce_coalesced",
+                "followup": result,
+                "message_id": message_id,
+            }
+        )
+    )
+    return True, None
 
 
 async def _run_backend(
@@ -304,10 +412,17 @@ async def _run_backend(
         apply_translations=not cfg.dry_run,
         dry_run=cfg.dry_run,
         is_create=is_create,
+        reconcile_shopify_drift=False,
         content_changes_only=not is_create,
+        recover_incomplete_state=False,
         sync_seo=cfg.seo_sync_enabled,
     )
-    if is_create and not cfg.dry_run:
+    completed_items = [
+        item
+        for item in summary.get("items", [])
+        if str(item.get("status") or "") in {"translated", "synced"}
+    ]
+    if (is_create or completed_items) and not cfg.dry_run:
         handle_summary = await sync_products_incremental(
             product_ids=[int(product_id)],
             target_locales=cfg.target_locales,
@@ -374,9 +489,15 @@ async def _process_one(record: dict[str, Any], cfg: WorkerConfig) -> tuple[bool,
             return True, None
         theme_gid = f"gid://shopify/OnlineStoreTheme/{cfg.approved_theme_id or 'main'}"
         if not _acquire_debounce(cfg, shop=shop, product_gid=theme_gid):
-            _defer_debounced_record(cfg, record)
-            print(json.dumps({"ok": False, "retry": "theme_debounce", "message_id": msg_id}))
-            return False, msg_id
+            return _coalesce_debounced_record(
+                cfg,
+                record=record,
+                shop=shop,
+                debounce_gid=theme_gid,
+                topic="themes/update",
+                body={"id": cfg.approved_theme_id or "main"},
+                event_id=event_id,
+            )
         try:
             _apply_runtime_secrets(cfg)
             from src.bootstrap.theme_tracking import track_main_theme_read_only
@@ -460,18 +581,15 @@ async def _process_one(record: dict[str, Any], cfg: WorkerConfig) -> tuple[bool,
         return True, None
 
     if not _acquire_debounce(cfg, shop=shop, product_gid=gid):
-        _defer_debounced_record(cfg, record)
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "retry": "debounce",
-                    "product_id": product_id,
-                    "message_id": msg_id,
-                }
-            )
+        return _coalesce_debounced_record(
+            cfg,
+            record=record,
+            shop=shop,
+            debounce_gid=gid,
+            topic="products/update",
+            body={"id": product_id},
+            event_id=event_id,
         )
-        return False, msg_id
 
     try:
         _apply_runtime_secrets(cfg)

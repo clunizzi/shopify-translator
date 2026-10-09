@@ -756,16 +756,88 @@ def _restore_protected_html_blocks(html: str, blocks: Sequence[tuple[str, str]])
 
 
 def _long_source_fragments_still_present(source_html: str, translated_html: str) -> list[str]:
-    translated_text = _visible_text(translated_html)
+    translated_text = re.sub(r"\s+", " ", _visible_text(translated_html)).strip()
     if not translated_text:
         return []
-    source_text = _visible_text(source_html)
-    fragments = [
-        part.strip()
-        for part in re.split(r"(?<=[.!?])\s+|\n+", source_text)
-        if len(part.strip()) >= 25 and " " in part.strip()
-    ]
+    try:
+        soup = BeautifulSoup(source_html or "", "html5lib")
+        for tag in soup.find_all(["style", "script", "noscript"]):
+            tag.decompose()
+        fragments = []
+        for node in soup.find_all(string=True):
+            text = re.sub(r"\s+", " ", str(node)).strip()
+            if (
+                len(text) < 25
+                or " " not in text
+                or is_technical_value(text)
+                or _looks_like_catalog_model_reference(text)
+                or _looks_like_postal_address(text)
+            ):
+                continue
+            fragments.extend(
+                part.strip()
+                for part in re.split(r"(?<=[.!?])\s+|\n+", text)
+                if len(part.strip()) >= 25 and " " in part.strip()
+            )
+    except Exception:
+        source_text = re.sub(r"\s+", " ", _visible_text(source_html)).strip()
+        fragments = [
+            part.strip()
+            for part in re.split(r"(?<=[.!?])\s+|\n+", source_text)
+            if len(part.strip()) >= 25 and " " in part.strip()
+        ]
     return [fragment for fragment in fragments if fragment in translated_text]
+
+
+def _looks_like_catalog_model_reference(value: str) -> bool:
+    """Recognize brand/model compatibility rows that must remain unchanged.
+
+    These rows are public technical identifiers, not Italian prose. Requiring
+    a spaced dash, a digit in the model side and no Italian descriptive words
+    keeps the exemption deliberately narrower than a generic "contains code"
+    rule.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) < 25 or len(text) > 180 or re.search(r"[!?]", text):
+        return False
+    match = re.match(r"^(.+?)\s+[—–-]\s+(.+)$", text)
+    if not match:
+        return False
+    brand, model = match.groups()
+    if not re.search(r"\d", model):
+        return False
+    descriptive_words = {
+        "adatto",
+        "compatibile",
+        "compatibili",
+        "con",
+        "macchina",
+        "modello",
+        "modelli",
+        "per",
+        "ricambio",
+        "versione",
+    }
+    brand_words = {word.lower() for word in re.findall(r"[A-Za-zÀ-ÿ]+", brand)}
+    if brand_words & descriptive_words:
+        return False
+    return bool(re.search(r"[A-Za-zÀ-ÿ]", brand) and re.search(r"[A-Za-z0-9]", model))
+
+
+def _looks_like_postal_address(value: str) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not re.search(r"\d", text):
+        return False
+    if re.search(r"\bSS\s*\d", text, flags=re.IGNORECASE):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:via|viale|vicolo|piazza|corso|strada|contrada|località|loc\.?|"
+            r"rue|avenue|boulevard|straße|strasse|platz|weg)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _should_reject_plain_cache_hit(
@@ -840,7 +912,12 @@ class Translator:
             "model": model,
             "response_format": response_format,
         }
-        if model.startswith("gpt-5.6"):
+        if model.startswith("gpt-6.1"):
+            # GPT-6.1 does not support `none` and reasoning models reject
+            # sampling parameters such as temperature. Low is the documented
+            # fit for routine transformation/rewrite work.
+            options["reasoning_effort"] = "low"
+        elif model.startswith("gpt-5.6"):
             # GPT-5.6 defaults to medium reasoning. The translator needs the
             # latency/cost profile of the previous non-reasoning request.
             options["reasoning_effort"] = "none"
@@ -2106,8 +2183,10 @@ class Translator:
         # 2) Cache & skip tecnico per leaf
         cached_out: dict[int, str] = {}
         todo_texts: list[str] = []
-        todo_idxs: list[int] = []
+        todo_idxs: list[list[int]] = []
+        todo_position_by_text: dict[str, int] = {}
         skip_count = 0
+        policy_skip_count = 0
 
         dont = list(sorted(set(dnt.brands + dnt.units + dnt.tokens)))
 
@@ -2116,7 +2195,7 @@ class Translator:
             path = paths[i]
             if should_translate_leaf and not should_translate_leaf(path, s):
                 cached_out[i] = s
-                logger.info("json_segment_skipped", reason="policy_skip")
+                policy_skip_count += 1
                 continue
             if (
                 not s
@@ -2126,7 +2205,6 @@ class Translator:
             ):
                 cached_out[i] = s
                 skip_count += 1
-                logger.info("json_segment_skipped", reason="tech_or_url")
                 continue
 
             # gestisci prefisso tecnico (es. "20m - ")
@@ -2168,10 +2246,23 @@ class Translator:
                 self.cache_hits += 1
                 logger.info("cache_hit_json", field=field_logical)
             else:
-                todo_texts.append(s)
-                todo_idxs.append(i)
+                todo_position = todo_position_by_text.get(s)
+                if todo_position is None:
+                    todo_position = len(todo_texts)
+                    todo_position_by_text[s] = todo_position
+                    todo_texts.append(s)
+                    todo_idxs.append([])
+                todo_idxs[todo_position].append(i)
                 # memorizza prefix per reiniezione post-traduzione
                 cached_out[i] = prefix  # temporaneamente solo prefisso
+
+        if policy_skip_count or skip_count:
+            logger.info(
+                "json_segments_filtered",
+                field=field_logical,
+                policy_skipped=policy_skip_count,
+                technical_or_url_skipped=skip_count,
+            )
 
         if todo_texts:
             self.cache_misses += len(todo_texts)
@@ -2230,9 +2321,10 @@ class Translator:
 
                     # copia nelle posizioni originali
                     for j, t in enumerate(arr):
-                        idx = todo_idxs[b + j]
-                        full = (cached_out[idx] or "") + (t or "")
-                        fresh_map[idx] = full
+                        indexes = todo_idxs[b + j]
+                        for idx in indexes:
+                            full = (cached_out[idx] or "") + (t or "")
+                            fresh_map[idx] = full
                         # aggiorna cache singolo leaf (senza prefisso tecnico)
                         text_norm = normalize_text(batch[j])
                         key = self._cache_key(type_name, field_logical, target_locale, text_norm)
@@ -2241,8 +2333,8 @@ class Translator:
             elif todo_texts and self.dry_run:
                 # DRY-RUN: eco con marker
                 for j, s in enumerate(todo_texts):
-                    idx = todo_idxs[j]
-                    fresh_map[idx] = (cached_out[idx] or "") + f"[{target_locale}] {s}"
+                    for idx in todo_idxs[j]:
+                        fresh_map[idx] = (cached_out[idx] or "") + f"[{target_locale}] {s}"
         except TranslationError:
             raise
         except Exception as e:

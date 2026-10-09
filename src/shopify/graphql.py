@@ -276,6 +276,90 @@ async def list_translatable_resources(
     return nodes, (conn.get("pageInfo") or {})
 
 
+async def list_translatable_resources_with_translations(
+    *,
+    resource_type: str,
+    locales: list[str],
+    first: int = 50,
+    after: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """List one resource type together with its current locale state.
+
+    Fetching translations on the paginated connection avoids one GraphQL
+    request per resource, which is essential for large collection catalogs.
+    Locale aliases are generated only from validated locale identifiers.
+    """
+    query_locales = sorted(
+        {str(locale or "").strip() for locale in locales if str(locale or "").strip()}
+    )
+    for query_locale in query_locales:
+        if any(not (char.isalnum() or char == "-") for char in query_locale):
+            raise ValueError(f"Invalid Shopify locale: {query_locale!r}")
+    locale_suffixes = {
+        query_locale: "".join(char if char.isalnum() else "_" for char in query_locale)
+        for query_locale in query_locales
+    }
+    translation_fields = "".join(
+        (
+            f" translations_{locale_suffixes[query_locale]}: "
+            f'translations(locale: "{query_locale}") '
+            "{ key value outdated }"
+        )
+        for query_locale in query_locales
+    )
+    q = (
+        "query TranslatableResourcesWithTranslations("
+        "$first: Int!, $after: String, $resourceType: TranslatableResourceType!) {"
+        "  translatableResources(first: $first, after: $after, resourceType: $resourceType) {"
+        "    edges {"
+        "      cursor"
+        "      node {"
+        "        resourceId"
+        "        translatableContent { key value digest locale }"
+        f"        {translation_fields}"
+        "      }"
+        "    }"
+        "    pageInfo { hasNextPage endCursor }"
+        "  }"
+        "}"
+    )
+    data = await _post_graphql(
+        q,
+        {
+            "first": int(first),
+            "after": after,
+            "resourceType": resource_type,
+        },
+    )
+    conn = ((data.get("data") or {}).get("translatableResources")) or {}
+    nodes: list[dict[str, Any]] = []
+    for edge in conn.get("edges") or []:
+        node = (edge or {}).get("node") or {}
+        resource_id = str(node.get("resourceId") or "")
+        if not resource_id:
+            continue
+        translations: dict[str, dict[str, dict[str, Any]]] = {}
+        for query_locale in query_locales:
+            fields: dict[str, dict[str, Any]] = {}
+            for item in node.get(f"translations_{locale_suffixes[query_locale]}") or []:
+                key = str(item.get("key") or "")
+                if key:
+                    fields[key] = {
+                        "value": str(item.get("value") or ""),
+                        "outdated": bool(item.get("outdated")),
+                    }
+            translations[query_locale] = fields
+        nodes.append(
+            {
+                "cursor": (edge or {}).get("cursor"),
+                "resourceId": resource_id,
+                "translatableContent": node.get("translatableContent") or [],
+                "translations": translations,
+            }
+        )
+    return nodes, (conn.get("pageInfo") or {})
+
+
 async def register_translations(resource_id: str, translations: list[dict]) -> list[dict]:
     """
     Executes translationsRegister with the provided list of TranslationInput.

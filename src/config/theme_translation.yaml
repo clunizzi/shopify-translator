@@ -8,6 +8,10 @@ allowed_resource_types:
 allowed_locale_key_prefixes:
   - customloc.
 
+# Theme JSON evolves continuously and merchants can invent setting IDs. After
+# the explicit technical deny-list below, textual values are storefront copy.
+translate_unclassified_text: true
+
 allowed_key_fragments:
   - announcement
   - button_label
@@ -20,6 +24,23 @@ allowed_key_fragments:
   - subheading
   - text
   - title
+
+blocked_leaf_names:
+  - address
+  - author
+  - brand
+  - business_name
+  - countdown_end
+  - discount_code
+  - discount_percent
+  - image
+  - image_mobile
+  - offer_threshold
+  - score
+  - selected_models
+  - short_name
+  - tags
+  - updated_at
 
 blocked_key_fragments:
   - alignment
@@ -40,8 +61,17 @@ blocked_key_fragments:
   - product_handle
   - speed
   - svg
+  - _tag
   - url
   - width
+
+# A generic `value` can be visible copy, so block only known technical contact
+# value paths rather than blocking every field named `value`.
+blocked_key_path_fragments:
+  - .email.value
+  - .messenger.value
+  - .phone.value
+  - .whatsapp.value
 
 blocked_value_patterns:
   - '^\s*$'
@@ -49,4 +79,5 @@ blocked_value_patterns:
   - '^\s*\{%.*%\}\s*$'
   - '^\s*<svg[\s>].*</svg>\s*$'
   - '^\s*https?://'
+  - '^\s*shopify://'
   - '^\s*[\[{].*[\]}]\s*$'

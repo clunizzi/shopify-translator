@@ -1,9 +1,10 @@
 import asyncio
+import json
 
 from src.bootstrap import catalog
 from src.state.neon import PDPTranslationState, make_source_hash
 from src.translate.cache import TranslationCache
-from src.translate.translator import Translator
+from src.translate.translator import DoNotTranslateConfig, Translator
 
 
 class _FakeTranslator:
@@ -149,6 +150,139 @@ def test_content_only_event_skips_inventory_noise_without_repairing_drift(monkey
         ).status
         == "translated"
     )
+
+
+def test_content_only_event_recovers_missing_locale_after_failed_create(monkeypatch):
+    calls = []
+    store = _FakeStore()
+    shop_domain = catalog.SETTINGS.shopify_domain
+    product_gid = "gid://shopify/Product/123"
+    source_title = "Filtro olio SO 11159"
+    source_hash = make_source_hash(source_title)
+
+    store.upsert_pdp_source(
+        catalog.PDPSourceRecord(
+            shop_domain=shop_domain,
+            product_gid=product_gid,
+            source_locale="it",
+            document={},
+            section_hashes={"product.title": source_hash},
+            metadata={},
+        )
+    )
+
+    def _fake_translate_pdp_document(**kwargs):
+        assert kwargs["changed_sections"] == {"product.title"}
+        return (
+            {"product": {"title": "Ölfilter SO 11159"}, "metafields": {}, "options": {}},
+            {"product.title": source_hash},
+            [
+                {
+                    "resource_id": product_gid,
+                    "key": "title",
+                    "locale": "de",
+                    "value": "Ölfilter SO 11159",
+                    "translatableContentDigest": "title-digest",
+                }
+            ],
+            {"product.title": "translator"},
+        )
+
+    async def _fake_register(resource_id, payloads):
+        calls.append((resource_id, payloads))
+        return []
+
+    monkeypatch.setattr(catalog, "translate_pdp_document", _fake_translate_pdp_document)
+    monkeypatch.setattr(catalog, "register_translations", _fake_register)
+
+    result = asyncio.run(
+        catalog.process_product_bundle(
+            store=store,
+            translator=_FakeTranslator(),
+            product_id=123,
+            product_gid=product_gid,
+            metafields=[],
+            live_map={
+                product_gid: [
+                    {
+                        "key": "title",
+                        "value": source_title,
+                        "digest": "title-digest",
+                        "locale": "it",
+                    }
+                ]
+            },
+            existing_translations={"de": {}},
+            target_locales=["de"],
+            source_locale="it",
+            apply_translations=True,
+            dry_run=False,
+            existing_products=True,
+            is_create=False,
+            content_changes_only=True,
+        )
+    )
+
+    item = result["items"][-1]
+    assert item["status"] == "synced"
+    assert item["changed_sections"] == []
+    assert calls[0][0] == product_gid
+    assert calls[0][1][0]["key"] == "title"
+
+
+def test_realtime_update_can_skip_historical_incomplete_locale(monkeypatch):
+    store = _FakeStore()
+    shop_domain = catalog.SETTINGS.shopify_domain
+    product_gid = "gid://shopify/Product/123"
+    source_title = "Filtro olio SO 11159"
+    source_hash = make_source_hash(source_title)
+    store.upsert_pdp_source(
+        catalog.PDPSourceRecord(
+            shop_domain=shop_domain,
+            product_gid=product_gid,
+            source_locale="it",
+            document={},
+            section_hashes={"product.title": source_hash},
+            metadata={},
+        )
+    )
+
+    async def _unexpected_register(*_args, **_kwargs):
+        raise AssertionError("inventory noise must not trigger historical recovery")
+
+    monkeypatch.setattr(catalog, "register_translations", _unexpected_register)
+
+    result = asyncio.run(
+        catalog.process_product_bundle(
+            store=store,
+            translator=_FakeTranslator(),
+            product_id=123,
+            product_gid=product_gid,
+            metafields=[],
+            live_map={
+                product_gid: [
+                    {
+                        "key": "title",
+                        "value": source_title,
+                        "digest": "inventory-only-digest",
+                        "locale": "it",
+                    }
+                ]
+            },
+            existing_translations={"de": {}},
+            target_locales=["de"],
+            source_locale="it",
+            apply_translations=True,
+            dry_run=False,
+            existing_products=True,
+            is_create=False,
+            content_changes_only=True,
+            recover_incomplete_state=False,
+        )
+    )
+
+    assert result["items"][-1]["status"] == "unchanged"
+    assert result["items"][-1]["skip_reason"] == "no_translatable_content_change"
 
 
 def test_content_only_event_translates_only_the_changed_section(monkeypatch):
@@ -895,6 +1029,7 @@ def test_apply_translations_reuses_stored_sections_for_failed_locale(monkeypatch
             dry_run=False,
             existing_products=True,
             is_create=False,
+            content_changes_only=True,
             summary=summary,
         )
     )
@@ -1361,8 +1496,7 @@ def test_dry_run_placeholder_is_not_rejected_by_domain_glossary():
                         "metafield_type": "json",
                         "content_kind": "json",
                         "value": (
-                            '{"items":[{"product_handle":"fresa-test",'
-                            '"title":"Fresa di prova"}]}'
+                            '{"items":[{"product_handle":"fresa-test","title":"Fresa di prova"}]}'
                         ),
                         "digest": "digest-1",
                     }
@@ -1433,6 +1567,8 @@ def test_dry_run_detects_shopify_drift_even_when_neon_state_is_synced():
             dry_run=True,
             existing_products=True,
             is_create=False,
+            content_changes_only=True,
+            reconcile_shopify_drift=True,
         )
     )
 
@@ -1523,6 +1659,8 @@ def test_handle_only_generates_handle_from_stored_title(monkeypatch):
     )
     assert result["items"][-1]["status"] == "synced"
     assert state.document["product"]["handle"] == "kompakttraktor"
+    assert store.source_writes == 1
+    assert store.sources[(shop_domain, product_gid, "it")]["section_hashes"] == {}
     assert calls == [
         (
             product_gid,
@@ -1625,3 +1763,82 @@ def test_json_validator_preserves_blank_and_blocked_leaves():
         ),
         target_locale="de",
     )
+
+
+def test_spare_part_json_uses_shared_leaf_dictionary(monkeypatch):
+    class SharedStore:
+        def __init__(self):
+            self.writes = []
+
+        def get_dictionary_translations(self, **kwargs):
+            assert kwargs["source_values"] == ["Tubo flessibile", "Serbatoio carburante"]
+            return {}
+
+        def upsert_dictionary_translations(self, **kwargs):
+            self.writes.append(kwargs)
+
+    class JsonTranslator:
+        def __init__(self):
+            self.sources = []
+
+        def translate_json_value(self, _type_name, _field, source, *_args, **_kwargs):
+            self.sources.append(json.loads(source))
+            return '{"values": ["Kraftstofftank"]}'
+
+    monkeypatch.setattr(
+        catalog,
+        "make_metafield_leaf_filter",
+        lambda _namespace, _key: (
+            lambda path, _value: next(
+                (part for part in reversed(path) if isinstance(part, str)), ""
+            )
+            in {"name", "illustration_description"}
+        ),
+    )
+    store = SharedStore()
+    translator = JsonTranslator()
+    entry = {
+        "namespace": "custom",
+        "key": "ssc_spare_part",
+        "value": json.dumps(
+            {
+                "name": "Tubo flessibile",
+                "material_number": "00009302803",
+                "compatibility": [
+                    {
+                        "product_name": "MS 170",
+                        "illustration_description": "Serbatoio carburante",
+                    },
+                    {
+                        "product_name": "MS 180",
+                        "illustration_description": "Serbatoio carburante",
+                    },
+                ],
+            }
+        ),
+    }
+
+    result = json.loads(
+        catalog._translate_shared_json_metafield(
+            store,
+            translator,
+            entry,
+            target_locale="de",
+            source_locale="it",
+            dnt=DoNotTranslateConfig(brands=[], units=[], tokens=[]),
+            exclude_tokens=[],
+            existing_translation='{"name":"Flexschlauch"}',
+        )
+    )
+
+    assert translator.sources == [{"values": ["Serbatoio carburante"]}]
+    assert result["name"] == "Flexschlauch"
+    assert result["material_number"] == "00009302803"
+    assert [row["product_name"] for row in result["compatibility"]] == ["MS 170", "MS 180"]
+    assert {row["illustration_description"] for row in result["compatibility"]} == {
+        "Kraftstofftank"
+    }
+    assert store.writes[0]["translations"] == {
+        "Tubo flessibile": "Flexschlauch",
+        "Serbatoio carburante": "Kraftstofftank",
+    }

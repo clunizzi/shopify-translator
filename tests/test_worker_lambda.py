@@ -98,7 +98,58 @@ def test_process_one_dedup_skip_is_success(monkeypatch):
     assert failure_id is None
 
 
-def test_process_one_debounce_requests_retry(monkeypatch):
+def test_process_one_debounce_coalesces_and_acknowledges(monkeypatch):
+    cfg = worker.WorkerConfig(
+        ddb_table="snap",
+        dedup_table="dedup",
+        source_locale="it",
+        target_locales=["de"],
+        mf_include=[],
+        debounce_seconds=20,
+        dry_run=False,
+        shop_domain="example.myshopify.com",
+        openai_api_key_secret_arn="",
+        shopify_admin_token_secret_arn="",
+        neon_database_url_secret_arn="",
+        disable_sync=False,
+        log_verbose_sync=False,
+    )
+    marked = []
+
+    monkeypatch.setattr(worker, "_event_already_processed", lambda cfg, event_id: False)
+    monkeypatch.setattr(worker, "_acquire_debounce", lambda cfg, shop, product_gid: False)
+    monkeypatch.setattr(
+        worker,
+        "_schedule_debounced_followup",
+        lambda *_args, **_kwargs: "scheduled",
+    )
+    monkeypatch.setattr(
+        worker,
+        "_mark_event_processed",
+        lambda _cfg, event_id: marked.append(event_id),
+    )
+
+    ok, failure_id = asyncio.run(
+        worker._process_one(
+            {
+                "messageId": "m-125",
+                "body": '{"id": 303}',
+                "messageAttributes": {
+                    "Topic": {"stringValue": "products/update"},
+                    "Shop": {"stringValue": "example.myshopify.com"},
+                    "EventId": {"stringValue": "evt-3"},
+                },
+            },
+            cfg,
+        )
+    )
+
+    assert ok
+    assert failure_id is None
+    assert marked == ["evt-3"]
+
+
+def test_process_one_debounce_retries_only_when_followup_scheduling_fails(monkeypatch):
     cfg = worker.WorkerConfig(
         ddb_table="snap",
         dedup_table="dedup",
@@ -117,16 +168,21 @@ def test_process_one_debounce_requests_retry(monkeypatch):
 
     monkeypatch.setattr(worker, "_event_already_processed", lambda cfg, event_id: False)
     monkeypatch.setattr(worker, "_acquire_debounce", lambda cfg, shop, product_gid: False)
+    monkeypatch.setattr(
+        worker,
+        "_schedule_debounced_followup",
+        lambda *_args, **_kwargs: "failed",
+    )
 
     ok, failure_id = asyncio.run(
         worker._process_one(
             {
-                "messageId": "m-125",
+                "messageId": "m-126",
                 "body": '{"id": 303}',
                 "messageAttributes": {
                     "Topic": {"stringValue": "products/update"},
                     "Shop": {"stringValue": "example.myshopify.com"},
-                    "EventId": {"stringValue": "evt-3"},
+                    "EventId": {"stringValue": "evt-4"},
                 },
             },
             cfg,
@@ -134,15 +190,28 @@ def test_process_one_debounce_requests_retry(monkeypatch):
     )
 
     assert not ok
-    assert failure_id == "m-125"
+    assert failure_id == "m-126"
 
 
-def test_debounce_defers_only_the_current_message(monkeypatch):
-    calls = []
+def test_debounce_schedules_one_compact_followup(monkeypatch):
+    table_calls = []
+    sqs_calls = []
+
+    class _ConditionalCheckFailedException(Exception):
+        pass
+
+    class _FakeTable:
+        class meta:
+            class client:
+                class exceptions:
+                    ConditionalCheckFailedException = _ConditionalCheckFailedException
+
+        def update_item(self, **kwargs):
+            table_calls.append(kwargs)
 
     class _FakeSQS:
-        def change_message_visibility(self, **kwargs):
-            calls.append(kwargs)
+        def send_message(self, **kwargs):
+            sqs_calls.append(kwargs)
 
     cfg = worker.WorkerConfig(
         ddb_table="snap",
@@ -160,21 +229,38 @@ def test_debounce_defers_only_the_current_message(monkeypatch):
         log_verbose_sync=False,
         sqs_url="https://example.com/products",
     )
+    monkeypatch.setattr(worker, "_snap_table", lambda _cfg: _FakeTable())
     monkeypatch.setattr(worker, "_SQS", _FakeSQS())
+    monkeypatch.setattr(worker, "_now_epoch", lambda: 1_000)
+    monkeypatch.setattr(worker.uuid, "uuid4", lambda: "followup-token")
 
-    worker._defer_debounced_record(
+    result = worker._schedule_debounced_followup(
         cfg,
-        {
-            "messageId": "m-126",
-            "receiptHandle": "receipt-126",
-        },
+        shop="example.myshopify.com",
+        debounce_gid="gid://shopify/Product/303",
+        topic="products/update",
+        body={"id": 303},
     )
 
-    assert calls == [
+    assert result == "scheduled"
+    assert len(table_calls) == 1
+    assert table_calls[0]["ExpressionAttributeValues"][":until"] == 1_022
+    assert sqs_calls == [
         {
             "QueueUrl": "https://example.com/products",
-            "ReceiptHandle": "receipt-126",
-            "VisibilityTimeout": 20,
+            "DelaySeconds": 22,
+            "MessageBody": '{"id":303}',
+            "MessageAttributes": {
+                "Topic": {"DataType": "String", "StringValue": "products/update"},
+                "Shop": {
+                    "DataType": "String",
+                    "StringValue": "example.myshopify.com",
+                },
+                "EventId": {
+                    "DataType": "String",
+                    "StringValue": "coalesced:followup-token",
+                },
+            },
         }
     ]
 
@@ -221,8 +307,69 @@ def test_product_update_backend_only_processes_content_changes(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0]["content_changes_only"] is True
+    assert calls[0]["reconcile_shopify_drift"] is False
+    assert calls[0]["recover_incomplete_state"] is False
     assert calls[0]["apply_translations"] is True
     assert calls[0]["sync_seo"] is True
+
+
+def test_recovered_product_update_also_completes_missing_handles(monkeypatch):
+    calls = []
+    cfg = worker.WorkerConfig(
+        ddb_table="snap",
+        dedup_table="dedup",
+        source_locale="it",
+        target_locales=["de", "fr"],
+        mf_include=[],
+        debounce_seconds=60,
+        dry_run=False,
+        shop_domain="example.myshopify.com",
+        openai_api_key_secret_arn="",
+        shopify_admin_token_secret_arn="",
+        neon_database_url_secret_arn="",
+        disable_sync=False,
+        log_verbose_sync=False,
+        seo_sync_enabled=True,
+    )
+
+    async def _fake_sync_products_incremental(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("handle_only"):
+            return {
+                "registered": 2,
+                "failed_products": 0,
+                "failed_product_ids": [],
+                "items": [{"status": "synced"}],
+            }
+        return {
+            "registered": 4,
+            "failed_products": 0,
+            "failed_product_ids": [],
+            "items": [{"status": "synced", "changed_sections": []}],
+        }
+
+    from src.bootstrap import incremental
+
+    monkeypatch.setattr(
+        incremental,
+        "sync_products_incremental",
+        _fake_sync_products_incremental,
+    )
+
+    summary = asyncio.run(
+        worker._run_backend(
+            cfg=cfg,
+            product_id="123",
+            is_create=False,
+            shop="example.myshopify.com",
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["content_changes_only"] is True
+    assert calls[1]["handle_only"] is True
+    assert calls[1]["is_create"] is False
+    assert summary["registered"] == 6
 
 
 def test_theme_update_runs_read_only_tracker_not_product_backend(monkeypatch):

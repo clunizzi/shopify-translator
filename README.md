@@ -18,6 +18,9 @@ every time an order changes inventory.
 ## Why it is different
 
 - **Near real-time sync** — Shopify webhooks trigger focused translation jobs.
+- **Theme-safe polling** — a lightweight Shopify fingerprint catches theme-file
+  and page changes that Shopify does not emit as useful webhooks; unchanged
+  checks never wake Neon or OpenAI.
 - **Change-aware** — inventory-only updates stop before OpenAI or Shopify
   writes.
 - **Complete storefront coverage** — products, variants, options, selected
@@ -38,7 +41,7 @@ Lambda receiver ──HMAC──▶ SQS ──▶ Translation worker
                                       ├── Shopify Admin GraphQL
                                       └── Neon / PostgreSQL
 
-EventBridge ──▶ reconciliation pollers
+EventBridge ──▶ digest poller ──changed only──▶ reconciliation
 Cloudflare Access ──▶ operations dashboard
 ```
 
@@ -53,9 +56,10 @@ missing or outdated, it translates and registers only those fields.
 | Catalog | Products, descriptions, product types, variants and options |
 | Custom data | Allowlisted textual metafield leaves, including structured JSON |
 | SEO | Meta titles and descriptions, with conservative rollout controls |
-| URLs | Missing localized handles, without replacing existing URLs |
+| URLs | Localized handles and internal links, preserving existing valid URLs |
 | Theme | JSON templates, section groups and configured locale namespaces |
-| Global resources | Store policies and explicitly enabled Shopify resources |
+| Collections | Titles, SEO, handles and deterministic `Ricambi <model>` localization |
+| Global resources | Pages, blogs, articles, menus, links, policies and shop copy |
 
 Liquid, HTML, JSON structure, protected terms, product codes and units are
 validated before a translation is accepted.
@@ -93,6 +97,14 @@ Review the output before enabling writes against a live store.
 The included Terraform stack provisions the AWS receiver, worker, queues,
 dead-letter queue, DynamoDB coordination tables and scheduled pollers.
 
+The theme/global poll defaults to every 10 minutes. It stores only a compact
+fingerprint in DynamoDB and runs the Neon/OpenAI reconciliation path only when
+Shopify source content or a remote translation actually changes.
+
+Set `COLLECTION_AI_ENABLED=false` to keep collection synchronization limited
+to deterministic rules. Free-form collection copy is sent to the configured
+AI translator only after this gate is explicitly enabled.
+
 ```bash
 make build-receiver
 make build-worker-docker PY=3.12
@@ -111,7 +123,6 @@ audits and unlock each write path intentionally.
 ## Operations dashboard
 
 `cloudflare-admin/` contains an optional Cloudflare Workers control panel for:
-
 - translation coverage and system health;
 - product and theme inspection;
 - localized storefront previews;

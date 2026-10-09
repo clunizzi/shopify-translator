@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from typing import Any
 
 import structlog
 
+from src.bootstrap.localized_urls import (
+    extract_internal_urls_from_html,
+    fetch_localized_handle_maps,
+    localize_internal_url,
+    localize_internal_urls_in_html,
+)
 from src.config.dnt_loader import load_do_not_translate
 from src.config.settings import SETTINGS
-from src.config.theme_policies import should_translate_theme_entry
+from src.config.theme_policies import is_localizable_theme_url, should_translate_theme_entry
 from src.shopify.graphql import (
     get_main_theme,
+    get_resource_translation_matrix,
     get_resource_translations_by_ids,
     list_translatable_resources,
     register_translations,
@@ -21,9 +30,11 @@ from src.state.neon import (
     make_source_hash,
 )
 from src.translate.cache import TranslationCache
-from src.translate.translator import Translator
+from src.translate.translator import TranslationError, Translator
 
 logger = structlog.get_logger("theme")
+
+_DEFAULT_GET_RESOURCE_TRANSLATIONS_BY_IDS = get_resource_translations_by_ids
 
 THEME_RESOURCE_TYPES = [
     "ONLINE_STORE_THEME_JSON_TEMPLATE",
@@ -34,6 +45,26 @@ THEME_RESOURCE_TYPES = [
 
 class ThemeSafetyError(RuntimeError):
     pass
+
+
+async def _get_theme_translations_by_locale(
+    resource_ids: list[str], target_locales: list[str]
+) -> dict[str, dict[str, dict[str, dict[str, Any]]]]:
+    # Keep the old injectable seam for focused unit tests and integrations,
+    # while production fetches both locales in one pass per resource.
+    if get_resource_translations_by_ids is not _DEFAULT_GET_RESOURCE_TRANSLATIONS_BY_IDS:
+        return {
+            locale: await get_resource_translations_by_ids(resource_ids, locale)
+            for locale in target_locales
+        }
+    matrix = await get_resource_translation_matrix(resource_ids, target_locales)
+    return {
+        locale: {
+            resource_id: locale_map.get(locale, {})
+            for resource_id, locale_map in matrix.items()
+        }
+        for locale in target_locales
+    }
 
 
 def _numeric_theme_id(theme_id: str | int) -> str:
@@ -123,23 +154,35 @@ def _build_theme_verbose_log_event(item_summary: dict[str, Any]) -> dict[str, An
 async def fetch_theme_source_bundle(
     *,
     resource_types: list[str] | None = None,
+    target_locales: list[str] | None = None,
     first: int = 250,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for resource_type in resource_types or THEME_RESOURCE_TYPES:
         cursor: str | None = None
         while True:
-            nodes, page_info = await list_translatable_resources(
-                resource_type=resource_type,
-                first=first,
-                after=cursor,
-            )
+            if target_locales:
+                from src.shopify.graphql import list_translatable_resources_with_translations
+
+                nodes, page_info = await list_translatable_resources_with_translations(
+                    resource_type=resource_type,
+                    locales=target_locales,
+                    first=first,
+                    after=cursor,
+                )
+            else:
+                nodes, page_info = await list_translatable_resources(
+                    resource_type=resource_type,
+                    first=first,
+                    after=cursor,
+                )
             for node in nodes:
                 out.append(
                     {
                         "resource_type": resource_type,
                         "resource_id": node["resourceId"],
                         "translatableContent": node.get("translatableContent") or [],
+                        "translations": node.get("translations") or {},
                     }
                 )
             if not page_info.get("hasNextPage"):
@@ -148,6 +191,65 @@ async def fetch_theme_source_bundle(
             if not cursor:
                 break
     return out
+
+
+async def get_theme_resource_fingerprint(
+    *,
+    theme_id: str | int,
+    target_locales: list[str],
+    source_locale: str,
+    resource_types: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fingerprint eligible theme fields and current translations, without Neon."""
+    main_theme = await assert_approved_main_theme(theme_id)
+    bundle = await fetch_theme_source_bundle(
+        resource_types=resource_types,
+        target_locales=target_locales,
+    )
+    docs = build_theme_documents(
+        shop_domain=SETTINGS.shopify_domain,
+        theme_id=_numeric_theme_id(theme_id),
+        source_locale=source_locale,
+        bundle=bundle,
+    )
+    remote_by_id = {
+        str(item.get("resource_id") or ""): item.get("translations") or {}
+        for item in bundle
+    }
+    rows: list[tuple[object, ...]] = []
+    for document, _section_hashes in docs:
+        resource_type = str(document["resource_type"])
+        resource_id = str(document["resource_id"])
+        remote_by_locale = remote_by_id.get(resource_id) or {}
+        for key, entry in document.get("entries", {}).items():
+            rows.append(
+                (
+                    resource_type,
+                    resource_id,
+                    key,
+                    str(entry.get("digest") or make_source_hash(str(entry.get("value") or ""))),
+                )
+            )
+            for locale in sorted(target_locales):
+                translated = ((remote_by_locale.get(locale) or {}).get(key)) or {}
+                rows.append(
+                    (
+                        resource_type,
+                        resource_id,
+                        key,
+                        locale,
+                        str(translated.get("value") or ""),
+                        bool(translated.get("outdated")),
+                    )
+                )
+    payload = json.dumps(sorted(rows), ensure_ascii=False, separators=(",", ":"))
+    return {
+        "fingerprint": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "resources": len(docs),
+        "fields": sum(1 for row in rows if len(row) == 4),
+        "theme_id": _numeric_theme_id(theme_id),
+        "theme_name": main_theme.get("name") or "",
+    }
 
 
 async def audit_theme_translations(
@@ -169,10 +271,9 @@ async def audit_theme_translations(
         bundle=bundle,
     )
     resource_ids = [document["resource_id"] for document, _hashes in docs]
-    translations_by_locale = {
-        locale: await get_resource_translations_by_ids(resource_ids, locale)
-        for locale in target_locales
-    }
+    translations_by_locale = await _get_theme_translations_by_locale(
+        resource_ids, target_locales
+    )
     summary: dict[str, Any] = {
         "ok": True,
         "read_only": True,
@@ -261,9 +362,13 @@ def build_theme_documents(
                 continue
             section_name = _theme_section_name(resource_type, key)
             content_kind = (
-                "html"
-                if "<" in value and ">" in value
-                else ("liquid" if "{{" in value or "{%" in value else "plain")
+                "internal_url"
+                if is_localizable_theme_url(key=key, value=value)
+                else (
+                    "html"
+                    if "<" in value and ">" in value
+                    else ("liquid" if "{{" in value or "{%" in value else "plain")
+                )
             )
             document["entries"][key] = {
                 "resource_id": resource_id,
@@ -286,6 +391,9 @@ def translate_theme_document(
     target_locale: str,
     translator: Translator,
     translation_reuse: dict[tuple[str, str, str, str], str] | None = None,
+    translation_memory: dict[tuple[str, str], str] | None = None,
+    localized_handle_maps: dict[str, dict[str, dict[str, str]]] | None = None,
+    route_prefixes: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], list[dict], dict[str, str]]:
     dnt_path = (
         SETTINGS.do_not_translate_path if getattr(SETTINGS, "do_not_translate_path", None) else None
@@ -316,31 +424,66 @@ def translate_theme_document(
             value=entry["value"],
             content_kind=entry["content_kind"],
         )
-        translated_value = (translation_reuse or {}).get(reuse_key)
-        if translated_value:
-            section_sources[section_name] = "current_shopify_translation_reuse"
-        elif entry["content_kind"] == "html" or entry["content_kind"] == "liquid":
-            translated_value = translator.translate_html_document(
-                "ONLINE_STORE_THEME",
-                key,
-                entry["value"],
-                target_locale,
-                dnt,
-                exclude_tokens,
+        try:
+            if entry["content_kind"] == "internal_url":
+                translated_value = localize_internal_url(
+                    entry["value"],
+                    target_locale=target_locale,
+                    route_prefixes=route_prefixes or {},
+                    handle_maps=localized_handle_maps,
+                )
+                section_sources[section_name] = "localized_internal_url"
+            else:
+                translated_value = (translation_reuse or {}).get(reuse_key)
+                if translated_value:
+                    section_sources[section_name] = "current_shopify_translation_reuse"
+                elif memory_value := (translation_memory or {}).get(
+                    (make_source_hash(entry["value"]), section_name)
+                ):
+                    translated_value = memory_value
+                    section_sources[section_name] = "memory:neon"
+                elif entry["content_kind"] in {"html", "liquid"}:
+                    translated_value = translator.translate_html_document(
+                        "ONLINE_STORE_THEME",
+                        key,
+                        entry["value"],
+                        target_locale,
+                        dnt,
+                        exclude_tokens,
+                    )
+                    section_sources[section_name] = "translator_html_document"
+                else:
+                    translated_value = translator.translate_plain(
+                        "ONLINE_STORE_THEME",
+                        key,
+                        entry["value"],
+                        target_locale,
+                        dnt,
+                        exclude_tokens,
+                    )
+                    section_sources[section_name] = "translator"
+                if translation_reuse is not None:
+                    translation_reuse[reuse_key] = translated_value
+                if entry["content_kind"] in {"html", "liquid"}:
+                    translated_value = localize_internal_urls_in_html(
+                        translated_value,
+                        target_locale=target_locale,
+                        route_prefixes=route_prefixes or {},
+                        handle_maps=localized_handle_maps,
+                    )
+        except TranslationError as exc:
+            # A single difficult field must not prevent unrelated theme content
+            # from being translated and registered.  Leaving it out of the
+            # payload also leaves it pending in the next Shopify reconciliation.
+            section_sources[section_name] = f"translation_error:{exc}"
+            logger.warning(
+                "theme_section_translation_failed",
+                resource_id=source_document["resource_id"],
+                key=key,
+                target_locale=target_locale,
+                error=str(exc),
             )
-            section_sources[section_name] = "translator_html_document"
-        else:
-            translated_value = translator.translate_plain(
-                "ONLINE_STORE_THEME",
-                key,
-                entry["value"],
-                target_locale,
-                dnt,
-                exclude_tokens,
-            )
-            section_sources[section_name] = "translator"
-        if translation_reuse is not None:
-            translation_reuse[reuse_key] = translated_value
+            continue
 
         translated_document["entries"][key] = translated_value
         translated_hashes[section_name] = make_source_hash(entry["value"])
@@ -462,18 +605,45 @@ async def bootstrap_theme(
         )
         remote_translations: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
         translation_reuse: dict[tuple[str, str, str, str], str] = {}
+        translation_memory: dict[str, dict[tuple[str, str], str]] = {}
+        localized_handle_maps: dict[str, dict[str, dict[str, str]]] = {}
+        route_prefix_loader = getattr(SETTINGS, "get_localized_route_prefixes", None)
+        route_prefixes = route_prefix_loader() if callable(route_prefix_loader) else {}
         if apply_translations and docs:
+            memory_loader = getattr(store, "get_translation_memory_map", None)
+            if callable(memory_loader):
+                translation_memory = {
+                    target_locale: memory_loader(
+                        source_locale=source_locale,
+                        target_locale=target_locale,
+                    )
+                    for target_locale in target_locales
+                }
             resource_ids = [document["resource_id"] for document, _hashes in docs]
-            remote_translations = {
-                locale: await get_resource_translations_by_ids(resource_ids, locale)
-                for locale in target_locales
-            }
+            remote_translations = await _get_theme_translations_by_locale(
+                resource_ids, target_locales
+            )
+            source_urls = [
+                source_url
+                for document, _section_hashes in docs
+                for entry in document.get("entries", {}).values()
+                for source_url in (
+                    [str(entry.get("value") or "")]
+                    if entry.get("content_kind") == "internal_url"
+                    else extract_internal_urls_from_html(str(entry.get("value") or ""))
+                )
+            ]
+            if source_urls:
+                localized_handle_maps = await fetch_localized_handle_maps(
+                    target_locales=target_locales,
+                    source_urls=source_urls,
+                )
             for target_locale in target_locales:
                 locale_resources = remote_translations.get(target_locale) or {}
                 for source_document, _section_hashes in docs:
                     remote = locale_resources.get(source_document["resource_id"]) or {}
                     for key, entry in source_document.get("entries", {}).items():
-                        if is_forced_key(key):
+                        if is_forced_key(key) or entry.get("content_kind") == "internal_url":
                             continue
                         translated = remote.get(key) or {}
                         translated_value = str(translated.get("value") or "").strip()
@@ -541,6 +711,45 @@ async def bootstrap_theme(
                         for section_name in section_hashes
                         if (
                             is_forced_key(section_name.split(".", 1)[1])
+                            or (
+                                source_document["entries"][section_name.split(".", 1)[1]].get(
+                                    "content_kind"
+                                )
+                                == "internal_url"
+                                and str(
+                                    (remote.get(section_name.split(".", 1)[1]) or {}).get("value")
+                                    or ""
+                                ).strip()
+                                != localize_internal_url(
+                                    source_document["entries"][section_name.split(".", 1)[1]][
+                                        "value"
+                                    ],
+                                    target_locale=target_locale,
+                                    route_prefixes=route_prefixes,
+                                    handle_maps=localized_handle_maps,
+                                )
+                            )
+                            or (
+                                source_document["entries"][section_name.split(".", 1)[1]].get(
+                                    "content_kind"
+                                )
+                                in {"html", "liquid"}
+                                and str(
+                                    (remote.get(section_name.split(".", 1)[1]) or {}).get("value")
+                                    or ""
+                                ).strip()
+                                != localize_internal_urls_in_html(
+                                    str(
+                                        (
+                                            remote.get(section_name.split(".", 1)[1]) or {}
+                                        ).get("value")
+                                        or ""
+                                    ).strip(),
+                                    target_locale=target_locale,
+                                    route_prefixes=route_prefixes,
+                                    handle_maps=localized_handle_maps,
+                                )
+                            )
                             or (translated := remote.get(section_name.split(".", 1)[1])) is None
                             or not str(translated.get("value") or "").strip()
                             or bool(translated.get("outdated"))
@@ -606,6 +815,9 @@ async def bootstrap_theme(
                             target_locale=target_locale,
                             translator=translator,
                             translation_reuse=translation_reuse,
+                            translation_memory=translation_memory.get(target_locale),
+                            localized_handle_maps=localized_handle_maps,
+                            route_prefixes=route_prefixes,
                         )
                     )
 
@@ -633,6 +845,13 @@ async def bootstrap_theme(
                     "translated_sections": sorted(list(locale_changed_sections)),
                     "section_sources": section_sources,
                 }
+                failed_sections = sorted(
+                    section_name
+                    for section_name, source in section_sources.items()
+                    if source.startswith("translation_error:")
+                )
+                if failed_sections:
+                    locale_summary["failed_sections"] = failed_sections
                 if apply_translations and dry_run:
                     summary["would_register"] += len(payloads)
                     translation_status = "planned"
@@ -653,7 +872,7 @@ async def bootstrap_theme(
                     )
                     if not user_errors:
                         summary["registered"] += len(shopify_payloads)
-                        translation_status = "synced"
+                        translation_status = "failed" if failed_sections else "synced"
                     else:
                         translation_status = "failed"
                         translation_metadata["user_errors"] = user_errors

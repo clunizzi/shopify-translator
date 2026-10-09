@@ -28,13 +28,15 @@ target_locales  = "fr,de"
 mf_include      = "" # es. "meta.namespace1.key1,meta.ns2.key2"
 theme_resource_types = "" # es. "ONLINE_STORE_THEME_JSON_TEMPLATE,ONLINE_STORE_THEME_SECTION_GROUP"
 global_resource_types = "" # es. "SHOP_POLICY,SHOP"
+localized_route_prefixes = "" # es. "de:/de-de,fr:/fr-fr"
 global_resource_poll_enabled = "false"
+collection_ai_enabled        = "false" # deterministic collection rules only until explicitly approved
 theme_id             = "" # ID MAIN approvato; il sync si blocca se Shopify MAIN cambia
 theme_tracking_enabled = "false" # checksum/digest via webhook, sempre read-only su Shopify
 theme_realtime_sync_enabled = "false" # sync differenziale su themes/update; abilita solo dopo il canary
 theme_poll_enabled   = "true"  # mantiene la regola; scheduled_sync_enabled ne controlla lo stato
 scheduled_sync_enabled = "false" # abilita davvero il poller; richiede approvazione live
-theme_poll_schedule  = "cron(0 3 1 * ? *)"
+theme_poll_schedule  = "rate(10 minutes)" # lightweight fingerprint; Neon/OpenAI only on change
 catalog_poll_enabled = "false" # rete di sicurezza prodotti; attivare dopo dry-run
 catalog_poll_schedule = "rate(15 minutes)"
 
@@ -48,6 +50,8 @@ log_verbose_sync     = "false"
 seo_sync_enabled     = "false" # attivare solo dopo audit e backfill SEO controllato
 openai_model          = "gpt-5.6-terra"
 openai_fallback_model = "gpt-5.6-sol"
+theme_openai_model          = "" # es. "gpt-6.1-sol" per un rollout separato del tema
+theme_openai_fallback_model = ""
 worker_maximum_concurrency = 5
 
 # Prompt and policy customization. Keep store-specific overlays in ignored

@@ -80,6 +80,9 @@ class _ReadOnlyTranslationStore:
     def upsert_dictionary_translation(self, **kwargs: Any) -> None:
         return None
 
+    def upsert_dictionary_translations(self, **kwargs: Any) -> None:
+        return None
+
 
 def _section_name_product(key: str) -> str:
     return f"product.{key}"
@@ -558,12 +561,16 @@ def _translate_json_metafield(
     exclude_tokens: list[str],
 ) -> str:
     if entry.get("metafield_type") == "rich_text_field":
+
         def leaf_filter(path, value):
-            return (next(
-                        (part for part in reversed(path) if isinstance(part, str)),
-                        "",
-                    )
-                    == "value")
+            return (
+                next(
+                    (part for part in reversed(path) if isinstance(part, str)),
+                    "",
+                )
+                == "value"
+            )
+
     else:
         leaf_filter = make_metafield_leaf_filter(entry["namespace"], entry["key"])
     return translator.translate_json_value(
@@ -575,6 +582,122 @@ def _translate_json_metafield(
         exclude_tokens,
         should_translate_leaf=leaf_filter,
     )
+
+
+def _translate_shared_json_metafield(
+    store: NeonTranslationStore,
+    translator: Translator,
+    entry: dict[str, Any],
+    *,
+    target_locale: str,
+    source_locale: str,
+    dnt,
+    exclude_tokens: list[str],
+    existing_translation: str | None = None,
+) -> str:
+    """Translate repeated human JSON leaves once and share them across products."""
+
+    try:
+        obj = json.loads(entry["value"])
+    except (TypeError, ValueError):
+        return _translate_json_metafield(
+            translator,
+            entry,
+            target_locale=target_locale,
+            dnt=dnt,
+            exclude_tokens=exclude_tokens,
+        )
+
+    leaf_filter = make_metafield_leaf_filter(entry["namespace"], entry["key"])
+    eligible: list[tuple[tuple[Any, ...], str]] = []
+
+    def walk(value: Any, path: tuple[Any, ...]) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                walk(child, path + (key,))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                walk(child, path + (index,))
+        elif isinstance(value, str) and leaf_filter(path, value):
+            eligible.append((path, value))
+
+    walk(obj, ())
+    unique_values = list(dict.fromkeys(value for _path, value in eligible if value.strip()))
+    if not unique_values:
+        return json.dumps(obj, ensure_ascii=False)
+
+    category = f"json_leaf.{entry['namespace']}.{entry['key']}"
+    shared = store.get_dictionary_translations(
+        category=category,
+        source_locale=source_locale,
+        target_locale=target_locale,
+        source_values=unique_values,
+    )
+    pending_writes: dict[str, str] = {}
+    if existing_translation:
+        try:
+            previous_obj = json.loads(existing_translation)
+            source_name = obj.get("name") if isinstance(obj, dict) else None
+            translated_name = previous_obj.get("name") if isinstance(previous_obj, dict) else None
+            if (
+                isinstance(source_name, str)
+                and isinstance(translated_name, str)
+                and source_name in unique_values
+                and source_name not in shared
+                and translation_output_issue(
+                    source_name,
+                    translated_name,
+                    target_locale=target_locale,
+                    dnt=dnt,
+                )
+                is None
+            ):
+                shared[source_name] = translated_name
+                pending_writes[source_name] = translated_name
+        except (TypeError, ValueError):
+            pass
+
+    missing = [value for value in unique_values if value not in shared]
+    if missing:
+        reduced_source = json.dumps({"values": missing}, ensure_ascii=False)
+        reduced_translation = translator.translate_json_value(
+            "METAFIELD",
+            "value",
+            reduced_source,
+            target_locale,
+            dnt,
+            exclude_tokens,
+        )
+        translated_missing = json.loads(reduced_translation).get("values") or []
+        if len(translated_missing) != len(missing):
+            raise RuntimeError("Shared JSON translation returned a mismatched value count")
+        fresh = {
+            source: str(translated)
+            for source, translated in zip(missing, translated_missing, strict=True)
+        }
+        shared.update(fresh)
+        pending_writes.update(fresh)
+
+    if pending_writes:
+        store.upsert_dictionary_translations(
+            category=category,
+            source_locale=source_locale,
+            target_locale=target_locale,
+            translations=pending_writes,
+            metadata={"origin": "shared_json_leaf_cache"},
+        )
+
+    def set_in(path: tuple[Any, ...], value: str) -> None:
+        current = obj
+        for part in path[:-1]:
+            current = current[part]
+        current[path[-1]] = value
+
+    for path, source_value in eligible:
+        translated_value = shared.get(source_value)
+        if translated_value is not None:
+            set_in(path, translated_value)
+    return json.dumps(obj, ensure_ascii=False)
 
 
 def _translate_option_entry(
@@ -615,6 +738,7 @@ def _shopify_translation_value(
     *,
     resource_id: str,
     key: str,
+    allow_outdated: bool = False,
 ) -> str | None:
     """Read both the new resource-aware shape and the legacy product-only shape."""
     data = translations or {}
@@ -626,7 +750,7 @@ def _shopify_translation_value(
         item = data.get(key)
 
     if isinstance(item, dict):
-        if bool(item.get("outdated")):
+        if bool(item.get("outdated")) and not allow_outdated:
             return None
         return _nonblank_translation(item.get("value"))
     return _nonblank_translation(item)
@@ -641,8 +765,8 @@ def _require_nonblank_translation(section_name: str, translated_value: object) -
 
 def _json_leaf_filter(entry: dict[str, Any]):
     if entry.get("metafield_type") == "rich_text_field":
-        return (
-            lambda path, value: next(
+        return lambda path, value: (
+            next(
                 (part for part in reversed(path) if isinstance(part, str)),
                 "",
             )
@@ -845,14 +969,32 @@ def translate_pdp_document(
             continue
 
         if entry["content_kind"] == "json":
-            translated_value = _translate_json_metafield(
-                translator,
-                entry,
-                target_locale=target_locale,
-                dnt=dnt,
-                exclude_tokens=exclude_tokens,
-            )
-            section_sources[section_name] = "translator_json_leafs"
+            if full_key == "custom.ssc_spare_part":
+                translated_value = _translate_shared_json_metafield(
+                    store,
+                    translator,
+                    entry,
+                    target_locale=target_locale,
+                    source_locale=source_locale,
+                    dnt=dnt,
+                    exclude_tokens=exclude_tokens,
+                    existing_translation=_shopify_translation_value(
+                        existing_shopify_translations,
+                        resource_id=entry["resource_id"],
+                        key="value",
+                        allow_outdated=True,
+                    ),
+                )
+                section_sources[section_name] = "shared_json_leaf_dictionary"
+            else:
+                translated_value = _translate_json_metafield(
+                    translator,
+                    entry,
+                    target_locale=target_locale,
+                    dnt=dnt,
+                    exclude_tokens=exclude_tokens,
+                )
+                section_sources[section_name] = "translator_json_leafs"
         elif entry["content_kind"] == "html":
             translated_value = translator.translate_html_document(
                 "METAFIELD",
@@ -1205,12 +1347,15 @@ async def bootstrap_products(
         for product_id in product_ids:
             try:
                 logger.info("bootstrap_product_started", product_id=int(product_id))
-                product_gid, metafields, live_map, existing_translations = (
-                    await fetch_product_source_bundle(
-                        product_id,
-                        mf_include,
-                        target_locales=target_locales,
-                    )
+                (
+                    product_gid,
+                    metafields,
+                    live_map,
+                    existing_translations,
+                ) = await fetch_product_source_bundle(
+                    product_id,
+                    mf_include,
+                    target_locales=target_locales,
                 )
                 logger.info(
                     "bootstrap_product_fetched",
@@ -1292,6 +1437,7 @@ async def process_product_bundle(
     persist_state: bool | None = None,
     reconcile_shopify_drift: bool = False,
     content_changes_only: bool = False,
+    recover_incomplete_state: bool = True,
 ) -> dict[str, Any]:
     if persist_state is None:
         persist_state = not dry_run
@@ -1354,6 +1500,50 @@ async def process_product_bundle(
     removed_sections = set(previous_hashes) - set(section_hashes)
     source_state_changed = bool(changed_sections or removed_sections)
 
+    # Read locale state before the content-only fast path. A failed create can
+    # persist the Italian source snapshot before any locale is safely stored.
+    # In that case a later products/update (including inventory noise) must be
+    # allowed to recover the incomplete locale instead of being mistaken for a
+    # fully processed, unchanged product.
+    previous_translations = {
+        target_locale: store.get_pdp_translation_state(
+            shop_domain=SETTINGS.shopify_domain,
+            product_gid=product_gid,
+            target_locale=target_locale,
+        )
+        for target_locale in target_locales
+    }
+    missing_translation_sections = {
+        target_locale: _missing_pdp_translation_sections(
+            previous_translation=previous_translations.get(target_locale),
+            source_document=source_document,
+            section_hashes=section_hashes,
+        )
+        for target_locale in target_locales
+    }
+    recovery_locales = {
+        target_locale
+        for target_locale, previous_translation in previous_translations.items()
+        if (
+            previous_translation is None
+            or previous_translation.status not in {"translated", "synced"}
+        )
+    }
+    shopify_current_sections_by_locale = {
+        target_locale: build_pdp_payloads_from_shopify_translations(
+            source_document=source_document,
+            shopify_translations=existing_translations.get(target_locale, {}),
+            target_locale=target_locale,
+            candidate_sections=set(section_hashes),
+        )[1]
+        for target_locale in target_locales
+    }
+    shopify_drift_sections = {
+        target_locale: set(section_hashes) - shopify_current_sections_by_locale[target_locale]
+        for target_locale in target_locales
+    }
+    has_shopify_drift = any(shopify_drift_sections.values())
+
     item_summary: dict[str, Any] | None = None
     if not handle_only:
         local_summary["products"] += 1
@@ -1366,22 +1556,29 @@ async def process_product_bundle(
             "changed_sections": sorted(list(changed_sections)),
             "locales": {},
         }
-        if content_changes_only and already_in_neon and not source_state_changed:
+        if (
+            content_changes_only
+            and already_in_neon
+            and not source_state_changed
+            and not (recover_incomplete_state and recovery_locales)
+            and not (reconcile_shopify_drift and has_shopify_drift)
+        ):
             item_summary["status"] = "unchanged"
             item_summary["skip_reason"] = "no_translatable_content_change"
             local_summary["items"].append(item_summary)
             return local_summary
 
-    store.upsert_pdp_source(
-        PDPSourceRecord(
-            shop_domain=SETTINGS.shopify_domain,
-            product_gid=product_gid,
-            source_locale=source_locale,
-            document=source_document,
-            section_hashes=section_hashes,
-            metadata={"product_id": int(product_id), "already_in_neon": already_in_neon},
+    if not handle_only:
+        store.upsert_pdp_source(
+            PDPSourceRecord(
+                shop_domain=SETTINGS.shopify_domain,
+                product_gid=product_gid,
+                source_locale=source_locale,
+                document=source_document,
+                section_hashes=section_hashes,
+                metadata={"product_id": int(product_id), "already_in_neon": already_in_neon},
+            )
         )
-    )
     if handle_only:
         return await _process_product_handle_only(
             store=store,
@@ -1401,35 +1598,6 @@ async def process_product_bundle(
         )
 
     assert item_summary is not None
-    previous_translations = {
-        target_locale: store.get_pdp_translation_state(
-            shop_domain=SETTINGS.shopify_domain,
-            product_gid=product_gid,
-            target_locale=target_locale,
-        )
-        for target_locale in target_locales
-    }
-    missing_translation_sections = {
-        target_locale: _missing_pdp_translation_sections(
-            previous_translation=previous_translations.get(target_locale),
-            source_document=source_document,
-            section_hashes=section_hashes,
-        )
-        for target_locale in target_locales
-    }
-    shopify_current_sections_by_locale = {
-        target_locale: build_pdp_payloads_from_shopify_translations(
-            source_document=source_document,
-            shopify_translations=existing_translations.get(target_locale, {}),
-            target_locale=target_locale,
-            candidate_sections=set(section_hashes),
-        )[1]
-        for target_locale in target_locales
-    }
-    shopify_drift_sections = {
-        target_locale: set(section_hashes) - shopify_current_sections_by_locale[target_locale]
-        for target_locale in target_locales
-    }
     pending_translation_locales = {
         target_locale
         for target_locale, previous_translation in previous_translations.items()
@@ -1468,13 +1636,26 @@ async def process_product_bundle(
         locale_missing_sections = missing_translation_sections[target_locale]
         locale_shopify_drift_sections = shopify_drift_sections[target_locale]
         locale_reusable_sections: set[str] = set()
-        if previous_translation is None:
+        if previous_translation is None and (not content_changes_only or recover_incomplete_state):
             locale_changed_sections.update(section_hashes.keys())
         elif content_changes_only:
-            # Webhook-driven sync must react only to source content changes.
-            # Missing/outdated translations are repaired by explicit reconciliation,
-            # never opportunistically because an order changed inventory.
+            # Healthy products still ignore inventory-only updates. Incomplete
+            # persisted states are different: they prove a previous translation
+            # attempt did not finish and must be recoverable by the next event.
             locale_changed_sections = set(changed_sections)
+            if reconcile_shopify_drift:
+                locale_changed_sections.update(locale_shopify_drift_sections)
+            if (
+                recover_incomplete_state
+                and previous_translation is not None
+                and (previous_translation.status not in {"translated", "synced"})
+            ):
+                locale_changed_sections.update(locale_missing_sections)
+                for section_name, source_hash in section_hashes.items():
+                    if previous_translation.section_hashes.get(section_name) != source_hash:
+                        locale_changed_sections.add(section_name)
+                    elif section_name not in locale_missing_sections:
+                        locale_reusable_sections.add(section_name)
         elif not apply_translations and previous_translation.status not in {"translated", "synced"}:
             locale_changed_sections.update(section_hashes.keys())
         else:
