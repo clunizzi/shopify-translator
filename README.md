@@ -123,7 +123,6 @@ audits and unlock each write path intentionally.
 ## Operations dashboard
 
 `cloudflare-admin/` contains an optional Cloudflare Workers control panel for:
-
 - translation coverage and system health;
 - product and theme inspection;
 - localized storefront previews;
