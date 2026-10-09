@@ -118,6 +118,18 @@ variable "global_resource_poll_enabled" {
   default     = "false"
 }
 
+variable "collection_ai_enabled" {
+  description = "Allow collection fields without deterministic rules to be sent to the AI translator"
+  type        = string
+  default     = "false"
+}
+
+variable "localized_route_prefixes" {
+  description = "Locale-to-market storefront prefixes, for example de:/de-de,fr:/fr-fr"
+  type        = string
+  default     = ""
+}
+
 variable "theme_id" {
   description = "Approved MAIN theme ID safety pin; writes stop if Shopify MAIN differs"
   type        = string
@@ -151,7 +163,7 @@ variable "scheduled_sync_enabled" {
 variable "theme_poll_schedule" {
   description = "EventBridge schedule expression for theme polling"
   type        = string
-  default     = "cron(0 3 1 * ? *)"
+  default     = "rate(10 minutes)"
 }
 
 variable "catalog_poll_enabled" {
@@ -236,6 +248,18 @@ variable "openai_fallback_model" {
   description = "Optional validation-failure fallback model"
   type        = string
   default     = "gpt-5.6-sol"
+}
+
+variable "theme_openai_model" {
+  description = "Optional OpenAI model override for theme/resource polling and manual theme jobs"
+  type        = string
+  default     = ""
+}
+
+variable "theme_openai_fallback_model" {
+  description = "Optional fallback model override for theme/resource polling and manual theme jobs"
+  type        = string
+  default     = ""
 }
 
 variable "worker_maximum_concurrency" {

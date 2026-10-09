@@ -48,6 +48,11 @@ resource "aws_dynamodb_table" "product_snapshots" {
     name = "sk"
     type = "S"
   }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
 }
 
 resource "aws_dynamodb_table" "webhook_dedup" {
@@ -161,7 +166,8 @@ resource "aws_iam_role_policy" "worker" {
           "sqs:ReceiveMessage",
           "sqs:DeleteMessage",
           "sqs:ChangeMessageVisibility",
-          "sqs:GetQueueAttributes"
+          "sqs:GetQueueAttributes",
+          "sqs:SendMessage"
         ],
         Resource = aws_sqs_queue.products.arn
       },
@@ -208,6 +214,7 @@ resource "aws_lambda_function" "worker" {
       SQS_URL             = aws_sqs_queue.products.id
       SOURCE_LOCALE       = var.source_locale
       TARGET_LOCALES      = var.target_locales
+      LOCALIZED_ROUTE_PREFIXES = var.localized_route_prefixes
       MF_INCLUDE          = var.mf_include
       SHOP_DOMAIN         = var.shop_domain
       SHOPIFY_API_VERSION = var.shopify_api_version
@@ -360,6 +367,11 @@ resource "aws_iam_role_policy" "theme_poller" {
         Effect   = "Allow",
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
         Resource = "*"
+      },
+      {
+        Effect   = "Allow",
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"],
+        Resource = aws_dynamodb_table.product_snapshots.arn
       }
     ]
   })
@@ -379,12 +391,15 @@ resource "aws_lambda_function" "theme_poller" {
   environment {
     variables = {
       SOURCE_LOCALE                     = var.source_locale
+      DDB_TABLE                         = aws_dynamodb_table.product_snapshots.name
       TARGET_LOCALES                    = var.target_locales
       THEME_ID                          = var.theme_id
       THEME_RESOURCE_TYPES              = var.theme_resource_types
       THEME_POLL_ENABLED                = var.disable_sync == "true" ? "false" : var.scheduled_sync_enabled
       GLOBAL_RESOURCE_TYPES             = var.global_resource_types
       GLOBAL_RESOURCE_POLL_ENABLED      = var.global_resource_poll_enabled
+      COLLECTION_AI_ENABLED             = var.collection_ai_enabled
+      LOCALIZED_ROUTE_PREFIXES          = var.localized_route_prefixes
       SHOP_DOMAIN                       = var.shop_domain
       SHOPIFY_API_VERSION               = var.shopify_api_version
       OPENAI_API_KEY_SECRET_ARN         = var.openai_api_key_secret_arn
@@ -394,8 +409,8 @@ resource "aws_lambda_function" "theme_poller" {
       RETRIES                           = var.retries
       DRY_RUN                           = var.dry_run
       LOG_VERBOSE_SYNC                  = var.log_verbose_sync
-      OPENAI_MODEL                      = var.openai_model
-      OPENAI_FALLBACK_MODEL             = var.openai_fallback_model
+      OPENAI_MODEL                      = var.theme_openai_model != "" ? var.theme_openai_model : var.openai_model
+      OPENAI_FALLBACK_MODEL             = var.theme_openai_fallback_model != "" ? var.theme_openai_fallback_model : var.openai_fallback_model
       TRANSLATOR_SPECIALIZATION         = var.translator_specialization
       TRANSLATOR_BRAND                  = var.translator_brand
       TRANSLATOR_AUDIENCE               = var.translator_audience

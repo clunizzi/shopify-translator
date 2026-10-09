@@ -87,3 +87,55 @@ def test_theme_policy_allows_text_fields_inside_image_with_text_sections():
         key="section.index.json.image_with_text_bg_kgBTcM.text_rNjyhk.text:1bwq785q13jyp",
         value="<p>Example Store è un easy-commerce semplificato.</p>",
     )
+
+
+def test_theme_policy_allows_custom_visible_fields_and_internal_links():
+    assert should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.faq.question:abc",
+        value="Quanto costa la spedizione?",
+    )
+    assert should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.main.intro:abc",
+        value="<p>Vieni a trovarci in negozio.</p>",
+    )
+    assert should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.main.store_url:abc",
+        value="/pages/negozio",
+    )
+
+
+def test_theme_policy_keeps_technical_and_external_values_out():
+    assert not should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.review.author:abc",
+        value="Mario Rossi",
+    )
+    assert not should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.main.store_url:abc",
+        value="https://example.com/pages/negozio",
+    )
+    assert not should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.main.link:abc",
+        value="shopify://pages/negozio",
+    )
+
+    assert not should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.review.score:abc",
+        value="4.9/5",
+    )
+    assert not should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.footer.contact.email.value:abc",
+        value="info@agrieden.com",
+    )
+    assert not should_translate_theme_entry(
+        resource_type="ONLINE_STORE_THEME_JSON_TEMPLATE",
+        key="section.page.offer.offer_threshold:abc",
+        value="100",
+    )

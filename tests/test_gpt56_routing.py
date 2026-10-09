@@ -28,6 +28,15 @@ def test_gpt56_request_uses_none_reasoning_without_temperature():
     assert "temperature" not in options
 
 
+def test_gpt61_request_uses_low_reasoning_without_temperature():
+    options = Translator._chat_completion_options(
+        model="gpt-6.1-sol",
+        response_format={"type": "text"},
+    )
+    assert options["reasoning_effort"] == "low"
+    assert "temperature" not in options
+
+
 def test_legacy_request_keeps_zero_temperature():
     options = Translator._chat_completion_options(
         model="gpt-5.2",

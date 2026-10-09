@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 from typing import Any
 
 import structlog
+from bs4 import BeautifulSoup
 
+from src.bootstrap.localized_urls import (
+    extract_internal_urls_from_html,
+    fetch_localized_handle_maps,
+    localize_internal_urls_in_html,
+)
 from src.config.dnt_loader import load_do_not_translate
 from src.config.settings import SETTINGS
-from src.shopify.graphql import list_translatable_resources, register_translations
+from src.shopify.graphql import (
+    list_translatable_resources,
+    list_translatable_resources_with_translations,
+    register_translations,
+)
 from src.state.neon import (
     NeonTranslationStore,
     ThemeSourceRecord,
@@ -17,6 +29,7 @@ from src.state.neon import (
 )
 from src.translate.cache import TranslationCache
 from src.translate.translator import Translator
+from src.translate.validators import make_handle_from_title
 
 logger = structlog.get_logger("resources")
 
@@ -24,6 +37,12 @@ GLOBAL_RESOURCE_GROUP = "global"
 DEFAULT_RESOURCE_TYPES = [
     "SHOP_POLICY",
     "SHOP",
+    "PAGE",
+    "BLOG",
+    "ARTICLE",
+    "COLLECTION",
+    "MENU",
+    "LINK",
 ]
 
 _BLOCKED_VALUE_PATTERNS = [
@@ -73,6 +92,98 @@ _SHOP_ALLOWED_KEYS = {
     "preferences_purposes_marketing_desc",
 }
 
+_COLLECTION_TITLE_EXACT = {
+    "de": {
+        "Ricambi e accessori per le raccolte": "Ersatzteile und Zubehör für die Ernte",
+        "Ricambi e manutenzione": "Ersatzteile und Wartung",
+    },
+    "fr": {
+        "Ricambi e accessori per le raccolte": (
+            "Pièces détachées et accessoires pour la récolte"
+        ),
+        "Ricambi e manutenzione": "Pièces détachées et entretien",
+    },
+}
+
+
+def deterministic_collection_title(value: str, target_locale: str) -> str | None:
+    """Translate the high-volume ``Ricambi <model>`` taxonomy without AI."""
+    source = str(value or "").strip()
+    locale = str(target_locale or "").split("-", 1)[0].lower()
+    exact = (_COLLECTION_TITLE_EXACT.get(locale) or {}).get(source)
+    if exact:
+        return exact
+    prefix = "Ricambi "
+    if not source.startswith(prefix):
+        return None
+    subject = source[len(prefix) :].strip()
+    if not subject:
+        return None
+    if locale == "de":
+        return f"Ersatzteile für {subject}"
+    if locale == "fr":
+        return f"Pièces détachées pour {subject}"
+    return None
+
+
+def resource_entry_needs_sync(
+    *,
+    source_document: dict[str, Any],
+    section_name: str,
+    remote: dict[str, dict[str, Any]],
+) -> bool:
+    """Return whether Shopify needs an explicit translation for this field.
+
+    A localized handle equal to the canonical handle is invalid in Shopify and
+    unnecessary: storefront routing already falls back to the canonical value.
+    """
+    key = section_name.split(".", 1)[1]
+    translated = remote.get(key)
+    if translated is not None and str(translated.get("value") or "").strip():
+        return bool(translated.get("outdated"))
+    if key != "handle":
+        return True
+    source_handle = str(
+        (source_document.get("entries", {}).get("handle") or {}).get("value") or ""
+    ).strip()
+    remote_title = remote.get("title") or {}
+    localized_title = str(remote_title.get("value") or "").strip()
+    return not (
+        source_handle
+        and localized_title
+        and not remote_title.get("outdated")
+        and make_handle_from_title(localized_title) == source_handle
+    )
+
+
+def collection_entry_is_enabled(
+    *,
+    source_document: dict[str, Any],
+    section_name: str,
+    target_locale: str,
+    remote: dict[str, dict[str, Any]],
+) -> bool:
+    """Keep repetitive collection sync deterministic unless AI is approved."""
+    if source_document.get("resource_type") != "COLLECTION" or getattr(
+        SETTINGS, "collection_ai_enabled", False
+    ):
+        return True
+    key = section_name.split(".", 1)[1]
+    if key == "title":
+        source_title = str(
+            (source_document.get("entries", {}).get("title") or {}).get("value") or ""
+        )
+        return deterministic_collection_title(source_title, target_locale) is not None
+    if key == "handle":
+        current_title = remote.get("title") or {}
+        if str(current_title.get("value") or "").strip() and not current_title.get("outdated"):
+            return True
+        source_title = str(
+            (source_document.get("entries", {}).get("title") or {}).get("value") or ""
+        )
+        return deterministic_collection_title(source_title, target_locale) is not None
+    return False
+
 
 def _resource_section_name(resource_type: str, key: str) -> str:
     return f"{resource_type}.{key}"
@@ -90,13 +201,25 @@ def _has_letters(value: str) -> bool:
     return any(ch.isalpha() for ch in value)
 
 
+def _visible_resource_text(value: str) -> str:
+    if "<" not in value or ">" not in value:
+        return value
+    try:
+        soup = BeautifulSoup(value, "html5lib")
+        for tag in soup.find_all(["style", "script", "noscript"]):
+            tag.decompose()
+        return soup.get_text(" ", strip=True)
+    except Exception:
+        return value
+
+
 def should_translate_resource_entry(*, resource_type: str, key: str, value: str) -> bool:
     rt = (resource_type or "").strip().upper()
     key_l = (key or "").strip().lower()
     val = value or ""
     if any(pattern.match(val) for pattern in _BLOCKED_VALUE_PATTERNS):
         return False
-    if not _has_letters(val):
+    if not _has_letters(_visible_resource_text(val)):
         return False
     if rt == "SHOP_POLICY":
         return key_l in {"body", "title", "name"}
@@ -109,6 +232,7 @@ async def fetch_global_resource_bundle(
     *,
     resource_types: list[str] | None = None,
     resource_ids: list[str] | None = None,
+    target_locales: list[str] | None = None,
     first: int = 250,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -116,11 +240,19 @@ async def fetch_global_resource_bundle(
     for resource_type in resource_types or DEFAULT_RESOURCE_TYPES:
         cursor: str | None = None
         while True:
-            nodes, page_info = await list_translatable_resources(
-                resource_type=resource_type,
-                first=first,
-                after=cursor,
-            )
+            if target_locales:
+                nodes, page_info = await list_translatable_resources_with_translations(
+                    resource_type=resource_type,
+                    locales=target_locales,
+                    first=first,
+                    after=cursor,
+                )
+            else:
+                nodes, page_info = await list_translatable_resources(
+                    resource_type=resource_type,
+                    first=first,
+                    after=cursor,
+                )
             for node in nodes:
                 if allowed_ids and node["resourceId"] not in allowed_ids:
                     continue
@@ -129,6 +261,7 @@ async def fetch_global_resource_bundle(
                         "resource_type": resource_type,
                         "resource_id": node["resourceId"],
                         "translatableContent": node.get("translatableContent") or [],
+                        "translations": node.get("translations") or {},
                     }
                 )
             if not page_info.get("hasNextPage"):
@@ -137,6 +270,64 @@ async def fetch_global_resource_bundle(
             if not cursor:
                 break
     return out
+
+
+async def get_global_resource_fingerprint(
+    *,
+    target_locales: list[str],
+    resource_types: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fingerprint Shopify source and remote locale state without touching Neon.
+
+    Including the current translations means the lightweight poll also notices
+    manual deletions/edits and can reconcile them, not only Italian source edits.
+    """
+    bundle = await fetch_global_resource_bundle(
+        resource_types=resource_types,
+        target_locales=target_locales,
+    )
+    rows: list[tuple[object, ...]] = []
+    resources: set[str] = set()
+    for item in bundle:
+        resource_type = str(item.get("resource_type") or "")
+        resource_id = str(item.get("resource_id") or "")
+        remote_by_locale = item.get("translations") or {}
+        for entry in item.get("translatableContent") or []:
+            key = str(entry.get("key") or "")
+            value = str(entry.get("value") or "")
+            if not should_translate_resource_entry(
+                resource_type=resource_type,
+                key=key,
+                value=value,
+            ):
+                continue
+            resources.add(resource_id)
+            rows.append(
+                (
+                    resource_type,
+                    resource_id,
+                    key,
+                    str(entry.get("digest") or make_source_hash(value)),
+                )
+            )
+            for locale in sorted(target_locales):
+                translated = ((remote_by_locale.get(locale) or {}).get(key)) or {}
+                rows.append(
+                    (
+                        resource_type,
+                        resource_id,
+                        key,
+                        locale,
+                        str(translated.get("value") or ""),
+                        bool(translated.get("outdated")),
+                    )
+                )
+    payload = json.dumps(sorted(rows), ensure_ascii=False, separators=(",", ":"))
+    return {
+        "fingerprint": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "resources": len(resources),
+        "fields": sum(1 for row in rows if len(row) == 4),
+    }
 
 
 def build_global_resource_documents(
@@ -221,6 +412,10 @@ def translate_resource_document(
     changed_sections: set[str],
     target_locale: str,
     translator: Translator,
+    current_translations: dict[str, dict[str, Any]] | None = None,
+    reserved_handles: set[str] | None = None,
+    localized_handle_maps: dict[str, dict[str, dict[str, str]]] | None = None,
+    route_prefixes: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], list[dict], dict[str, str]]:
     dnt_path = (
         SETTINGS.do_not_translate_path if getattr(SETTINGS, "do_not_translate_path", None) else None
@@ -241,20 +436,44 @@ def translate_resource_document(
     payloads: list[dict] = []
     section_sources: dict[str, str] = {}
 
-    for key, entry in source_document.get("entries", {}).items():
+    entries = source_document.get("entries", {})
+    for key, entry in entries.items():
         section_name = _resource_section_name(source_document["resource_type"], key)
-        if section_name not in changed_sections:
+        if section_name not in changed_sections or key == "handle":
             continue
         if entry["content_kind"] in {"html", "liquid"}:
-            translated_value = translator.translate_html_document(
-                source_document["resource_type"],
-                key,
-                entry["value"],
-                target_locale,
-                dnt,
-                exclude_tokens,
+            current = (current_translations or {}).get(key) or {}
+            current_value = str(current.get("value") or "").strip()
+            if current_value and not current.get("outdated"):
+                translated_value = current_value
+                section_sources[section_name] = "current_shopify_translation_link_rewrite"
+            else:
+                translated_value = translator.translate_html_document(
+                    source_document["resource_type"],
+                    key,
+                    entry["value"],
+                    target_locale,
+                    dnt,
+                    exclude_tokens,
+                )
+                section_sources[section_name] = "translator_html_document"
+            translated_value = localize_internal_urls_in_html(
+                translated_value,
+                target_locale=target_locale,
+                route_prefixes=route_prefixes or {},
+                handle_maps=localized_handle_maps,
             )
-            section_sources[section_name] = "translator_html_document"
+        elif (
+            source_document["resource_type"] == "COLLECTION"
+            and key == "title"
+            and (
+                deterministic_title := deterministic_collection_title(
+                    entry["value"], target_locale
+                )
+            )
+        ):
+            translated_value = deterministic_title
+            section_sources[section_name] = "deterministic_collection_title"
         else:
             translated_value = translator.translate_plain(
                 source_document["resource_type"],
@@ -277,6 +496,56 @@ def translate_resource_document(
                 "translatableContentDigest": entry["digest"],
             }
         )
+
+    handle_entry = entries.get("handle") or {}
+    handle_section = _resource_section_name(source_document["resource_type"], "handle")
+    if handle_entry and handle_section in changed_sections:
+        current = (current_translations or {}).get("handle") or {}
+        current_handle = str(current.get("value") or "").strip()
+        if current_handle:
+            translated_handle = current_handle
+            section_sources[handle_section] = "shopify_handle_preserved"
+        else:
+            translated_title = str(translated_document["entries"].get("title") or "").strip()
+            if not translated_title:
+                translated_title = str(
+                    ((current_translations or {}).get("title") or {}).get("value") or ""
+                ).strip()
+            if not translated_title:
+                source_title = str((entries.get("title") or {}).get("value") or "").strip()
+                if source_title:
+                    translated_title = translator.translate_plain(
+                        source_document["resource_type"],
+                        "title",
+                        source_title,
+                        target_locale,
+                        dnt,
+                        exclude_tokens,
+                    )
+            translated_handle = make_handle_from_title(translated_title)
+            if not translated_handle:
+                translated_handle = make_handle_from_title(str(handle_entry.get("value") or ""))
+            if reserved_handles is not None and translated_handle:
+                base = translated_handle
+                suffix = 2
+                while translated_handle in reserved_handles:
+                    translated_handle = make_handle_from_title(f"{base}-{suffix}")
+                    suffix += 1
+                reserved_handles.add(translated_handle)
+            section_sources[handle_section] = "handle_from_localized_title"
+
+        if translated_handle:
+            translated_document["entries"]["handle"] = translated_handle
+            translated_hashes[handle_section] = make_source_hash(handle_entry["value"])
+            payloads.append(
+                {
+                    "resource_id": handle_entry["resource_id"],
+                    "key": "handle",
+                    "locale": target_locale,
+                    "value": translated_handle,
+                    "translatableContentDigest": handle_entry["digest"],
+                }
+            )
     return translated_document, translated_hashes, payloads, section_sources
 
 
@@ -358,6 +627,7 @@ async def bootstrap_resources(
     dry_run: bool,
     resource_types: list[str] | None = None,
     resource_ids: list[str] | None = None,
+    max_translations: int | None = None,
 ) -> dict[str, Any]:
     store = NeonTranslationStore()
     store.ensure_schema()
@@ -372,20 +642,68 @@ async def bootstrap_resources(
         "changed_resources": 0,
         "changed_sections": 0,
         "registered": 0,
+        "would_register": 0,
+        "max_translations": max_translations,
         "target_locales": target_locales,
         "items": [],
     }
+    remaining_translations = max_translations
 
     try:
         bundle = await fetch_global_resource_bundle(
             resource_types=requested_resource_types,
             resource_ids=resource_ids,
+            target_locales=target_locales if apply_translations else None,
         )
         docs = build_global_resource_documents(
             shop_domain=SETTINGS.shopify_domain,
             source_locale=source_locale,
             bundle=bundle,
         )
+        remote_by_id = {
+            str(item.get("resource_id") or ""): item.get("translations") or {}
+            for item in bundle
+            if item.get("resource_id")
+        }
+        route_prefix_loader = getattr(SETTINGS, "get_localized_route_prefixes", None)
+        route_prefixes = route_prefix_loader() if callable(route_prefix_loader) else {}
+        source_urls = [
+            source_url
+            for source_document, _section_hashes in docs
+            for entry in source_document.get("entries", {}).values()
+            if entry.get("content_kind") in {"html", "liquid"}
+            for source_url in extract_internal_urls_from_html(str(entry.get("value") or ""))
+        ]
+        localized_handle_maps = (
+            await fetch_localized_handle_maps(
+                target_locales=target_locales,
+                source_urls=source_urls,
+            )
+            if source_urls
+            else {}
+        )
+        reserved_handles: dict[tuple[str, str], set[str]] = {}
+        for item in bundle:
+            resource_type = str(item.get("resource_type") or "")
+            source_handle = next(
+                (
+                    str(entry.get("value") or "").strip()
+                    for entry in item.get("translatableContent") or []
+                    if str(entry.get("key") or "") == "handle"
+                ),
+                "",
+            )
+            for target_locale in target_locales:
+                if source_handle:
+                    reserved_handles.setdefault((target_locale, resource_type), set()).add(
+                        source_handle
+                    )
+                translated = ((item.get("translations") or {}).get(target_locale) or {}).get(
+                    "handle"
+                ) or {}
+                value = str(translated.get("value") or "").strip()
+                if value:
+                    reserved_handles.setdefault((target_locale, resource_type), set()).add(value)
         for source_document, section_hashes in docs:
             resource_type = source_document["resource_type"]
             resource_id = source_document["resource_id"]
@@ -422,6 +740,7 @@ async def bootstrap_resources(
             }
             previous_translations = {}
             pending_sync_locales = set()
+            pending_remote_sections: dict[str, set[str]] = {}
             for target_locale in target_locales:
                 state = store.get_theme_translation_state(
                     shop_domain=SETTINGS.shopify_domain,
@@ -431,14 +750,54 @@ async def bootstrap_resources(
                     target_locale=target_locale,
                 )
                 previous_translations[target_locale] = state
-                if (
-                    apply_translations
-                    and not dry_run
-                    and (state is None or state.status != "synced")
-                ):
+                if apply_translations:
+                    remote = (remote_by_id.get(resource_id) or {}).get(target_locale) or {}
+                    pending_remote_sections[target_locale] = {
+                        section_name
+                        for section_name in section_hashes
+                        if collection_entry_is_enabled(
+                            source_document=source_document,
+                            section_name=section_name,
+                            target_locale=target_locale,
+                            remote=remote,
+                        )
+                        and (
+                            (
+                                source_document["entries"][section_name.split(".", 1)[1]].get(
+                                    "content_kind"
+                                )
+                                in {"html", "liquid"}
+                                and str(
+                                    (remote.get(section_name.split(".", 1)[1]) or {}).get(
+                                        "value"
+                                    )
+                                    or ""
+                                ).strip()
+                                != localize_internal_urls_in_html(
+                                    str(
+                                        (remote.get(section_name.split(".", 1)[1]) or {}).get(
+                                            "value"
+                                        )
+                                        or ""
+                                    ).strip(),
+                                    target_locale=target_locale,
+                                    route_prefixes=route_prefixes,
+                                    handle_maps=localized_handle_maps,
+                                )
+                            )
+                            or resource_entry_needs_sync(
+                                source_document=source_document,
+                                section_name=section_name,
+                                remote=remote,
+                            )
+                        )
+                    }
+                if pending_remote_sections.get(target_locale):
                     pending_sync_locales.add(target_locale)
 
-            if not changed_sections and not pending_sync_locales:
+            if (apply_translations and not pending_sync_locales) or (
+                not apply_translations and not changed_sections
+            ):
                 item_summary["status"] = "unchanged"
                 summary["items"].append(item_summary)
                 logger.info("resource_translation", **_build_resource_log_event(item_summary))
@@ -450,29 +809,34 @@ async def bootstrap_resources(
 
             for target_locale in target_locales:
                 previous_translation = previous_translations.get(target_locale)
-                locale_changed_sections = set(changed_sections)
-                if previous_translation is None:
-                    locale_changed_sections.update(section_hashes.keys())
-                elif previous_translation.status != "synced":
-                    if (
-                        not changed_sections
-                        and previous_translation.section_hashes == section_hashes
-                    ):
+                if apply_translations:
+                    locale_changed_sections = set(
+                        pending_remote_sections.get(target_locale) or set()
+                    )
+                else:
+                    locale_changed_sections = set(changed_sections)
+                    if previous_translation is None or previous_translation.status != "synced":
                         locale_changed_sections.update(section_hashes.keys())
                     else:
                         for section_name, source_hash in section_hashes.items():
                             if previous_translation.section_hashes.get(section_name) != source_hash:
                                 locale_changed_sections.add(section_name)
-                else:
-                    for section_name, source_hash in section_hashes.items():
-                        if previous_translation.section_hashes.get(section_name) != source_hash:
-                            locale_changed_sections.add(section_name)
+
+                if remaining_translations is not None:
+                    locale_changed_sections = set(
+                        sorted(locale_changed_sections)[: max(0, remaining_translations)]
+                    )
 
                 if not locale_changed_sections:
                     continue
 
                 reused = None
-                if previous_translation is not None and previous_translation.status != "synced":
+                handle_section = _resource_section_name(resource_type, "handle")
+                if (
+                    previous_translation is not None
+                    and previous_translation.status != "synced"
+                    and handle_section not in locale_changed_sections
+                ):
                     reused = build_resource_payloads_from_stored_translation(
                         source_document=source_document,
                         stored_document=previous_translation.document or {},
@@ -480,17 +844,74 @@ async def bootstrap_resources(
                         changed_sections=locale_changed_sections,
                     )
 
-                if reused is not None:
-                    partial_document, partial_hashes, payloads, section_sources = reused
-                else:
-                    partial_document, partial_hashes, payloads, section_sources = (
-                        translate_resource_document(
-                            source_document=source_document,
-                            changed_sections=locale_changed_sections,
+                try:
+                    if reused is not None:
+                        partial_document, partial_hashes, payloads, section_sources = reused
+                    else:
+                        partial_document, partial_hashes, payloads, section_sources = (
+                            translate_resource_document(
+                                source_document=source_document,
+                                changed_sections=locale_changed_sections,
+                                target_locale=target_locale,
+                                translator=translator,
+                                current_translations=(
+                                    (remote_by_id.get(resource_id) or {}).get(target_locale) or {}
+                                ),
+                                reserved_handles=reserved_handles.setdefault(
+                                    (target_locale, resource_type), set()
+                                ),
+                                localized_handle_maps=localized_handle_maps,
+                                route_prefixes=route_prefixes,
+                            )
+                        )
+                except Exception as error:
+                    failed_document = (
+                        previous_translation.document
+                        if previous_translation is not None
+                        else {
+                            "shop_domain": source_document["shop_domain"],
+                            "resource_group": GLOBAL_RESOURCE_GROUP,
+                            "resource_type": resource_type,
+                            "resource_id": resource_id,
+                            "source_locale": source_locale,
+                            "target_locale": target_locale,
+                            "entries": {},
+                        }
+                    )
+                    store.upsert_theme_translation(
+                        ThemeTranslationRecord(
+                            shop_domain=SETTINGS.shopify_domain,
+                            theme_id=GLOBAL_RESOURCE_GROUP,
+                            resource_type=resource_type,
+                            resource_id=resource_id,
                             target_locale=target_locale,
-                            translator=translator,
+                            document=failed_document,
+                            section_hashes=(
+                                previous_translation.section_hashes
+                                if previous_translation is not None
+                                else {}
+                            ),
+                            status="failed",
+                            model=translator.model,
+                            metadata={
+                                "changed_sections": sorted(locale_changed_sections),
+                                "error": str(error),
+                            },
                         )
                     )
+                    item_summary["locales"][target_locale] = {
+                        "status": "failed",
+                        "translated_sections": [],
+                        "section_sources": {},
+                        "error": str(error),
+                    }
+                    logger.exception(
+                        "resource_translation_failed",
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        target_locale=target_locale,
+                    )
+                    continue
 
                 translated_document, translated_hashes = _merge_resource_translation_document(
                     source_document=source_document,
@@ -536,7 +957,10 @@ async def bootstrap_resources(
                     "translated_sections": sorted(list(locale_changed_sections)),
                     "section_sources": section_sources,
                 }
-                if apply_translations and not dry_run:
+                if apply_translations and dry_run:
+                    summary["would_register"] += len(payloads)
+                    translation_status = "planned"
+                elif apply_translations:
                     shopify_payloads = [
                         {
                             "key": item["key"],
@@ -561,6 +985,9 @@ async def bootstrap_resources(
                         "y",
                     }:
                         locale_summary["shopify_payloads"] = shopify_payloads
+
+                if remaining_translations is not None:
+                    remaining_translations -= len(payloads)
 
                 store.upsert_theme_translation(
                     ThemeTranslationRecord(

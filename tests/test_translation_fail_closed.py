@@ -7,6 +7,7 @@ from src.translate.translator import (
     DoNotTranslateConfig,
     TranslationError,
     Translator,
+    _long_source_fragments_still_present,
     json_translation_output_issue,
     meta_shape_issue,
     translation_output_issue,
@@ -81,6 +82,74 @@ def test_html_structure_failure_falls_back_to_text_nodes(monkeypatch):
     assert result == "<p>Hallo<br/>• <strong>Welt</strong></p>"
 
 
+def test_html_untranslated_detector_does_not_merge_technical_list_items():
+    source = (
+        "<ul><li>STIHL SPA 130</li><li>STIHL SPA 140</li></ul>"
+        "<p>Confronta i modelli e scegli quello adatto al tuo oliveto.</p>"
+    )
+    translated = (
+        "<ul><li>STIHL SPA 130</li><li>STIHL SPA 140</li></ul>"
+        "<p>Vergleiche die Modelle und wähle das passende für deinen Olivenhain.</p>"
+    )
+
+    assert _long_source_fragments_still_present(source, translated) == []
+
+
+def test_html_untranslated_detector_allows_brand_model_compatibility_rows():
+    source = (
+        "<ul><li>ANTONIO CARRARO — 7600 TTR</li></ul>"
+        "<p>Controlla il modello della macchina prima dell’acquisto.</p>"
+    )
+    translated = (
+        "<ul><li>ANTONIO CARRARO — 7600 TTR</li></ul>"
+        "<p>Prüfen Sie vor dem Kauf das Maschinenmodell.</p>"
+    )
+
+    assert _long_source_fragments_still_present(source, translated) == []
+
+
+def test_html_untranslated_detector_does_not_exempt_descriptive_model_sentence():
+    source = "<p>Compatibile con il modello — 7600 TTR della serie professionale</p>"
+
+    assert _long_source_fragments_still_present(source, source) == [
+        "Compatibile con il modello — 7600 TTR della serie professionale"
+    ]
+
+
+def test_html_untranslated_detector_still_rejects_discursive_text_node():
+    source = "<p>Confronta i modelli e scegli quello adatto al tuo oliveto.</p>"
+
+    assert _long_source_fragments_still_present(source, source) == [
+        "Confronta i modelli e scegli quello adatto al tuo oliveto."
+    ]
+
+
+def test_html_untranslated_detector_allows_unchanged_postal_address():
+    source = (
+        "<p>Ci trovi in <strong>Via Purgatorio 19, 83021 Avella (AV)</strong>. "
+        "Contattaci prima di venire.</p>"
+    )
+    translated = (
+        "<p>Sie finden uns in <strong>Via Purgatorio 19, 83021 Avella (AV)</strong>. "
+        "Kontaktieren Sie uns vor Ihrem Besuch.</p>"
+    )
+
+    assert _long_source_fragments_still_present(source, translated) == []
+
+
+def test_html_untranslated_detector_allows_italian_state_road_address():
+    source = (
+        "<p><span>Indirizzo</span><span>: Flli Castaldo srl, SS7bis, 19, "
+        "83021, Avella (AV)</span></p>"
+    )
+    translated = (
+        "<p><span>Adresse</span><span>: Flli Castaldo srl, SS7bis, 19, "
+        "83021, Avella (AV)</span></p>"
+    )
+
+    assert _long_source_fragments_still_present(source, translated) == []
+
+
 def test_json_parse_failure_never_returns_empty_payload(monkeypatch):
     translator = _translator()
     monkeypatch.setattr(
@@ -98,6 +167,31 @@ def test_json_parse_failure_never_returns_empty_payload(monkeypatch):
             DoNotTranslateConfig(brands=[], units=[], tokens=[]),
             [],
         )
+
+
+def test_json_translation_deduplicates_repeated_leaf_values(monkeypatch):
+    translator = _translator()
+    payloads = []
+
+    def _translate(_system, payload):
+        payloads.append(payload)
+        return ('{"translations":["Wiederholte Beschreibung"]}', {})
+
+    monkeypatch.setattr(translator, "_call_openai", _translate)
+
+    result = translator.translate_json_value(
+        "METAFIELD",
+        "value",
+        '{"first":"Descrizione ripetuta","second":"Descrizione ripetuta"}',
+        "de",
+        DoNotTranslateConfig(brands=[], units=[], tokens=[]),
+        [],
+    )
+
+    assert payloads == ['{"values": ["Descrizione ripetuta"], "do_not_translate": []}']
+    assert result == (
+        '{"first": "Wiederholte Beschreibung", ' '"second": "Wiederholte Beschreibung"}'
+    )
 
 
 @pytest.mark.parametrize(
@@ -308,21 +402,18 @@ def test_async_meta_fit_rechecks_glossary_after_rewrite(monkeypatch):
 
 def test_json_cache_validator_preserves_blank_and_blocked_leaves():
     dnt = DoNotTranslateConfig(brands=[], units=[], tokens=[])
-    source = (
-        '{"disclaimer":"","rows":[{"title":"Titolo",' '"image_url":"https://example.com/a.jpg"}]}'
-    )
+    source = '{"disclaimer":"","rows":[{"title":"Titolo","image_url":"https://example.com/a.jpg"}]}'
+
     def leaf_filter(path, _value):
         return path[-1] in {"disclaimer", "title"}
 
-    valid = (
-        '{"disclaimer":"","rows":[{"title":"Titel",' '"image_url":"https://example.com/a.jpg"}]}'
-    )
+    valid = '{"disclaimer":"","rows":[{"title":"Titel","image_url":"https://example.com/a.jpg"}]}'
     changed_blank = (
         '{"disclaimer":"Hinweis","rows":[{"title":"Titel",'
         '"image_url":"https://example.com/a.jpg"}]}'
     )
     changed_url = (
-        '{"disclaimer":"","rows":[{"title":"Titel",' '"image_url":"https://example.com/b.jpg"}]}'
+        '{"disclaimer":"","rows":[{"title":"Titel","image_url":"https://example.com/b.jpg"}]}'
     )
 
     assert (

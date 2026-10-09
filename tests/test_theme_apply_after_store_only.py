@@ -586,3 +586,45 @@ def test_theme_translation_reuses_same_semantic_shopify_value():
     assert translated["entries"]["section.page.one.expiry_text:a"] == "9. August"
     assert payloads[0]["value"] == "9. August"
     assert sources[section_name] == "current_shopify_translation_reuse"
+
+
+def test_theme_translation_reuses_neon_memory_before_ai():
+    class TranslatorMustNotRun:
+        def translate_plain(self, *args, **kwargs):
+            raise AssertionError("AI translation should not run for an exact memory match")
+
+        def translate_html_document(self, *args, **kwargs):
+            raise AssertionError("AI translation should not run for an exact memory match")
+
+    source_value = "Aggiungi al carrello"
+    section_name = "ONLINE_STORE_THEME_LOCALE_CONTENT.customloc.add_to_cart"
+    source_document = {
+        "shop_domain": "agri-eden.myshopify.com",
+        "theme_id": "197624562046",
+        "resource_type": "ONLINE_STORE_THEME_LOCALE_CONTENT",
+        "resource_id": "gid://shopify/OnlineStoreTheme/197624562046?key=locales/it.json",
+        "source_locale": "it",
+        "entries": {
+            "customloc.add_to_cart": {
+                "resource_id": "gid://shopify/OnlineStoreTheme/197624562046?key=locales/it.json",
+                "value": source_value,
+                "digest": "digest",
+                "locale": "it",
+                "content_kind": "plain",
+            }
+        },
+    }
+
+    translated, _hashes, payloads, sources = theme.translate_theme_document(
+        source_document=source_document,
+        changed_sections={section_name},
+        target_locale="de",
+        translator=TranslatorMustNotRun(),
+        translation_memory={
+            (theme.make_source_hash(source_value), section_name): "In den Warenkorb"
+        },
+    )
+
+    assert translated["entries"]["customloc.add_to_cart"] == "In den Warenkorb"
+    assert payloads[0]["value"] == "In den Warenkorb"
+    assert sources[section_name] == "memory:neon"

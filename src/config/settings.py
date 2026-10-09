@@ -116,6 +116,8 @@ class Settings:
         "THEME_TRANSLATION_POLICY_PATH",
         "src/config/theme_translation.yaml",
     )
+    localized_route_prefixes_raw: str = os.getenv("LOCALIZED_ROUTE_PREFIXES", "")
+    collection_ai_enabled: bool = _get_bool("COLLECTION_AI_ENABLED", False)
     bootstrap_ids_file: str = os.getenv("BOOTSTRAP_IDS_FILE", "state/bootstrap_product_ids.txt")
     bootstrap_apply_translations: bool = _get_bool("BOOTSTRAP_APPLY_TRANSLATIONS", False)
     bootstrap_existing_products: bool = _get_bool("BOOTSTRAP_EXISTING_PRODUCTS", True)
@@ -148,6 +150,16 @@ class Settings:
             ns, key = p.split(".", 1)
             items.append((ns.strip(), key.strip()))
         return items
+
+    def get_localized_route_prefixes(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for item in (self.localized_route_prefixes_raw or "").split(","):
+            locale, separator, prefix = item.partition(":")
+            if not separator or not locale.strip() or not prefix.strip():
+                continue
+            normalized = "/" + prefix.strip().strip("/")
+            out[locale.strip()] = normalized
+        return out
 
 
 SETTINGS = Settings()

@@ -196,8 +196,7 @@ class NeonTranslationStore:
     def ensure_schema(self) -> None:
         def run(conn: Any) -> None:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS pdp_source_state (
                       shop_domain TEXT NOT NULL,
                       product_gid TEXT NOT NULL,
@@ -208,10 +207,8 @@ class NeonTranslationStore:
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       PRIMARY KEY (shop_domain, product_gid, source_locale)
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS pdp_translation_state (
                       shop_domain TEXT NOT NULL,
                       product_gid TEXT NOT NULL,
@@ -224,10 +221,8 @@ class NeonTranslationStore:
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       PRIMARY KEY (shop_domain, product_gid, target_locale)
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS translation_memory (
                       source_hash TEXT NOT NULL,
                       field_key TEXT NOT NULL,
@@ -240,10 +235,8 @@ class NeonTranslationStore:
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       PRIMARY KEY (source_hash, field_key, source_locale, target_locale)
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS translation_dictionary (
                       category TEXT NOT NULL,
                       source_locale TEXT NOT NULL,
@@ -254,10 +247,8 @@ class NeonTranslationStore:
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       PRIMARY KEY (category, source_locale, target_locale, source_value)
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS theme_source_state (
                       shop_domain TEXT NOT NULL,
                       theme_id TEXT NOT NULL,
@@ -270,10 +261,8 @@ class NeonTranslationStore:
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       PRIMARY KEY (shop_domain, theme_id, resource_type, resource_id, source_locale)
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS theme_translation_state (
                       shop_domain TEXT NOT NULL,
                       theme_id TEXT NOT NULL,
@@ -288,10 +277,8 @@ class NeonTranslationStore:
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       PRIMARY KEY (shop_domain, theme_id, resource_type, resource_id, target_locale)
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS theme_file_state (
                       shop_domain TEXT NOT NULL,
                       theme_id TEXT NOT NULL,
@@ -303,10 +290,8 @@ class NeonTranslationStore:
                       seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       PRIMARY KEY (shop_domain, theme_id, filename)
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS theme_change_events (
                       event_id TEXT PRIMARY KEY,
                       shop_domain TEXT NOT NULL,
@@ -319,10 +304,8 @@ class NeonTranslationStore:
                       details JSONB NOT NULL DEFAULT '{}'::jsonb,
                       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS admin_jobs (
                       id UUID PRIMARY KEY,
                       shop_domain TEXT NOT NULL,
@@ -340,21 +323,16 @@ class NeonTranslationStore:
                       finished_at TIMESTAMPTZ,
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE INDEX IF NOT EXISTS admin_jobs_shop_created_idx
                     ON admin_jobs (shop_domain, created_at DESC)
-                    """
-                )
-                cur.execute(
-                    """
+                    """)
+                cur.execute("""
                     CREATE UNIQUE INDEX IF NOT EXISTS admin_jobs_one_active_theme_idx
                     ON admin_jobs (shop_domain)
                     WHERE status IN ('queued', 'running')
-                    """
-                )
+                    """)
 
         self._run_db(run)
 
@@ -741,6 +719,38 @@ class NeonTranslationStore:
 
         return self._run_db(run)
 
+    def get_translation_memory_map(
+        self,
+        *,
+        source_locale: str,
+        target_locale: str,
+    ) -> dict[tuple[str, str], str]:
+        """Load exact source/field translations in one query.
+
+        Theme IDs deliberately aren't part of the key: an unchanged field can be
+        reused safely when a cloned or newly published theme has the same source
+        value and semantic field key.
+        """
+
+        def run(conn: Any) -> dict[tuple[str, str], str]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source_hash, field_key, translated_value
+                    FROM translation_memory
+                    WHERE source_locale = %s
+                      AND target_locale = %s
+                    """,
+                    (source_locale, target_locale),
+                )
+                return {
+                    (str(source_hash), str(field_key)): str(translated_value)
+                    for source_hash, field_key, translated_value in cur.fetchall()
+                    if translated_value is not None and str(translated_value).strip()
+                }
+
+        return self._run_db(run)
+
     def upsert_translation_memory(
         self,
         *,
@@ -811,6 +821,41 @@ class NeonTranslationStore:
 
         return self._run_db(run)
 
+    def get_dictionary_translations(
+        self,
+        *,
+        category: str,
+        source_locale: str,
+        target_locale: str,
+        source_values: list[str],
+    ) -> dict[str, str]:
+        """Load a bounded set of dictionary entries in one Neon round trip."""
+
+        values = list(dict.fromkeys(value for value in source_values if value.strip()))
+        if not values:
+            return {}
+
+        def run(conn: Any) -> dict[str, str]:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source_value, translated_value
+                    FROM translation_dictionary
+                    WHERE category = %s
+                      AND source_locale = %s
+                      AND target_locale = %s
+                      AND source_value = ANY(%s)
+                    """,
+                    (category, source_locale, target_locale, values),
+                )
+                return {
+                    str(source_value): str(translated_value)
+                    for source_value, translated_value in cur.fetchall()
+                    if translated_value is not None and str(translated_value).strip()
+                }
+
+        return self._run_db(run)
+
     def upsert_dictionary_translation(
         self,
         *,
@@ -845,6 +890,56 @@ class NeonTranslationStore:
                         json.dumps(sanitize_json_value(metadata or {}), ensure_ascii=False),
                         _utc_now(),
                     ),
+                )
+
+        self._run_db(run)
+
+    def upsert_dictionary_translations(
+        self,
+        *,
+        category: str,
+        source_locale: str,
+        target_locale: str,
+        translations: dict[str, str],
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist multiple shared leaf translations in one transaction."""
+
+        rows = [
+            (source_value, translated_value)
+            for source_value, translated_value in translations.items()
+            if source_value.strip() and translated_value.strip()
+        ]
+        if not rows:
+            return
+
+        def run(conn: Any) -> None:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO translation_dictionary (
+                      category, source_locale, target_locale,
+                      source_value, translated_value, metadata, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                    ON CONFLICT (category, source_locale, target_locale, source_value)
+                    DO UPDATE SET
+                      translated_value = EXCLUDED.translated_value,
+                      metadata = EXCLUDED.metadata,
+                      updated_at = EXCLUDED.updated_at
+                    """,
+                    [
+                        (
+                            sanitize_text(category),
+                            source_locale,
+                            target_locale,
+                            sanitize_text(source_value),
+                            sanitize_text(translated_value),
+                            json.dumps(sanitize_json_value(metadata or {}), ensure_ascii=False),
+                            _utc_now(),
+                        )
+                        for source_value, translated_value in rows
+                    ],
                 )
 
         self._run_db(run)

@@ -119,3 +119,60 @@ def test_translation_matrix_fetches_two_locales_in_one_resource_request(monkeypa
     assert 'translations_fr: translations(locale: "fr")' in seen[0][0]
     assert matrix["gid://shopify/Product/123"]["de"]["title"]["value"] == "Titel"
     assert matrix["gid://shopify/Product/123"]["fr"]["title"]["outdated"] is True
+
+
+def test_paginated_resources_can_include_two_locale_states(monkeypatch):
+    seen = {}
+
+    async def _fake_post_graphql(query, variables):
+        seen["query"] = query
+        seen["variables"] = variables
+        return {
+            "data": {
+                "translatableResources": {
+                    "edges": [
+                        {
+                            "cursor": "cursor-1",
+                            "node": {
+                                "resourceId": "gid://shopify/Page/123",
+                                "translatableContent": [
+                                    {
+                                        "key": "title",
+                                        "value": "Negozio",
+                                        "digest": "digest",
+                                        "locale": "it",
+                                    }
+                                ],
+                                "translations_de": [
+                                    {"key": "title", "value": "Geschäft", "outdated": False}
+                                ],
+                                "translations_fr": [
+                                    {"key": "title", "value": "Boutique", "outdated": True}
+                                ],
+                            },
+                        }
+                    ],
+                    "pageInfo": {"hasNextPage": False, "endCursor": "cursor-1"},
+                }
+            }
+        }
+
+    monkeypatch.setattr(graphql, "_post_graphql", _fake_post_graphql)
+    nodes, page_info = asyncio.run(
+        graphql.list_translatable_resources_with_translations(
+            resource_type="PAGE",
+            locales=["fr", "de"],
+            first=250,
+        )
+    )
+
+    assert seen["variables"] == {
+        "first": 250,
+        "after": None,
+        "resourceType": "PAGE",
+    }
+    assert 'translations_de: translations(locale: "de")' in seen["query"]
+    assert 'translations_fr: translations(locale: "fr")' in seen["query"]
+    assert nodes[0]["translations"]["de"]["title"]["value"] == "Geschäft"
+    assert nodes[0]["translations"]["fr"]["title"]["outdated"] is True
+    assert page_info["hasNextPage"] is False

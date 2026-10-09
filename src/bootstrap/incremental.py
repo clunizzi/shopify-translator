@@ -20,6 +20,7 @@ async def sync_products_incremental(
     handle_only: bool = False,
     reconcile_shopify_drift: bool = False,
     content_changes_only: bool = False,
+    recover_incomplete_state: bool = True,
     sync_seo: bool = False,
     continue_on_error: bool = False,
 ) -> dict:
@@ -52,12 +53,15 @@ async def sync_products_incremental(
     try:
         for product_id in product_ids:
             try:
-                product_gid, metafields, live_map, _existing_translations = (
-                    await fetch_product_source_bundle(
-                        product_id,
-                        mf_include,
-                        target_locales=target_locales,
-                    )
+                (
+                    product_gid,
+                    metafields,
+                    live_map,
+                    _existing_translations,
+                ) = await fetch_product_source_bundle(
+                    product_id,
+                    mf_include,
+                    target_locales=target_locales,
                 )
                 await process_product_bundle(
                     store=store,
@@ -78,8 +82,12 @@ async def sync_products_incremental(
                     persist_state=not dry_run,
                     reconcile_shopify_drift=reconcile_shopify_drift,
                     content_changes_only=content_changes_only,
+                    recover_incomplete_state=recover_incomplete_state,
                 )
-                if sync_seo:
+                product_item = summary["items"][-1] if summary["items"] else {}
+                if sync_seo and not (
+                    content_changes_only and product_item.get("status") == "unchanged"
+                ):
                     seo_item = await process_product_seo_bundle(
                         store=store,
                         translator=translator,
