@@ -11,6 +11,7 @@ from typing import Any
 import boto3
 
 from src.logging_setup import configure_logging
+from src.openai_usage import estimate_openai_cost, persist_translation_usage_event
 
 
 @dataclass(frozen=True)
@@ -175,7 +176,91 @@ def _apply_runtime_secrets(cfg: WorkerConfig) -> None:
     os.environ["LOG_VERBOSE_SYNC"] = "true" if cfg.log_verbose_sync else "false"
 
 
-def _build_log_event(*, product_id: str, topic: str, summary: dict[str, Any]) -> dict[str, Any]:
+def _merge_openai_telemetry(*telemetries: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "openai_calls": 0,
+        "openai_ms_total": 0,
+        "openai_prompt_tokens": 0,
+        "openai_cached_prompt_tokens": 0,
+        "openai_cache_write_tokens": 0,
+        "openai_completion_tokens": 0,
+        "openai_reasoning_tokens": 0,
+        "fallback_calls": 0,
+        "openai_usage_by_model": {},
+    }
+    numeric_keys = tuple(key for key in merged if key != "openai_usage_by_model")
+    for telemetry in telemetries:
+        if not isinstance(telemetry, dict):
+            continue
+        for key in numeric_keys:
+            merged[key] += int(telemetry.get(key) or 0)
+        if not merged.get("model") and telemetry.get("model"):
+            merged["model"] = telemetry["model"]
+        if not merged.get("fallback_model") and telemetry.get("fallback_model"):
+            merged["fallback_model"] = telemetry["fallback_model"]
+        for model, usage in (telemetry.get("openai_usage_by_model") or {}).items():
+            if not isinstance(usage, dict):
+                continue
+            model_totals = merged["openai_usage_by_model"].setdefault(model, {})
+            for key, value in usage.items():
+                model_totals[key] = int(model_totals.get(key) or 0) + int(value or 0)
+    return merged
+
+
+def _estimate_openai_cost(telemetry: dict[str, Any]) -> dict[str, Any]:
+    return estimate_openai_cost(telemetry)
+
+
+def _persist_usage_best_effort(
+    *,
+    cfg: WorkerConfig,
+    event_key: str,
+    event_type: str,
+    entity_id: str,
+    topic: str,
+    source: str,
+    status: str,
+    summary: dict[str, Any],
+) -> None:
+    try:
+        persist_translation_usage_event(
+            shop_domain=cfg.shop_domain,
+            event_key=event_key,
+            event_type=event_type,
+            entity_id=entity_id,
+            topic=topic,
+            source=source,
+            status=status,
+            telemetry=summary.get("telemetry") or {},
+            metadata={
+                "registered": int(summary.get("registered") or 0),
+                "changed_sections": int(summary.get("changed_sections") or 0),
+            },
+        )
+    except Exception as exc:
+        # Observability must never turn a successful Shopify sync into a retry
+        # that could repeat OpenAI work or translation writes.
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "warning": "usage_telemetry_persist_failed",
+                    "event_key": event_key,
+                    "error": str(exc)[:500],
+                }
+            )
+        )
+
+
+def _build_log_event(
+    *,
+    product_id: str,
+    topic: str,
+    summary: dict[str, Any],
+    source: str = "",
+) -> dict[str, Any]:
     item = ((summary.get("items") or [{}])[0]) if isinstance(summary, dict) else {}
     locales = item.get("locales") or {}
     seo_summary = summary.get("seo") or {}
@@ -186,6 +271,7 @@ def _build_log_event(*, product_id: str, topic: str, summary: dict[str, Any]) ->
         "product_id": int(product_id),
         "product_title": item.get("product_title") or "",
         "topic": topic,
+        "source": source,
         "status": item.get("status") or "unknown",
         "skip_reason": item.get("skip_reason") or "",
         "changed_sections": item.get("changed_sections") or [],
@@ -206,6 +292,8 @@ def _build_log_event(*, product_id: str, topic: str, summary: dict[str, Any]) ->
             }
             for locale, data in (seo_item.get("locales") or {}).items()
         },
+        "telemetry": summary.get("telemetry") or {},
+        "estimated_openai_cost": _estimate_openai_cost(summary.get("telemetry") or {}),
     }
 
 
@@ -322,6 +410,10 @@ def _schedule_debounced_followup(
                 "EventId": {
                     "DataType": "String",
                     "StringValue": f"coalesced:{token}",
+                },
+                "Source": {
+                    "DataType": "String",
+                    "StringValue": "debounce_followup",
                 },
             },
         )
@@ -443,6 +535,10 @@ async def _run_backend(
             handle_summary.get("failed_product_ids", [])
         )
         summary["items"] = list(summary.get("items", [])) + list(handle_summary.get("items", []))
+        summary["telemetry"] = _merge_openai_telemetry(
+            summary.get("telemetry"),
+            handle_summary.get("telemetry"),
+        )
     return summary
 
 
@@ -468,6 +564,7 @@ async def _process_one(record: dict[str, Any], cfg: WorkerConfig) -> tuple[bool,
     topic = (attrs.get("Topic") or {}).get("stringValue", "")
     shop = (attrs.get("Shop") or {}).get("stringValue", cfg.shop_domain)
     event_id = (attrs.get("EventId") or {}).get("stringValue", "")
+    source = (attrs.get("Source") or {}).get("stringValue", "")
     topic_lower = topic.lower()
 
     try:
@@ -521,6 +618,16 @@ async def _process_one(record: dict[str, Any], cfg: WorkerConfig) -> tuple[bool,
                 ]
                 if failed_items:
                     raise RuntimeError("Theme realtime sync produced failed resources")
+                _persist_usage_best_effort(
+                    cfg=cfg,
+                    event_key=event_id or f"sqs:{msg_id}",
+                    event_type="theme",
+                    entity_id=cfg.approved_theme_id,
+                    topic=topic_lower,
+                    source=source or "shopify_webhook",
+                    status="synced",
+                    summary=realtime_summary,
+                )
             _mark_event_processed(cfg, event_id)
             print(
                 json.dumps(
@@ -600,8 +707,23 @@ async def _process_one(record: dict[str, Any], cfg: WorkerConfig) -> tuple[bool,
             shop=shop,
         )
         _mark_event_processed(cfg, event_id)
-        event = _build_log_event(product_id=product_id, topic=topic, summary=summary)
+        event = _build_log_event(
+            product_id=product_id,
+            topic=topic,
+            summary=summary,
+            source=source,
+        )
         event["message_id"] = msg_id
+        _persist_usage_best_effort(
+            cfg=cfg,
+            event_key=event_id or f"sqs:{msg_id}",
+            event_type="product",
+            entity_id=product_id,
+            topic=topic_lower,
+            source=source or "shopify_webhook",
+            status=str(event.get("status") or "unknown"),
+            summary=summary,
+        )
         print(json.dumps(event, ensure_ascii=False))
         if cfg.log_verbose_sync:
             verbose = _build_verbose_log_event(summary)

@@ -16,6 +16,7 @@ class ReceiverConfig:
     webhook_secret_arn: str
     webhook_secret_plain: str
     disable_sync: bool
+    product_webhook_delay_seconds: int
 
 
 _SQS = None
@@ -29,6 +30,10 @@ def _config() -> ReceiverConfig:
         webhook_secret_arn=os.environ.get("SHOPIFY_WEBHOOK_SECRET_ARN", ""),
         webhook_secret_plain=os.environ.get("SHOPIFY_WEBHOOK_SECRET", ""),
         disable_sync=os.environ.get("DISABLE_SYNC", "false").lower() in {"1", "true", "yes", "y"},
+        product_webhook_delay_seconds=max(
+            0,
+            min(900, int(os.environ.get("PRODUCT_WEBHOOK_DELAY_SECONDS", "180"))),
+        ),
     )
 
 
@@ -105,8 +110,12 @@ def handler(event, context):
             return {"statusCode": 401, "body": "Invalid HMAC"}
 
         topic_lower = topic.lower()
-        if topic_lower == "products/create":
-            delay = 8
+        if topic_lower in {"products/create", "products/update"}:
+            # DDT/import tools often save a product several times while its
+            # title, body and metafields are still incomplete. Fetching the
+            # product after a quiet period avoids paying to translate each
+            # intermediate state. The worker still performs content hashing.
+            delay = cfg.product_webhook_delay_seconds
         elif topic_lower in {"themes/update", "themes/publish"}:
             delay = 10
         else:
@@ -119,6 +128,10 @@ def handler(event, context):
                 "Topic": {"DataType": "String", "StringValue": topic or ""},
                 "Shop": {"DataType": "String", "StringValue": shop or ""},
                 "EventId": {"DataType": "String", "StringValue": event_id or ""},
+                "Source": {
+                    "DataType": "String",
+                    "StringValue": "shopify_webhook",
+                },
             },
         )
         print(

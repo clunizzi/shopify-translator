@@ -37,6 +37,46 @@ def test_gpt61_request_uses_low_reasoning_without_temperature():
     assert "temperature" not in options
 
 
+def test_gpt6_luna_request_uses_no_reasoning_without_temperature():
+    options = Translator._chat_completion_options(
+        model="gpt-6-luna",
+        response_format={"type": "text"},
+    )
+    assert options["reasoning_effort"] == "none"
+    assert "temperature" not in options
+
+
+def test_telemetry_tracks_cached_and_reasoning_tokens_by_model():
+    cache = TranslationCache(":memory:")
+    translator = Translator(cache=cache, model="gpt-6-luna")
+
+    translator._record_openai_usage(
+        model="gpt-6-luna",
+        duration_ms=25,
+        usage={
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "completion_tokens_details": {"reasoning_tokens": 4},
+        },
+    )
+
+    telemetry = translator.get_telemetry()
+    assert telemetry["openai_calls"] == 1
+    assert telemetry["openai_cached_prompt_tokens"] == 80
+    assert telemetry["openai_reasoning_tokens"] == 4
+    assert telemetry["openai_usage_by_model"]["gpt-6-luna"] == {
+        "calls": 1,
+        "duration_ms": 25,
+        "prompt_tokens": 120,
+        "cached_prompt_tokens": 80,
+        "cache_write_tokens": 0,
+        "completion_tokens": 30,
+        "reasoning_tokens": 4,
+    }
+    cache.close()
+
+
 def test_legacy_request_keeps_zero_temperature():
     options = Translator._chat_completion_options(
         model="gpt-5.2",

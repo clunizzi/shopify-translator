@@ -11,8 +11,8 @@
       content="default-src 'self'; connect-src 'self'; img-src 'self' data: https://cdn.shopify.com; object-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     />
     <title>Shopify Translation Control</title>
-    <link rel="stylesheet" href="/styles.css?v=20260730.5" />
-    <script src="/app.js?v=20260730.5" type="module"></script>
+    <link rel="stylesheet" href="/styles.css?v=20261014.1" />
+    <script src="/app.js?v=20261014.1" type="module"></script>
   </head>
   <body>
     <a class="skip-link" href="#main">Vai al contenuto</a>
@@ -27,6 +27,7 @@
       </a>
       <nav class="app-nav" aria-label="Navigazione principale">
         <a class="is-active" href="#content-title">Contenuti</a>
+        <a href="#costs">Costi</a>
         <a href="#theme-control">Tema e sync</a>
         <a href="#system-overview">Sistema</a>
       </nav>
@@ -69,6 +70,97 @@
         <span class="notice-title">Caricamento stato</span>
         <span class="notice-copy">Sto leggendo il quadro operativo.</span>
       </div>
+
+      <section class="cost-command" id="costs" aria-labelledby="cost-title">
+        <div class="cost-command-head">
+          <div>
+            <p class="section-kicker">OpenAI / ultimi 30 giorni</p>
+            <h2 id="cost-title">Quanto sta spendendo il traduttore.</h2>
+            <p>
+              Stime calcolate dai token restituiti dall’API. La fatturazione OpenAI resta il dato
+              contabile definitivo.
+            </p>
+          </div>
+          <div class="cost-freshness">
+            <span class="live-indicator"><i aria-hidden="true"></i> Chiave SRT dedicata</span>
+            <small id="cost-updated">In attesa del primo evento</small>
+          </div>
+        </div>
+
+        <div class="cost-metrics" aria-label="Riepilogo costi OpenAI">
+          <article class="cost-primary">
+            <span>Oggi</span>
+            <strong id="cost-today">$0,00</strong>
+            <small id="cost-today-note">0 chiamate negli ultimi 30 giorni</small>
+          </article>
+          <article>
+            <span>Mese corrente</span>
+            <strong id="cost-month">$0,00</strong>
+            <small id="cost-budget-note">Budget non impostato</small>
+          </article>
+          <article>
+            <span>Ultimi 7 giorni</span>
+            <strong id="cost-seven-days">$0,00</strong>
+            <small id="cost-seven-days-note">Raccolta dati attiva da oggi</small>
+          </article>
+          <article>
+            <span>Media prodotto</span>
+            <strong id="cost-product-average">$0,00</strong>
+            <small id="cost-product-note">Solo eventi che hanno usato l’AI</small>
+          </article>
+        </div>
+
+        <div class="cost-detail-grid">
+          <article class="cost-panel cost-trend-panel">
+            <div class="cost-panel-head">
+              <div>
+                <h3>Andamento giornaliero</h3>
+                <p>Ultimi 14 giorni, costi stimati in USD.</p>
+              </div>
+              <strong id="cost-thirty-days">$0,00 / 30 gg</strong>
+            </div>
+            <div class="cost-chart" id="cost-chart" aria-label="Grafico costi giornalieri"></div>
+            <div class="budget-track" id="budget-track" hidden>
+              <div class="budget-track-head">
+                <span>Budget mensile</span>
+                <strong id="budget-progress-label">0%</strong>
+              </div>
+              <div class="budget-bar" aria-hidden="true"><i id="budget-progress"></i></div>
+            </div>
+          </article>
+
+          <article class="cost-panel">
+            <div class="cost-panel-head">
+              <div>
+                <h3>Motore e token</h3>
+                <p>Consumo attribuito ai modelli effettivamente chiamati.</p>
+              </div>
+            </div>
+            <div class="model-usage-list" id="model-usage-list">
+              <p class="empty-state">Nessun utilizzo registrato.</p>
+            </div>
+            <dl class="token-strip">
+              <div><dt>Input</dt><dd id="token-input">0</dd></div>
+              <div><dt>Cache</dt><dd id="token-cached">0</dd></div>
+              <div><dt>Output</dt><dd id="token-output">0</dd></div>
+              <div><dt>Senza AI</dt><dd id="no-ai-events">0</dd></div>
+            </dl>
+          </article>
+        </div>
+
+        <details class="cost-events">
+          <summary>
+            <span><strong>Eventi di costo recenti</strong><small>Prodotti, tema e risorse globali</small></span>
+            <span class="diagnostics-summary">Apri registro</span>
+          </summary>
+          <div class="cost-event-list" id="cost-event-list">
+            <p class="empty-state">Gli eventi nuovi compariranno qui.</p>
+          </div>
+        </details>
+        <p class="cost-disclaimer" id="cost-disclaimer">
+          Nessun testo del catalogo viene salvato nella telemetria.
+        </p>
+      </section>
 
       <details class="diagnostics" id="system-overview">
         <summary>
@@ -339,13 +431,13 @@
 
       <section class="cost-rail" aria-label="Guardrail costi">
         <div>
-          <strong>Guardrail costi attivo</strong>
-          <p>Nessun polling tema. I job partono solo su richiesta. Lo storico viene eliminato dopo 30 giorni.</p>
+          <strong>Attribuzione costi attiva</strong>
+          <p>Vengono salvati solo contatori, token e stime. Nessun testo sorgente o tradotto entra nella telemetria.</p>
         </div>
         <dl>
           <div>
             <dt>Modello</dt>
-            <dd>GPT-5.6 Terra</dd>
+            <dd id="openai-model">In verifica</dd>
           </div>
           <div>
             <dt>Lingue</dt>
@@ -376,6 +468,11 @@
         <div class="dialog-safety">
           <strong>Protezione attiva</strong>
           <p id="dialog-safety-copy"></p>
+        </div>
+        <div class="dialog-cost-preview" id="dialog-cost-preview">
+          <span>Preflight costo</span>
+          <strong id="dialog-cost-value">Nessun costo</strong>
+          <small id="dialog-cost-copy">L’audit non chiama OpenAI.</small>
         </div>
         <label class="confirmation-field" id="confirmation-field">
           <span>Scrivi <strong id="confirmation-phrase"></strong></span>

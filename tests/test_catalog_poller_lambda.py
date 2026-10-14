@@ -139,3 +139,4 @@ def test_enqueue_batches_ten_messages_and_sets_idempotency_attributes(monkeypatc
     assert first["MessageAttributes"]["EventId"]["StringValue"].startswith(
         "catalog-poller:gid://shopify/Product/0:"
     )
+    assert first["MessageAttributes"]["Source"]["StringValue"] == "catalog_poller"

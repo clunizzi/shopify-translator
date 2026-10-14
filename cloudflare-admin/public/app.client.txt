@@ -4,6 +4,16 @@ const dateFormat = new Intl.DateTimeFormat("it-IT", {
   dateStyle: "short",
   timeStyle: "short",
 });
+const usdFormat = new Intl.NumberFormat("it-IT", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 4,
+});
+const compactNumberFormat = new Intl.NumberFormat("it-IT", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
 
 const ACTIONS = {
   theme_audit: {
@@ -50,6 +60,16 @@ function asBytes(value) {
   );
   const amount = bytes / 1024 ** exponent;
   return `${amount.toLocaleString("it-IT", { maximumFractionDigits: 1 })} ${units[exponent]}`;
+}
+
+function asUsd(value) {
+  const amount = Number(value || 0);
+  return usdFormat.format(Number.isFinite(amount) ? amount : 0);
+}
+
+function safeNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number : 0;
 }
 
 function productNumber(gid) {
@@ -250,6 +270,15 @@ function latestSuccessfulAudit(jobs) {
   );
 }
 
+function themeAiRequired(jobs) {
+  const audit = latestSuccessfulAudit(jobs);
+  if (!audit?.result?.locales) return null;
+  return Object.values(audit.result.locales).reduce(
+    (total, locale) => total + safeNumber(locale.ai_required),
+    0,
+  );
+}
+
 function renderThemeAudit(jobs) {
   const target = byId("theme-audit");
   const audit = latestSuccessfulAudit(jobs);
@@ -427,6 +456,190 @@ function renderThemeEvents(rows) {
   );
 }
 
+function lastFourteenDays(rows) {
+  const byDay = new Map(
+    (rows || []).map((row) => [String(row.day || ""), safeNumber(row.estimated_cost_usd)]),
+  );
+  const result = [];
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+  for (let offset = 13; offset >= 0; offset -= 1) {
+    const date = new Date(today);
+    date.setDate(today.getDate() - offset);
+    const key = [
+      date.getFullYear(),
+      String(date.getMonth() + 1).padStart(2, "0"),
+      String(date.getDate()).padStart(2, "0"),
+    ].join("-");
+    result.push({ key, date, cost: byDay.get(key) || 0 });
+  }
+  return result;
+}
+
+function renderCostChart(rows) {
+  const target = byId("cost-chart");
+  const days = lastFourteenDays(rows);
+  const maximum = Math.max(...days.map((day) => day.cost), 0.0001);
+  target.replaceChildren(
+    ...days.map((day) => {
+      const item = makeElement("div", "cost-bar-item");
+      const amount = makeElement("span", "cost-bar-amount", day.cost ? asUsd(day.cost) : "—");
+      const track = makeElement("div", "cost-bar-track");
+      const bar = makeElement("i", "cost-bar-fill");
+      bar.style.setProperty("--cost-height", `${Math.max(day.cost ? 5 : 1, (day.cost / maximum) * 100)}%`);
+      track.append(bar);
+      const label = makeElement(
+        "time",
+        "cost-bar-label",
+        new Intl.DateTimeFormat("it-IT", { day: "2-digit", month: "2-digit" }).format(day.date),
+      );
+      label.dateTime = day.key;
+      item.title = `${label.textContent}: ${asUsd(day.cost)}`;
+      item.setAttribute("aria-label", item.title);
+      item.append(amount, track, label);
+      return item;
+    }),
+  );
+}
+
+function renderModelUsage(rows, configuredModel, fallbackModel) {
+  const target = byId("model-usage-list");
+  if (!rows?.length) {
+    target.replaceChildren(
+      makeElement(
+        "p",
+        "empty-state",
+        `In attesa del primo evento. Modello configurato: ${configuredModel || "non disponibile"}.`,
+      ),
+    );
+    return;
+  }
+  target.replaceChildren(
+    ...rows.map((row) => {
+      const item = makeElement("article", "model-usage-row");
+      const identity = makeElement("div", "model-usage-identity");
+      const modelName = String(row.model || "modello sconosciuto");
+      identity.append(
+        makeElement("strong", "", modelName),
+        makeElement(
+          "span",
+          "",
+          modelName === fallbackModel
+            ? "Fallback"
+            : modelName === configuredModel
+              ? "Primario"
+              : "Utilizzato",
+        ),
+      );
+      const tokens = safeNumber(row.prompt_tokens) + safeNumber(row.completion_tokens);
+      const stats = makeElement("div", "model-usage-stats");
+      stats.append(
+        makeElement("strong", "", numberFormat.format(safeNumber(row.calls))),
+        makeElement("span", "", `${compactNumberFormat.format(tokens)} token`),
+      );
+      item.append(identity, stats);
+      return item;
+    }),
+  );
+}
+
+function costEventTitle(row) {
+  if (row.event_type === "product") return `Prodotto #${row.entity_id || "sconosciuto"}`;
+  if (row.event_type === "theme") return `Tema #${row.entity_id || "MAIN"}`;
+  return "Pagine, collezioni e risorse globali";
+}
+
+function renderCostEvents(rows) {
+  const target = byId("cost-event-list");
+  if (!rows?.length) {
+    target.replaceChildren(
+      makeElement("p", "empty-state", "Gli eventi nuovi compariranno qui."),
+    );
+    return;
+  }
+  target.replaceChildren(
+    ...rows.map((row) => {
+      const item = makeElement("article", "cost-event-row");
+      const identity = makeElement("div", "cost-event-identity");
+      identity.append(
+        makeElement("strong", "", costEventTitle(row)),
+        makeElement(
+          "span",
+          "",
+          `${asDate(row.created_at)} · ${numberFormat.format(safeNumber(row.openai_calls))} chiamate · ${row.source || "sorgente non indicata"}`,
+        ),
+      );
+      const amount = makeElement(
+        "strong",
+        safeNumber(row.openai_calls) ? "cost-event-amount" : "cost-event-zero",
+        safeNumber(row.openai_calls) ? asUsd(row.estimated_cost_usd) : "senza AI",
+      );
+      item.append(identity, amount);
+      return item;
+    }),
+  );
+}
+
+function renderCosts(usage = {}, config = {}) {
+  const calls = safeNumber(usage.openai_calls_30d);
+  const monthCost = safeNumber(usage.month_usd);
+  byId("cost-today").textContent = asUsd(usage.today_usd);
+  byId("cost-month").textContent = asUsd(monthCost);
+  byId("cost-seven-days").textContent = asUsd(usage.seven_days_usd);
+  byId("cost-thirty-days").textContent = `${asUsd(usage.thirty_days_usd)} / 30 gg`;
+  byId("cost-product-average").textContent = asUsd(usage.avg_product_usd_30d);
+  byId("cost-today-note").textContent =
+    `${numberFormat.format(calls)} chiamate · ${numberFormat.format(safeNumber(usage.ai_events_30d))} eventi AI`;
+  byId("cost-product-note").textContent = usage.product_ai_events_30d
+    ? `${numberFormat.format(safeNumber(usage.product_ai_events_30d))} prodotti con chiamate AI`
+    : "In attesa del primo prodotto con chiamate AI";
+  byId("cost-seven-days-note").textContent = usage.latest_event_at
+    ? `Ultimo evento ${asDate(usage.latest_event_at)}`
+    : "La raccolta parte da questo aggiornamento";
+  byId("cost-updated").textContent = usage.latest_event_at
+    ? `Telemetria aggiornata ${asDate(usage.latest_event_at)}`
+    : "In attesa del primo evento";
+
+  byId("token-input").textContent = compactNumberFormat.format(
+    safeNumber(usage.prompt_tokens_30d),
+  );
+  byId("token-cached").textContent = compactNumberFormat.format(
+    safeNumber(usage.cached_prompt_tokens_30d),
+  );
+  byId("token-output").textContent = compactNumberFormat.format(
+    safeNumber(usage.completion_tokens_30d),
+  );
+  byId("no-ai-events").textContent = numberFormat.format(
+    safeNumber(usage.no_ai_events_30d),
+  );
+
+  const budget = safeNumber(config.openai_monthly_budget_usd);
+  const budgetTrack = byId("budget-track");
+  budgetTrack.hidden = budget <= 0;
+  if (budget > 0) {
+    const ratio = monthCost / budget;
+    const percentage = Math.round(ratio * 100);
+    byId("cost-budget-note").textContent = `${asUsd(Math.max(0, budget - monthCost))} disponibili su ${asUsd(budget)}`;
+    byId("budget-progress-label").textContent = `${percentage}% · ${asUsd(monthCost)} su ${asUsd(budget)}`;
+    const progress = byId("budget-progress");
+    progress.style.setProperty("--budget-progress", `${Math.min(100, percentage)}%`);
+    progress.className = ratio >= 1 ? "is-critical" : ratio >= 0.8 ? "is-warning" : "";
+  } else {
+    byId("cost-budget-note").textContent = "Budget non impostato";
+  }
+
+  byId("cost-disclaimer").textContent = usage.estimates_complete === false
+    ? "Attenzione: almeno un modello non ha un prezzo configurato, quindi il totale è parziale. Nessun testo del catalogo viene salvato."
+    : `Stima con listino del ${usage.pricing_date || "14/10/2026"}. Nessun testo del catalogo viene salvato nella telemetria.`;
+  renderCostChart(usage.daily || []);
+  renderModelUsage(
+    usage.models || [],
+    config.openai_model,
+    config.openai_fallback_model,
+  );
+  renderCostEvents(usage.recent || []);
+}
+
 function scheduleRefresh(jobs) {
   if (refreshTimer) {
     clearTimeout(refreshTimer);
@@ -476,7 +689,11 @@ function renderOverview(payload) {
   byId("credential-age").textContent = Number.isFinite(credentialDays)
     ? `${credentialDays} giorni`
     : "Dato non disponibile";
+  byId("openai-model").textContent = config.openai_fallback_model
+    ? `${config.openai_model} · fallback ${config.openai_fallback_model}`
+    : config.openai_model;
 
+  renderCosts(data.usage, config);
   renderSystemState(data);
   renderLocales(data.product_translations, data.product_sources);
   renderThemeAudit(data.jobs);
@@ -531,6 +748,33 @@ function openOperationDialog(action) {
         : "risk-label risk-safe";
   byId("dialog-safety-copy").textContent =
     `AWS accetta solo il tema MAIN con ID ${themeId}. Nessun file Liquid o JSON viene scritto.`;
+  const usage = currentPayload.data?.usage || {};
+  const calls = safeNumber(usage.openai_calls_30d);
+  const averageCallCost = calls > 0 ? safeNumber(usage.thirty_days_usd) / calls : 0;
+  const aiRequired = themeAiRequired(currentPayload.data?.jobs || []);
+  if (action === "theme_audit") {
+    byId("dialog-cost-value").textContent = "Nessun costo OpenAI";
+    byId("dialog-cost-copy").textContent =
+      "Legge Shopify e calcola quanti campi richiederebbero davvero l’AI.";
+  } else if (aiRequired === null) {
+    byId("dialog-cost-value").textContent = "Stima non disponibile";
+    byId("dialog-cost-copy").textContent =
+      "Esegui prima un audit: è gratuito e conta i campi ancora da tradurre.";
+  } else if (aiRequired === 0) {
+    byId("dialog-cost-value").textContent = asUsd(0);
+    byId("dialog-cost-copy").textContent =
+      "L’ultimo audit non ha trovato campi che richiedono una nuova traduzione AI.";
+  } else if (averageCallCost <= 0) {
+    byId("dialog-cost-value").textContent = `${numberFormat.format(aiRequired)} campi AI`;
+    byId("dialog-cost-copy").textContent =
+      "Manca ancora uno storico sufficiente per trasformare il preflight in dollari.";
+  } else {
+    const estimatedCalls = action === "theme_canary" ? Math.min(1, aiRequired) : aiRequired;
+    byId("dialog-cost-value").textContent = `≈ ${asUsd(estimatedCalls * averageCallCost)}`;
+    byId("dialog-cost-copy").textContent = action === "theme_canary"
+      ? `Canary limitato a un campo; stima basata sul costo medio per chiamata degli ultimi 30 giorni.`
+      : `${numberFormat.format(aiRequired)} campi AI secondo l’ultimo audit; stima prudenziale basata sul costo medio per chiamata.`;
+  }
   byId("confirmation-field").hidden = !phrase;
   byId("confirmation-phrase").textContent = phrase;
   byId("confirmation-input").value = "";

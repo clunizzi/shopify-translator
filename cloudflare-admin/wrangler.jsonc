@@ -2,8 +2,9 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "shopify-translation-control",
   "main": "src/worker.ts",
-  "compatibility_date": "2026-05-03",
+  "compatibility_date": "2026-10-12",
   "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
   "rules": [
     {
       "type": "Text",
@@ -25,6 +26,10 @@
     "CATALOG_POLL_SCHEDULE": "Disabled",
     "SCHEDULED_SYNC_ENABLED": "false",
     "THEME_REALTIME_SYNC_ENABLED": "false",
+    "OPENAI_MODEL": "gpt-6.1-sol",
+    "OPENAI_FALLBACK_MODEL": "gpt-5.6-terra",
+    "OPENAI_MONTHLY_BUDGET_USD": "",
+    "REPORT_TIME_ZONE": "UTC",
     "DEPLOYMENT_LOCKED": "true"
   }
 }

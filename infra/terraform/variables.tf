@@ -214,6 +214,17 @@ variable "debounce_seconds" {
   default     = 60
 }
 
+variable "product_webhook_delay_seconds" {
+  description = "Delay product webhooks so staged DDT/import writes settle before translation"
+  type        = number
+  default     = 180
+
+  validation {
+    condition     = var.product_webhook_delay_seconds >= 0 && var.product_webhook_delay_seconds <= 900
+    error_message = "product_webhook_delay_seconds must be between 0 and 900."
+  }
+}
+
 variable "dry_run" {
   description = "Dry run mode for worker"
   type        = string

@@ -92,6 +92,38 @@ def test_receiver_still_enqueues_while_sync_is_paused(monkeypatch):
     assert res["statusCode"] == 200
     assert len(sent) == 1
     assert sent[0]["MessageBody"] == body.decode()
+    assert sent[0]["MessageAttributes"]["Source"]["StringValue"] == "shopify_webhook"
+
+
+def test_receiver_delays_product_updates_until_import_writes_settle(monkeypatch):
+    monkeypatch.setenv("SQS_URL", "https://example.com/q")
+    monkeypatch.setenv("SHOPIFY_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("PRODUCT_WEBHOOK_DELAY_SECONDS", "180")
+    monkeypatch.setattr(receiver, "_CACHED_SECRET", None)
+    sent = []
+
+    class _FakeSQS:
+        def send_message(self, **kwargs):
+            sent.append(kwargs)
+            return {"MessageId": "product-message"}
+
+    monkeypatch.setattr(receiver, "_SQS", _FakeSQS())
+    body = b'{"id":303}'
+    event = {
+        "headers": {
+            "X-Shopify-Topic": "products/update",
+            "X-Shopify-Shop-Domain": "example.myshopify.com",
+            "X-Shopify-Event-Id": "product-event",
+            "X-Shopify-Hmac-Sha256": _shopify_hmac("secret", body),
+        },
+        "body": body.decode(),
+        "isBase64Encoded": False,
+    }
+
+    result = receiver.handler(event, None)
+
+    assert result["statusCode"] == 200
+    assert sent[0]["DelaySeconds"] == 180
 
 
 def test_receiver_delays_theme_webhooks_for_shopify_consistency(monkeypatch):

@@ -899,7 +899,11 @@ class Translator:
         self.openai_calls = 0
         self.openai_ms_total = 0
         self.openai_prompt_tokens = 0
+        self.openai_cached_prompt_tokens = 0
+        self.openai_cache_write_tokens = 0
         self.openai_completion_tokens = 0
+        self.openai_reasoning_tokens = 0
+        self.openai_usage_by_model: dict[str, dict[str, int]] = {}
         self.fallback_calls = 0
 
     @staticmethod
@@ -912,7 +916,11 @@ class Translator:
             "model": model,
             "response_format": response_format,
         }
-        if model.startswith("gpt-6.1"):
+        if model.startswith("gpt-6-luna"):
+            # Luna is the high-volume path: translation is a constrained
+            # transformation, so reasoning adds cost without useful signal.
+            options["reasoning_effort"] = "none"
+        elif model.startswith("gpt-6.1"):
             # GPT-6.1 does not support `none` and reasoning models reject
             # sampling parameters such as temperature. Low is the documented
             # fit for routine transformation/rewrite work.
@@ -924,6 +932,60 @@ class Translator:
         else:
             options["temperature"] = 0
         return options
+
+    def _record_openai_usage(
+        self,
+        *,
+        model: str,
+        usage: dict[str, Any] | None,
+        duration_ms: int,
+    ) -> None:
+        usage = usage if isinstance(usage, dict) else {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        cached_prompt_tokens = (
+            int(prompt_details.get("cached_tokens") or 0) if isinstance(prompt_details, dict) else 0
+        )
+        cache_write_tokens = (
+            int(prompt_details.get("cache_write_tokens") or 0)
+            if isinstance(prompt_details, dict)
+            else 0
+        )
+        reasoning_tokens = (
+            int(completion_details.get("reasoning_tokens") or 0)
+            if isinstance(completion_details, dict)
+            else 0
+        )
+
+        self.openai_calls += 1
+        self.openai_ms_total += duration_ms
+        self.openai_prompt_tokens += prompt_tokens
+        self.openai_cached_prompt_tokens += cached_prompt_tokens
+        self.openai_cache_write_tokens += cache_write_tokens
+        self.openai_completion_tokens += completion_tokens
+        self.openai_reasoning_tokens += reasoning_tokens
+
+        model_usage = self.openai_usage_by_model.setdefault(
+            model,
+            {
+                "calls": 0,
+                "duration_ms": 0,
+                "prompt_tokens": 0,
+                "cached_prompt_tokens": 0,
+                "cache_write_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+            },
+        )
+        model_usage["calls"] += 1
+        model_usage["duration_ms"] += duration_ms
+        model_usage["prompt_tokens"] += prompt_tokens
+        model_usage["cached_prompt_tokens"] += cached_prompt_tokens
+        model_usage["cache_write_tokens"] += cache_write_tokens
+        model_usage["completion_tokens"] += completion_tokens
+        model_usage["reasoning_tokens"] += reasoning_tokens
 
     def _client_openai(self):
         if self.dry_run:
@@ -979,10 +1041,11 @@ class Translator:
         usage_obj = getattr(resp, "usage", None)
         usage = usage_obj.model_dump() if usage_obj else {}
         duration_ms = int((time.perf_counter() - t0) * 1000)
-        self.openai_calls += 1
-        self.openai_ms_total += duration_ms
-        self.openai_prompt_tokens += int(usage.get("prompt_tokens") or 0)
-        self.openai_completion_tokens += int(usage.get("completion_tokens") or 0)
+        self._record_openai_usage(
+            model=request_model,
+            usage=usage,
+            duration_ms=duration_ms,
+        )
         return out, {
             "usage": usage,
             "duration_ms": duration_ms,
@@ -1246,19 +1309,7 @@ class Translator:
             out = (msg.get("content") or "").strip()
             usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
-        # Telemetry counters
-        try:
-            self.openai_calls += 1
-            self.openai_ms_total += dt
-            pt = 0
-            ct = 0
-            if isinstance(usage, dict):
-                pt = int(usage.get("prompt_tokens") or 0)
-                ct = int(usage.get("completion_tokens") or 0)
-            self.openai_prompt_tokens += pt
-            self.openai_completion_tokens += ct
-        except Exception:
-            pass
+        self._record_openai_usage(model=request_model, usage=usage, duration_ms=dt)
         meta = {
             "usage": usage,
             "duration_ms": dt,
@@ -1335,19 +1386,7 @@ class Translator:
             text = (msg.get("content") or "").strip()
             usage = resp.get("usage") or {}
         dt = int((time.perf_counter() - t0) * 1000)
-        # Telemetry counters
-        try:
-            self.openai_calls += 1
-            self.openai_ms_total += dt
-            pt = 0
-            ct = 0
-            if isinstance(usage, dict):
-                pt = int(usage.get("prompt_tokens") or 0)
-                ct = int(usage.get("completion_tokens") or 0)
-            self.openai_prompt_tokens += pt
-            self.openai_completion_tokens += ct
-        except Exception:
-            pass
+        self._record_openai_usage(model=request_model, usage=usage, duration_ms=dt)
         try:
             obj = json.loads(text)
         except Exception as e:
@@ -1405,7 +1444,14 @@ class Translator:
             "openai_calls": int(getattr(self, "openai_calls", 0)),
             "openai_ms_total": int(getattr(self, "openai_ms_total", 0)),
             "openai_prompt_tokens": int(getattr(self, "openai_prompt_tokens", 0)),
+            "openai_cached_prompt_tokens": int(getattr(self, "openai_cached_prompt_tokens", 0)),
+            "openai_cache_write_tokens": int(getattr(self, "openai_cache_write_tokens", 0)),
             "openai_completion_tokens": int(getattr(self, "openai_completion_tokens", 0)),
+            "openai_reasoning_tokens": int(getattr(self, "openai_reasoning_tokens", 0)),
+            "openai_usage_by_model": {
+                model: dict(usage)
+                for model, usage in getattr(self, "openai_usage_by_model", {}).items()
+            },
             "fallback_calls": int(getattr(self, "fallback_calls", 0)),
             "model": self.model,
             "fallback_model": self.fallback_model,

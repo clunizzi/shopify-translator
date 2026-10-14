@@ -333,6 +333,49 @@ class NeonTranslationStore:
                     ON admin_jobs (shop_domain)
                     WHERE status IN ('queued', 'running')
                     """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS translation_usage_events (
+                      shop_domain TEXT NOT NULL,
+                      event_key TEXT NOT NULL,
+                      event_type TEXT NOT NULL
+                        CHECK (event_type IN ('product', 'theme', 'global_resource')),
+                      entity_id TEXT NOT NULL DEFAULT '',
+                      topic TEXT NOT NULL DEFAULT '',
+                      source TEXT NOT NULL DEFAULT '',
+                      status TEXT NOT NULL DEFAULT 'unknown',
+                      openai_calls INTEGER NOT NULL DEFAULT 0 CHECK (openai_calls >= 0),
+                      fallback_calls INTEGER NOT NULL DEFAULT 0 CHECK (fallback_calls >= 0),
+                      cache_hits INTEGER NOT NULL DEFAULT 0 CHECK (cache_hits >= 0),
+                      cache_misses INTEGER NOT NULL DEFAULT 0 CHECK (cache_misses >= 0),
+                      prompt_tokens BIGINT NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
+                      cached_prompt_tokens BIGINT NOT NULL DEFAULT 0
+                        CHECK (cached_prompt_tokens >= 0),
+                      cache_write_tokens BIGINT NOT NULL DEFAULT 0
+                        CHECK (cache_write_tokens >= 0),
+                      completion_tokens BIGINT NOT NULL DEFAULT 0
+                        CHECK (completion_tokens >= 0),
+                      reasoning_tokens BIGINT NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+                      duration_ms BIGINT NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+                      estimated_cost_usd NUMERIC(16, 8) NOT NULL DEFAULT 0
+                        CHECK (estimated_cost_usd >= 0),
+                      pricing_date DATE,
+                      estimate_complete BOOLEAN NOT NULL DEFAULT TRUE,
+                      models JSONB NOT NULL DEFAULT '{}'::jsonb,
+                      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      PRIMARY KEY (shop_domain, event_key)
+                    )
+                    """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS translation_usage_events_shop_created_idx
+                    ON translation_usage_events (shop_domain, created_at DESC)
+                    """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS translation_usage_events_shop_entity_idx
+                    ON translation_usage_events (
+                      shop_domain, event_type, entity_id, created_at DESC
+                    )
+                    """)
 
         self._run_db(run)
 
@@ -344,6 +387,7 @@ class NeonTranslationStore:
                 cur.execute("DROP TABLE IF EXISTS theme_file_state")
                 cur.execute("DROP TABLE IF EXISTS theme_source_state")
                 cur.execute("DROP TABLE IF EXISTS admin_jobs")
+                cur.execute("DROP TABLE IF EXISTS translation_usage_events")
                 cur.execute("DROP TABLE IF EXISTS pdp_translation_state")
                 cur.execute("DROP TABLE IF EXISTS pdp_source_state")
                 cur.execute("DROP TABLE IF EXISTS translation_memory")
@@ -354,6 +398,83 @@ class NeonTranslationStore:
 
         self._run_db(run)
         self.ensure_schema()
+
+    def append_translation_usage_event(
+        self,
+        *,
+        shop_domain: str,
+        event_key: str,
+        event_type: str,
+        entity_id: str,
+        topic: str,
+        source: str,
+        status: str,
+        telemetry: dict[str, Any],
+        estimated_cost: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """Persist one compact, idempotent usage record without translated content."""
+
+        if event_type not in {"product", "theme", "global_resource"}:
+            raise ValueError(f"Unsupported usage event type: {event_type}")
+
+        def non_negative_int(key: str) -> int:
+            return max(0, int(telemetry.get(key) or 0))
+
+        def run(conn: Any) -> bool:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO translation_usage_events (
+                      shop_domain, event_key, event_type, entity_id, topic, source, status,
+                      openai_calls, fallback_calls, cache_hits, cache_misses,
+                      prompt_tokens, cached_prompt_tokens, cache_write_tokens,
+                      completion_tokens, reasoning_tokens, duration_ms,
+                      estimated_cost_usd, pricing_date, estimate_complete,
+                      models, metadata, created_at
+                    )
+                    VALUES (
+                      %s, %s, %s, %s, %s, %s, %s,
+                      %s, %s, %s, %s,
+                      %s, %s, %s,
+                      %s, %s, %s,
+                      %s, %s::date, %s,
+                      %s::jsonb, %s::jsonb, NOW()
+                    )
+                    ON CONFLICT (shop_domain, event_key) DO NOTHING
+                    RETURNING event_key
+                    """,
+                    (
+                        sanitize_text(shop_domain),
+                        sanitize_text(event_key),
+                        event_type,
+                        sanitize_text(entity_id),
+                        sanitize_text(topic),
+                        sanitize_text(source),
+                        sanitize_text(status or "unknown"),
+                        non_negative_int("openai_calls"),
+                        non_negative_int("fallback_calls"),
+                        non_negative_int("cache_hits"),
+                        non_negative_int("cache_misses"),
+                        non_negative_int("openai_prompt_tokens"),
+                        non_negative_int("openai_cached_prompt_tokens"),
+                        non_negative_int("openai_cache_write_tokens"),
+                        non_negative_int("openai_completion_tokens"),
+                        non_negative_int("openai_reasoning_tokens"),
+                        non_negative_int("openai_ms_total"),
+                        max(0.0, float(estimated_cost.get("amount") or 0)),
+                        str(estimated_cost.get("pricing_date") or "") or None,
+                        bool(estimated_cost.get("complete", False)),
+                        json.dumps(
+                            sanitize_json_value(telemetry.get("openai_usage_by_model") or {}),
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(sanitize_json_value(metadata or {}), ensure_ascii=False),
+                    ),
+                )
+                return cur.fetchone() is not None
+
+        return self._run_db(run)
 
     def claim_admin_job(self, *, job_id: str, shop_domain: str) -> bool:
         def run(conn: Any) -> bool:
