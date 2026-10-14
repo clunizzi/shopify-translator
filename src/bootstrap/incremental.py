@@ -122,6 +122,10 @@ async def sync_products_incremental(
             if summary["items"] and summary["items"][-1].get("status") == "unchanged":
                 summary["skipped_products"] += 1
     finally:
+        # Keep OpenAI usage attached to the unit of work that caused it. This
+        # makes webhook cost attribution exact even when payload logging is off.
+        get_telemetry = getattr(translator, "get_telemetry", None)
+        summary["telemetry"] = get_telemetry() if callable(get_telemetry) else {}
         cache.close()
         store.close()
 

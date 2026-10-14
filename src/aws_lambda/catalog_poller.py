@@ -212,6 +212,10 @@ def _enqueue_products(
                             "DataType": "String",
                             "StringValue": event_id,
                         },
+                        "Source": {
+                            "DataType": "String",
+                            "StringValue": "catalog_poller",
+                        },
                     },
                 }
             )

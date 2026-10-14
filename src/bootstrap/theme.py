@@ -60,8 +60,7 @@ async def _get_theme_translations_by_locale(
     matrix = await get_resource_translation_matrix(resource_ids, target_locales)
     return {
         locale: {
-            resource_id: locale_map.get(locale, {})
-            for resource_id, locale_map in matrix.items()
+            resource_id: locale_map.get(locale, {}) for resource_id, locale_map in matrix.items()
         }
         for locale in target_locales
     }
@@ -213,8 +212,7 @@ async def get_theme_resource_fingerprint(
         bundle=bundle,
     )
     remote_by_id = {
-        str(item.get("resource_id") or ""): item.get("translations") or {}
-        for item in bundle
+        str(item.get("resource_id") or ""): item.get("translations") or {} for item in bundle
     }
     rows: list[tuple[object, ...]] = []
     for document, _section_hashes in docs:
@@ -271,9 +269,7 @@ async def audit_theme_translations(
         bundle=bundle,
     )
     resource_ids = [document["resource_id"] for document, _hashes in docs]
-    translations_by_locale = await _get_theme_translations_by_locale(
-        resource_ids, target_locales
-    )
+    translations_by_locale = await _get_theme_translations_by_locale(resource_ids, target_locales)
     summary: dict[str, Any] = {
         "ok": True,
         "read_only": True,
@@ -740,9 +736,9 @@ async def bootstrap_theme(
                                 ).strip()
                                 != localize_internal_urls_in_html(
                                     str(
-                                        (
-                                            remote.get(section_name.split(".", 1)[1]) or {}
-                                        ).get("value")
+                                        (remote.get(section_name.split(".", 1)[1]) or {}).get(
+                                            "value"
+                                        )
                                         or ""
                                     ).strip(),
                                     target_locale=target_locale,
@@ -920,6 +916,8 @@ async def bootstrap_theme(
                 if verbose:
                     logger.info("theme_translation_debug", **verbose)
     finally:
+        get_telemetry = getattr(translator, "get_telemetry", None)
+        summary["telemetry"] = get_telemetry() if callable(get_telemetry) else {}
         cache.close()
         store.close()
 

@@ -122,9 +122,10 @@ resource "aws_lambda_function" "receiver" {
   source_code_hash = (var.receiver_s3_bucket == "" && var.receiver_s3_key == "") ? filebase64sha256(var.receiver_zip) : null
   environment {
     variables = {
-      SQS_URL                    = aws_sqs_queue.products.id
-      SHOPIFY_WEBHOOK_SECRET_ARN = var.shopify_webhook_secret_arn
-      DISABLE_SYNC               = var.disable_sync
+      SQS_URL                       = aws_sqs_queue.products.id
+      SHOPIFY_WEBHOOK_SECRET_ARN    = var.shopify_webhook_secret_arn
+      DISABLE_SYNC                  = var.disable_sync
+      PRODUCT_WEBHOOK_DELAY_SECONDS = tostring(var.product_webhook_delay_seconds)
     }
   }
 }
@@ -209,15 +210,15 @@ resource "aws_lambda_function" "worker" {
   memory_size      = 512
   environment {
     variables = {
-      DDB_TABLE           = aws_dynamodb_table.product_snapshots.name
-      DEDUP_TABLE         = aws_dynamodb_table.webhook_dedup.name
-      SQS_URL             = aws_sqs_queue.products.id
-      SOURCE_LOCALE       = var.source_locale
-      TARGET_LOCALES      = var.target_locales
+      DDB_TABLE                = aws_dynamodb_table.product_snapshots.name
+      DEDUP_TABLE              = aws_dynamodb_table.webhook_dedup.name
+      SQS_URL                  = aws_sqs_queue.products.id
+      SOURCE_LOCALE            = var.source_locale
+      TARGET_LOCALES           = var.target_locales
       LOCALIZED_ROUTE_PREFIXES = var.localized_route_prefixes
-      MF_INCLUDE          = var.mf_include
-      SHOP_DOMAIN         = var.shop_domain
-      SHOPIFY_API_VERSION = var.shopify_api_version
+      MF_INCLUDE               = var.mf_include
+      SHOP_DOMAIN              = var.shop_domain
+      SHOPIFY_API_VERSION      = var.shopify_api_version
       # Secrets Manager ARNs for runtime retrieval
       OPENAI_API_KEY_SECRET_ARN      = var.openai_api_key_secret_arn
       SHOPIFY_ADMIN_TOKEN_SECRET_ARN = var.shopify_admin_token_secret_arn

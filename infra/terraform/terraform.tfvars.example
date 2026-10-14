@@ -41,18 +41,19 @@ catalog_poll_enabled = "false" # rete di sicurezza prodotti; attivare dopo dry-r
 catalog_poll_schedule = "rate(15 minutes)"
 
 # Worker runtime
-request_timeout      = 30
-retries              = 3
-debounce_seconds     = 60
-dry_run              = "false"
-disable_sync         = "true" # fail-safe: abilitare il sync solo dopo un rollout verificato
-log_verbose_sync     = "false"
-seo_sync_enabled     = "false" # attivare solo dopo audit e backfill SEO controllato
-openai_model          = "gpt-5.6-terra"
-openai_fallback_model = "gpt-5.6-sol"
-theme_openai_model          = "" # es. "gpt-6.1-sol" per un rollout separato del tema
-theme_openai_fallback_model = ""
-worker_maximum_concurrency = 5
+request_timeout                 = 30
+retries                         = 3
+debounce_seconds                = 60
+product_webhook_delay_seconds = 180 # aspetta che import/DDT finiscano gli aggiornamenti a raffica
+dry_run                        = "false"
+disable_sync                   = "true" # fail-safe: abilitare il sync solo dopo un rollout verificato
+log_verbose_sync               = "false"
+seo_sync_enabled               = "false" # attivare solo dopo audit e backfill SEO controllato
+openai_model                   = "gpt-5.6-terra"
+openai_fallback_model          = "gpt-5.6-sol"
+theme_openai_model             = "" # es. "gpt-6.1-sol" per un rollout separato del tema
+theme_openai_fallback_model    = ""
+worker_maximum_concurrency     = 5
 
 # Prompt and policy customization. Keep store-specific overlays in ignored
 # `*.local.yaml` files; they are still included in Lambda builds.

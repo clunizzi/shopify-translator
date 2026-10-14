@@ -98,9 +98,7 @@ _COLLECTION_TITLE_EXACT = {
         "Ricambi e manutenzione": "Ersatzteile und Wartung",
     },
     "fr": {
-        "Ricambi e accessori per le raccolte": (
-            "Pièces détachées et accessoires pour la récolte"
-        ),
+        "Ricambi e accessori per le raccolte": ("Pièces détachées et accessoires pour la récolte"),
         "Ricambi e manutenzione": "Pièces détachées et entretien",
     },
 }
@@ -467,9 +465,7 @@ def translate_resource_document(
             source_document["resource_type"] == "COLLECTION"
             and key == "title"
             and (
-                deterministic_title := deterministic_collection_title(
-                    entry["value"], target_locale
-                )
+                deterministic_title := deterministic_collection_title(entry["value"], target_locale)
             )
         ):
             translated_value = deterministic_title
@@ -768,9 +764,7 @@ async def bootstrap_resources(
                                 )
                                 in {"html", "liquid"}
                                 and str(
-                                    (remote.get(section_name.split(".", 1)[1]) or {}).get(
-                                        "value"
-                                    )
+                                    (remote.get(section_name.split(".", 1)[1]) or {}).get("value")
                                     or ""
                                 ).strip()
                                 != localize_internal_urls_in_html(
@@ -1017,6 +1011,8 @@ async def bootstrap_resources(
             summary["items"].append(item_summary)
             logger.info("resource_translation", **_build_resource_log_event(item_summary))
     finally:
+        get_telemetry = getattr(translator, "get_telemetry", None)
+        summary["telemetry"] = get_telemetry() if callable(get_telemetry) else {}
         cache.close()
         store.close()
 

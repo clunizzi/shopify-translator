@@ -11,6 +11,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from src.logging_setup import configure_logging
+from src.openai_usage import estimate_openai_cost, persist_translation_usage_event
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,10 @@ def _build_theme_summary_event(summary: dict[str, object], *, theme_id: str) -> 
         "registered": summary.get("registered", 0),
         "target_locales": summary.get("target_locales") or [],
         "resource_types": summary.get("resource_types") or [],
+        "telemetry": summary.get("telemetry") or {},
+        "estimated_openai_cost": estimate_openai_cost(
+            summary.get("telemetry") if isinstance(summary.get("telemetry"), dict) else {}
+        ),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -226,8 +231,56 @@ def _build_global_resource_summary_event(summary: dict[str, object]) -> dict[str
         "registered": summary.get("registered", 0),
         "target_locales": summary.get("target_locales") or [],
         "resource_types": summary.get("resource_types") or [],
+        "telemetry": summary.get("telemetry") or {},
+        "estimated_openai_cost": estimate_openai_cost(
+            summary.get("telemetry") if isinstance(summary.get("telemetry"), dict) else {}
+        ),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def _persist_usage_best_effort(
+    *,
+    event_key: str,
+    event_type: str,
+    entity_id: str,
+    topic: str,
+    source: str,
+    status: str,
+    summary: dict[str, object],
+    metadata: dict[str, object] | None = None,
+) -> None:
+    try:
+        from src.config.settings import SETTINGS
+
+        persist_translation_usage_event(
+            shop_domain=SETTINGS.shopify_domain,
+            event_key=event_key,
+            event_type=event_type,
+            entity_id=entity_id,
+            topic=topic,
+            source=source,
+            status=status,
+            telemetry=(
+                summary.get("telemetry") if isinstance(summary.get("telemetry"), dict) else {}
+            ),
+            metadata={
+                "registered": int(summary.get("registered") or 0),
+                "changed_sections": int(summary.get("changed_sections") or 0),
+                **(metadata or {}),
+            },
+        )
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "warning": "usage_telemetry_persist_failed",
+                    "event_key": event_key,
+                    "error": str(exc)[:500],
+                }
+            )
+        )
 
 
 def _checkpoint_key(group: str, cfg: PollerConfig) -> dict[str, str]:
@@ -406,9 +459,7 @@ async def _probe_global_resources(cfg: PollerConfig) -> dict[str, object]:
 async def _run_scheduled_poll_unlocked(cfg: PollerConfig) -> dict[str, object]:
     """Use Shopify-only fingerprints so unchanged polls never wake Neon or OpenAI."""
     theme_probe = await _probe_theme(cfg) if cfg.run_theme else None
-    global_probe = (
-        await _probe_global_resources(cfg) if cfg.global_resource_poll_enabled else None
-    )
+    global_probe = await _probe_global_resources(cfg) if cfg.global_resource_poll_enabled else None
     theme_changed = bool(
         theme_probe
         and (
@@ -427,18 +478,22 @@ async def _run_scheduled_poll_unlocked(cfg: PollerConfig) -> dict[str, object]:
     result: dict[str, object] = {
         "ok": True,
         "event": "scheduled_translation_poll",
-        "theme": {
-            "status": "changed" if theme_changed else "unchanged",
-            "probe": theme_probe,
-        }
-        if theme_probe
-        else None,
-        "global": {
-            "status": "changed" if global_changed else "unchanged",
-            "probe": global_probe,
-        }
-        if global_probe
-        else None,
+        "theme": (
+            {
+                "status": "changed" if theme_changed else "unchanged",
+                "probe": theme_probe,
+            }
+            if theme_probe
+            else None
+        ),
+        "global": (
+            {
+                "status": "changed" if global_changed else "unchanged",
+                "probe": global_probe,
+            }
+            if global_probe
+            else None
+        ),
     }
 
     # Global handles must settle before theme/page links are reconciled.
@@ -446,6 +501,15 @@ async def _run_scheduled_poll_unlocked(cfg: PollerConfig) -> dict[str, object]:
         global_summary = await _run_global_resources(cfg)
         global_event = _build_global_resource_summary_event(global_summary)
         result["global"] = global_event
+        _persist_usage_best_effort(
+            event_key=f"scheduled:global:{uuid.uuid4()}",
+            event_type="global_resource",
+            entity_id="global",
+            topic="scheduled_poll",
+            source="eventbridge",
+            status=str(global_event.get("status") or "unknown"),
+            summary=global_summary,
+        )
         print(json.dumps(global_event, ensure_ascii=False))
         if _summary_succeeded(global_summary):
             fresh_global_probe = await _probe_global_resources(cfg)
@@ -468,6 +532,15 @@ async def _run_scheduled_poll_unlocked(cfg: PollerConfig) -> dict[str, object]:
         theme_summary = await _run_theme(cfg)
         theme_event = _build_theme_summary_event(theme_summary, theme_id=cfg.theme_id)
         result["theme"] = theme_event
+        _persist_usage_best_effort(
+            event_key=f"scheduled:theme:{uuid.uuid4()}",
+            event_type="theme",
+            entity_id=cfg.theme_id,
+            topic="scheduled_poll",
+            source="eventbridge",
+            status=str(theme_event.get("status") or "unknown"),
+            summary=theme_summary,
+        )
         print(json.dumps(theme_event, ensure_ascii=False))
         if _summary_succeeded(theme_summary):
             fresh_theme_probe = await _probe_theme(cfg)
@@ -614,6 +687,16 @@ def handler(event, context):
                 "actor": actor or None,
                 "max_translations": cfg.max_translations,
             }
+            _persist_usage_best_effort(
+                event_key=f"admin:{job_id}:theme",
+                event_type="theme",
+                entity_id=cfg.theme_id,
+                topic=action or "manual_theme_sync",
+                source="dashboard",
+                status=str(result.get("status") or "unknown"),
+                summary=summary,
+                metadata={"job_id": job_id, "actor": actor},
+            )
             print(json.dumps(result, ensure_ascii=False))
         elif not manual:
             result = asyncio.run(_run_scheduled_poll(cfg))

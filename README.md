@@ -23,12 +23,15 @@ every time an order changes inventory.
   checks never wake Neon or OpenAI.
 - **Change-aware** — inventory-only updates stop before OpenAI or Shopify
   writes.
+- **Import-aware** — configurable webhook stabilization lets ERP/DDT tools
+  finish staged product writes before translation starts.
 - **Complete storefront coverage** — products, variants, options, selected
   metafields, SEO, handles and theme content.
 - **Safe on live stores** — retries, deduplication, debounce, dry-runs and a
   strict MAIN-theme guard.
 - **Built to operate** — Neon-backed state, scheduled reconciliation and an
-  optional Cloudflare dashboard for audits and manual corrections.
+  optional Cloudflare dashboard for audits and manual corrections. Worker logs
+  attribute every OpenAI call and persist a compact per-event cost estimate.
 
 ## How it works
 
@@ -124,10 +127,12 @@ audits and unlock each write path intentionally.
 
 `cloudflare-admin/` contains an optional Cloudflare Workers control panel for:
 - translation coverage and system health;
+- OpenAI cost estimates for today/month/30 days, model and token breakdown,
+  recent events and optional monthly-budget warnings;
 - product and theme inspection;
 - localized storefront previews;
 - controlled manual corrections;
-- theme audits, canaries and sync jobs.
+- theme audits, canaries and sync jobs with a cost preflight.
 
 ```bash
 cd cloudflare-admin
@@ -137,7 +142,8 @@ npm run dev
 ```
 
 The dashboard is designed to run behind Cloudflare Access and uses a
-least-privilege AWS identity.
+least-privilege AWS identity. Cost history starts when telemetry is deployed;
+the OpenAI Usage Dashboard remains the accounting source of truth.
 
 ## Store-specific configuration
 

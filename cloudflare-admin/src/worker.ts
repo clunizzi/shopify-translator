@@ -112,7 +112,11 @@ app.get("/api/health", async (c) => {
       actor: c.get("actorEmail"),
       correlation_id: c.get("correlationId"),
     });
-  } catch {
+  } catch (error) {
+    console.error("overview_health_failed", {
+      message: error instanceof Error ? error.message : String(error),
+      correlation_id: c.get("correlationId"),
+    });
     return c.json(
       {
         ok: false,
@@ -153,13 +157,25 @@ app.get("/api/overview", async (c) => {
         scheduled_sync_enabled: c.env.SCHEDULED_SYNC_ENABLED === "true",
         theme_realtime_sync_enabled:
           c.env.THEME_REALTIME_SYNC_ENABLED === "true",
+        openai_model: String(c.env.OPENAI_MODEL || "").trim() || "Non configurato",
+        openai_fallback_model:
+          String(c.env.OPENAI_FALLBACK_MODEL || "").trim() || null,
+        openai_monthly_budget_usd: (() => {
+          const value = Number(c.env.OPENAI_MONTHLY_BUDGET_USD || 0);
+          return Number.isFinite(value) && value > 0 ? value : null;
+        })(),
+        report_time_zone: c.env.REPORT_TIME_ZONE || "UTC",
         mode: "operational",
       },
       actor: c.get("actorEmail"),
       generated_at: new Date().toISOString(),
       correlation_id: c.get("correlationId"),
     });
-  } catch {
+  } catch (error) {
+    console.error("overview_load_failed", {
+      message: error instanceof Error ? error.message : String(error),
+      correlation_id: c.get("correlationId"),
+    });
     return c.json(
       {
         error: {

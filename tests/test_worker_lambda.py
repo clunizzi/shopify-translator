@@ -3,6 +3,80 @@ import asyncio
 from src.aws_lambda import worker
 
 
+def test_openai_cost_estimate_uses_cached_and_cache_write_rates():
+    estimate = worker._estimate_openai_cost(
+        {
+            "openai_usage_by_model": {
+                "gpt-6-luna": {
+                    "prompt_tokens": 1_000,
+                    "cached_prompt_tokens": 200,
+                    "cache_write_tokens": 100,
+                    "completion_tokens": 100,
+                }
+            }
+        }
+    )
+
+    assert estimate == {
+        "amount": 0.0001345,
+        "currency": "USD",
+        "pricing_date": "2026-10-14",
+        "complete": True,
+        "unknown_models": [],
+    }
+
+
+def test_openai_cost_estimate_covers_configured_fallback_model():
+    estimate = worker._estimate_openai_cost(
+        {
+            "openai_usage_by_model": {
+                "gpt-5.6-terra": {
+                    "prompt_tokens": 1_000,
+                    "cached_prompt_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "completion_tokens": 100,
+                }
+            }
+        }
+    )
+
+    assert estimate["amount"] == 0.0032
+    assert estimate["complete"] is True
+
+
+def test_usage_persistence_failure_never_fails_sync(monkeypatch):
+    def _fail(**_kwargs):
+        raise RuntimeError("neon unavailable")
+
+    monkeypatch.setattr(worker, "persist_translation_usage_event", _fail)
+    cfg = worker.WorkerConfig(
+        ddb_table="snap",
+        dedup_table="dedup",
+        source_locale="it",
+        target_locales=["de"],
+        mf_include=[],
+        debounce_seconds=20,
+        dry_run=False,
+        shop_domain="example.myshopify.com",
+        openai_api_key_secret_arn="",
+        shopify_admin_token_secret_arn="",
+        neon_database_url_secret_arn="",
+        disable_sync=False,
+        log_verbose_sync=False,
+    )
+
+    worker._persist_usage_best_effort(
+        cfg=cfg,
+        event_key="evt-usage",
+        event_type="product",
+        entity_id="123",
+        topic="products/update",
+        source="shopify_webhook",
+        status="synced",
+        summary={"telemetry": {"openai_calls": 1}},
+    )
+
+
 def test_handler_disabled(monkeypatch):
     monkeypatch.setenv("DDB_TABLE", "snap")
     monkeypatch.setenv("DEDUP_TABLE", "dedup")
@@ -259,6 +333,10 @@ def test_debounce_schedules_one_compact_followup(monkeypatch):
                 "EventId": {
                     "DataType": "String",
                     "StringValue": "coalesced:followup-token",
+                },
+                "Source": {
+                    "DataType": "String",
+                    "StringValue": "debounce_followup",
                 },
             },
         }
